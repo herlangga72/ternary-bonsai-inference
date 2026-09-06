@@ -55,10 +55,13 @@ Migrate from the outside in:
 | forward pass (attn + GDN + FFN + head) | Rust (M6), greedy matches golden logits |
 | decode / KV / EOG | Rust (M7), standalone, llama.cpp link removed |
 
-## Next: inference performance (M8+)
+## Next: inference performance (M8+) and GPU (RX 7600)
 
-The migration is done; the remaining gap is speed (~23-34 s/token vs a ~0.4 s/token
-memory-bandwidth floor on this box). See `notes/perf-plan.md` for the measured
-breakdown and the ordered plan: mmap the payload (kill the 4M row syscalls/token),
-tighten the scalar PQ2_0 dot, thread the matvecs over the 4 cores, then add an
-AVX2 dequant-dot (target ~1 s/token decode), and finally batched prefill.
+The migration is done; the remaining gap is speed (~23-34 s/token today). An
+RX 7600 (288 GB/s) arrives soon and is now the target: ~25 ms/token decode
+floor, ~20-40 tok/s expected. See `notes/perf-plan.md` for the full plan:
+slim CPU work now (mmap + threaded matvec, ~5-8 s/token fallback), then an
+OpenCL backend (buildable + validated on the current gfx902 iGPU today):
+PQ2_0 matvec + norm/activation kernels (G0), device weight store (G1),
+single-stream GPU decode (G2), then batched prefill and tuning on the 7600
+(G3).

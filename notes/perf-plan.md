@@ -1,10 +1,9 @@
-# Perf plan: making Ternary-Bonsai-27B inference fast on this box
+# Perf plan: Ternary-Bonsai-27B inference fast on CPU, then on an RX 7600
 
 Status: 2026-09-06. The M1..M7 Rust migration is functionally complete
-(correct, golden-verified, standalone). The remaining problem is speed:
-~23-34 s/token on the 4-core Ryzen 3200G. This document is the plan to close
-most of that gap, in dependency order, with measured evidence and a target for
-each step.
+(correct, golden-verified, standalone). Speed today is ~23-34 s/token on the
+4-core Ryzen 3200G. An RX 7600 arrives in a few days; this document tracks
+both the interim CPU work and the GPU build-out that is the real target.
 
 ## Current state (measured)
 
@@ -16,220 +15,140 @@ each step.
 | matvec throughput | 0.34 GMAC/s (1 thr), 0.88 GMAC/s (4 thr) | `bonsai-matbench` on blk.0.ffn_up |
 | matvec rows per token | ~4.0M (every row is a seek+read syscall today) | computed |
 | page-cache RAM scan | ~18 GB/s | membw probe (gcc) |
-| disk | SATA SSDs (no HDD); 30 GB zram swap | `lsblk` |
-
-Model weight budget per decode token = stream ~7.1 GB through the CPU.
-Memory-bandwidth floor on this machine: 7.1 GB / 18 GB/s ≈ **0.4 s/token**.
-A llama.cpp-quality kernel would land near 0.5-0.8 s/token here (decode is
-bandwidth-bound, not compute-bound, once the kernel is sane). Today we are
-~30-70x above that floor, so there is a large, well-understood gap to close.
+| iGPU (today) | Vega 8 / gfx902, OpenCL works, shares the 18 GB/s DRAM | clinfo |
+| disk | SATA SSDs (no HDD); 30 GB zram swap | lsblk |
 
 ## Bottleneck analysis (why 30 s/token)
 
 1. **Scalar inner loop.** `kernels::pq2_matvec_range` decodes every weight
-   with per-element integer shifts/masks plus *two* float multiplies
-   (`(code-1)*scale`, then `* x[j]`). matbench proves this kernel alone gives
-   ~0.88 GMAC/s across 4 threads; the whole model at that rate is ~30 s/token.
-   This is the dominant cost (~90%+ of decode time).
+   with per-element integer shifts/masks plus two float multiplies. matbench
+   proves this kernel alone gives ~0.88 GMAC/s across 4 threads; the whole
+   model at that rate is ~30 s/token. This is >90% of decode time.
 2. **Syscall per row.** `gguf::read_bytes_at` does `seek` + `read_exact` per
-   row. Decode touches ~4M rows/token -> ~4M syscalls/token plus a fresh
-   kernel-side copy into a scratch `raw` buffer per matvec. Roughly a tenth of
-   decode time and an obstacle to threading (shared `File` position).
-3. **Single-threaded pipeline.** Only the standalone matbench threads; the
-   engine's matvecs run on one core. 4 cores sit idle.
-4. **Prefill is decode repeated.** `main.rs` forwards prompt tokens one at a
-   time, each a full 7.1 GB model pass. A 20-token prompt is 20 model passes.
-5. Minor: per-layer String tensor-name lookups, `.clone()` of norm vectors and
-   small tensors, ~450 `Vec` allocations/token, whole-model re-read for every
-   matvec slice (weight data is not cached per layer across the layer loop,
-   but each tensor is used once per token anyway, so no reuse is lost).
+   row. Decode touches ~4M rows/token -> ~4M syscalls/token, plus row-copy
+   scratch per matvec. Also blocks threading (shared File position).
+3. **Single-threaded pipeline.** Only the standalone matbench threads.
+4. **Prefill = decode repeated.** `main.rs` forwards prompt tokens one at a
+   time, each a full 7.1 GB model pass.
 
-## Target
+## Decision (2026-09-06): GPU-first, RX 7600
 
-- Decode: 30 s/token -> **~1 s/token** (bandwidth-bound regime). Budget: M8.
-- Prefill: per-token model passes -> **one batched pass per prompt** for
-  multi-token prompts. Budget: M9 (stretch, after M8 lands).
-- Keep the golden checks green at every step (qa/code prompts: greedy id
-  8160, logit rel diff in the 1e-3 range).
+An RX 7600 (Navi 33, gfx1102) is being added to this box. Its relevant specs:
 
-## M8 - fast decode path (the main event)
+- 8 GB GDDR6 on a 128-bit bus @ 18 Gbps -> **288 GB/s** (vs ~18 GB/s today)
+- 2048 shaders, up to ~2.66 GHz, ~21.7 TFLOPS FP32 peak
+- PCIe 4.0 x8 (~14 GB/s one-way; fine for a one-time weight upload)
+- Supported by ROCm 6.0 (`gfx1102`), which is already installed at /opt/rocm
 
-Order matters: mmap first (unblocks threading), then kernel, then SIMD.
-Each step compiles, passes golden, and is benchmarked before the next.
+New decode floor on the 7600: 7.1 GB / 288 GB/s = **~25 ms/token** for the
+weight stream. With a sane PQ2_0 kernel that is ~20-40 tok/s decode (600-1000x
+today), and prefill for a normal prompt drops to ~1 s. That is the level this
+repo is now being built toward.
 
-### M8.1 mmap the tensor payload (removes syscalls + enables threads)
+### Compute API choice: OpenCL first
 
-- Replace per-row `File::seek/read` with a read-only mmap of the whole file
-  (`memmap2` or `libc::mmap` directly; the repo is dependency-light today, so
-  prefer a tiny `libc` shim or `memmap2` - decision at implementation).
-- `GGUF` keeps parsing the header/tensor index; add a `payload: &[u8]` view
-  over the data section and a `tensor_slice(info) -> &[u8]` accessor.
-- Refactor `pq2_matvec_range` to take a `&[u8]` row window (exactly what
-  matbench already does) instead of a `&mut GGUF` handle. Numerically
-  identical - same bytes, same decode.
-- `madvise(MADV_SEQUENTIAL)` on the data section; keep the 7.1 GB working set
-  in page cache (9.7 GB available - fits, but nothing else should compete).
+Recommended: **OpenCL**, not HIP, for the first GPU backend.
 
-Expected: removes ~4M syscalls + row-copy churn per token. ~10-20% alone,
-but it is the prerequisite for M8.3.
+- It is the only compute API verified working on this box right now
+  (AMD-APP platform enumerates gfx902), so kernels can be written, run, and
+  validated against the CPU decoder *before* the 7600 arrives.
+- ROCm 6.0 ships the OpenCL runtime for gfx1102, so the same kernels run on
+  the 7600 when it lands.
+- Kernels are plain C with runtime `clBuildProgram` compilation: fast
+  iteration, and trivially mirrors the scalar CPU kernels one-to-one for
+  validation.
+- HIP remains the fallback if OpenCL perf on RDNA3 disappoints; the kernel
+  math ports nearly line-for-line.
 
-### M8.2 tighten the scalar row kernel (small, safe, reversible)
+Keep the CPU path alive as the numeric reference and fallback (it is what the
+golden checks run against). Structurally this is a **compute-backend split**,
+not a rewrite: weights + forward semantics stay in Rust; only matvec-scale
+kernels move behind a trait.
 
-- Hoist the group scale: accumulate `x[j] * (code-1)` per element, apply the
-  block scale once per 128-block instead of per element (halves the float
-  multiplies). Rounding changes at ~1e-7 relative; golden greedy ids are
-  unaffected (existing logit agreement is only ~4e-3 anyway).
-- Unroll 4 elements per byte (the 2-bit fields of one `qs` byte), keep the
-  decode order stable so row-level unit tests stay meaningful.
+### Two-track work plan
 
-### M8.3 thread the matvecs
+The CPU track keeps value flowing before the card arrives and produces the
+mmap/upload plumbing + numeric reference the GPU track needs.
 
-- Row-parallelize each PQ2_0 matvec over the 4 cores: split the row range
-  into contiguous chunks; each worker dots its own rows against the shared `x`
-  from the mmap slice. Pure read-only parallelism, no cache mutation, join per
-  matvec (layer dependencies stay serialized in `forward_hidden`).
-- Use `std::thread::scope` (no new dependency) or a tiny persistent pool
-  (avoid 4M-thread spawn churn per token; a per-call scoped spawn of 4 threads
-  is acceptable at ~450 matvecs/token, but a pool is nicer).
+#### Track CPU (do now, slim)
 
-Expected M8.1-3 together: ~3-5x over today -> decode ~5-8 s/token.
+| step | work | expected |
+| --- | --- | --- |
+| M8.1 | mmap the payload; slice-based row kernel (kills 4M syscalls/token, enables threads and GPU upload) | ~10-20% + prerequisite |
+| M8.3 | thread matvecs over 4 cores (read-only row chunks, scoped threads) | decode ~5-8 s/token |
+| (defer) | M8.2 scalar tightening, M8.4 AVX2 - only if CPU stays useful after the GPU lands; the 7600 makes CPU SIMD a hobby path | - |
 
-### M8.4 AVX2 SIMD dequant-dot
+#### Track GPU (target: 7600, build on gfx902 now)
 
-Ternary values are `(code-1)*scale` with code in 0..3, i.e. {-1, 0, +1, +2}.
-A block of 128 weights is 34 bytes (2-byte scale + 32 bytes of codes), so the
-natural kernel processes 128 floats of `x` (512 B, one cache line) per block:
+| step | work | validates on | expected on 7600 |
+| --- | --- | --- | --- |
+| G0 | OpenCL kernels: PQ2_0 matvec (2-bit unpack, block scales), RMSNorm, silu/softplus/sigmoid, softmax, IMROPE, GDN step. Micro-bench each vs the CPU kernel on random rows | gfx902 (OpenCL works today) | kernel math identical to CPU |
+| G1 | device weight store: upload packed 2-bit tensors from the mmap (no repack, no f32 blowup); KV (f32) + recurrent state buffers on device | gfx902 | 7.1 GB fits 8 GB; KV 64 KB/token |
+| G2 | single-stream GPU decode: layer loop launches kernels per tensor, KV/state stay on device, logits sampled on host | gfx902, then 7600 | decode ~20-40 tok/s |
+| G3 | batched prefill on device (matmul over N prompt tokens), then tune: wave32/LDS/vectorization, KV f16 at long ctx | 7600 | prefill ~1 s for a 150-token prompt |
 
-- Scalar-Rust reference math to preserve: `y_block = scale * (2*S3 + S2 - S0)`
-  where `Sc = sum of x[j]` whose 2-bit code equals c. (code 1 contributes 0.)
-- AVX2 + FMA implementation sketch: stream the 32 code bytes, expand to
-  per-element masks/planes (`_mm256_*` bit tricks or a 16-entry nibble LUT
-  through `_mm256_shuffle_epi8`), accumulate the three bucket sums with fused
-  multiply-add over 8 x-lanes at a time. Final combine per block.
-- Use `std::arch` with `#[target_feature(enable = "avx2,fma")]` + a
-  compile-time fallback to the M8.2 scalar path for non-AVX2 machines.
-  Runtime detection at load (`is_x86_feature_detected!`).
-- The matvec then approaches the ~18 GB/s stream limit; with 4 threads the
-  decode becomes bandwidth-bound.
+G0-G2 are designed to be validated on the current iGPU for *correctness*
+(golden greedy id 8160 must match), knowing gfx902 throughput is irrelevant;
+the 7600 numbers are the goal.
 
-Expected: decode ~1-2 s/token (15-30x vs today), i.e. the llama.cpp-class
-number for this CPU/RAM.
+## GPU kernel design notes
 
-### M8 verification
+- Keep weights packed as PQ2_0 (34 B per 128-weight block = 2 bits + one fp16
+  scale). Dequantize in-kernel: one workgroup tile loads x (5120 floats =
+  20 KB) into LDS once, then streams weight blocks; each 128-block maps to
+  wave/lane unpacking (32 code bytes -> 128 two-bit codes). Scale applied per
+  block at the end: `block_dot = scale * (2*S3 + S2 - S0)` over x buckets.
+- A decode token is 7.1 GB of device-memory reads; the kernel must stream
+  weight rows sequentially and saturate the 288 GB/s bus, so row-block
+  work assignment and vectorized 16-byte code loads matter more than FMA
+  count. Target ~60-75% of bus bandwidth (200+ GB/s).
+- Embedding and LM head are 0.34 GB tensors each (1.27e9 elems): plain
+  gather/matvec on device. Embedding row lookup per token is a single row.
+- Recurrent (gdn) state is 48 x 128 x 128 f32 = 786 KB/layer x 48 layers =
+  151 MB; keep it on device and run the GDN update as a small kernel (order-
+  dependent per token, cheap FLOPS).
+- KV for full-attention layers is f32 64 KB/token (4 kv heads x 256 x 4 B x
+  16 layers). 32K ctx = ~2 GB; switch KV to f16 if long-context runs matter.
+- Weight upload once at load: 7.1 GB over PCIe 4.0 x8 (~10-14 GB/s) ~ 0.5-1
+  min. Do not copy weights per token.
 
-- `cargo build --release`; `bonsai-golden` on qa + code prompts must keep
-  greedy id 8160 and logit rel diff in the same 1e-3 ballpark.
-- Extend `bonsai-matbench` (or add a matvec microbench variant) so every step
-  reports GMAC/s single- and multi-threaded against the same tensor, and a
-  `--check` mode compares SIMD results to the scalar decode on random rows
-  (exact or <1e-6 rel).
-- `bonsai-run -n 2 -v` timing after each step; keep a table in this file.
+## Verification (both tracks)
 
-## M9 - batched prefill (stretch)
-
-Problem today: a 20-token prompt = 20 full model passes (~11 min at 30 s/tok;
-even at 1 s/tok it is 20 s of avoidable work). Fix: process the whole prompt
-in one weight pass per layer:
-
-- Embedding: gather the N prompt rows at once.
-- FFN + attention projections: matrix * `[N x n_embd]` activation block
-  instead of `[1 x n_embd]`; weights stream once for all N tokens.
-- Full-attention layers: compute q/k/v for all N, causal scores over the N
-  positions, output all N at once (no per-token KV append needed for prefill).
-- Recurrent (gdn) layers: projections and the conv1d are batch-friendly; the
-  `gdn_step` recurrence stays sequential per position over precomputed q/k/v
-  (the state update is order-dependent by definition). State math is ~150M
-  MAC/token/layer-set, small next to the matvecs, so serializing it is fine.
-- Workspaces sized `[N x n_embd]`; N = prompt length.
-
-Expected: a 150-token prompt from ~75 min (today) to tens of seconds.
-The block-matmul kernel from M8.4 generalizes (same row kernel, batch of x).
-
-## Later / optional (not in the fast-decode critical path)
-
-- Self-contained profiling flag (`-v` per-stage timings, or `#[feature]`
-  counters) to catch the next bottleneck after M8 (likely attention KV +
-  softmax at long context, then the GDN state update).
-- Speculative decoding with the dspark 3.6B sidecar (`*dspark*.gguf` present
-  in the repo): real 2-3x decode win, but it lives in the fork's C++
-  acceptance loop today and porting it is a large separate effort. Keep as a
-  documented follow-up (README already flags this).
-- Layer fusion (norm + matvec + residual in one pass) and scratch reuse are
-  small constant-factor wins once M8 lands; do them only if profiling shows
-  they matter.
-
-## GPU? (question, 2026-09-06)
-
-Hardware facts on this box:
-
-- One GPU: the Vega 8 iGPU (Picasso/Raven2, gfx902, 8 CUs / 512 SP, ~1.25 GHz,
-  ~1.3 TFLOPS FP32 peak). No discrete card in the PCIe slots.
-- It is usable today: `/dev/kfd` present, OpenCL platform works
-  (`clinfo`: AMD-APP, gfx902), 512 MB carve-out, ~8 GB host-visible global.
-  ROCm 6.0 no longer officially supports gfx900-class, so treat HIP as
-  experimental.
-- The iGPU shares the same DDR4 as the CPU. Measured RAM scan is ~18 GB/s for
-  the CPU; the iGPU reads the same memory controller, so it does not add
-  bandwidth.
-
-Why the iGPU does not change the decode plan:
-
-- Decode streams ~7.1 GB of weights per token. The floor is DRAM bandwidth
-  (~0.4 s/token), and that floor is shared with the CPU. Adding the iGPU
-  cannot lower it; it would only move the same FMA work to a device that is
-  also waiting on the same memory.
-- The packed-PQ2_0 dot is not iGPU-compute-limited either: streaming 7.1 GB
-  at 18 GB/s needs only ~68 GMAC/s (3.76 MAC/byte), well under what the Vega
-  can do once dequantized, so the iGPU would idle on bandwidth like the CPU.
-- 15 GB total RAM with the 7.1 GB model page-cached already leaves ~9 GB
-  free. GPU-side copies of weights would fight the CPU page cache for the
-  same 15 GB and push mapped pages out (SSD re-read stalls).
-
-Where a GPU would actually pay:
-
-1. **Discrete card with its own VRAM/bandwidth** (e.g. any 8 GB+ card:
-   224-288 GB/s vs 18 GB/s) - that is the only hardware on this box that
-   lowers the decode wall (floor ~30-60 ms/token compute-side, real-world
-   maybe 3-8 tok/s for this ternary model) and makes batched prefill fast.
-   Cost: weight upload over PCIe at load, a HIP/OpenCL/Vulkan PQ2_0 kernel,
-   and reworking the pure-Rust no-llama.cpp architecture. Separate project.
-2. **Batched prefill (M9)** is compute-bound once weights stream once per
-   prompt (N tokens x 27e9 MAC); extra FLOPS help there. The iGPU could cut
-   prefill time for long prompts even though it cannot help decode.
-3. **dspark speculative decode** - once M8/M9 land, the verifier is
-   bandwidth-bound; a GPU only helps the draft-model compute, not the wall.
-
-Recommendation: do M8 on CPU first - it reaches the shared-DRAM decode wall
-(~0.5-1 s/token) with a fraction of the effort of any GPU path and is a
-prerequisite data point (kernel design, golden checks) for a later GPU port.
-Revisit "add GPU" only if (a) a discrete card becomes available, or (b) M9
-prefill on long prompts is the dominant user pain and the iGPU's extra FLOPs
-are worth an OpenCL experiment.
+- Every step: `cargo build --release`; `bonsai-golden` on qa + code prompts
+  must keep greedy id 8160 and logit rel diff in the same 1e-3 ballpark.
+- OpenCL kernels get a CPU-vs-GPU row check mode (exact or <1e-6 rel) before
+  they are wired into the graph.
+- Keep `decode_pq2_0_row` and the CPU scalar kernels untouched as the numeric
+  anchor.
+- Micro-benchmarks per kernel (GMAC/s and GB/s) so each G step reports a
+  number; record the table here.
 
 ## Risks / watch-outs
 
-- **Autovectorization will not happen by itself.** Rust rarely vectorizes
-  these byte-scattered loops; the AVX2 path must be explicit intrinsics.
-  Validate against the scalar path per tensor with a check mode.
-- **Numeric drift**: M8.2/M8.4 reorder summation and scale application.
-  Expected ~1e-6 relative on logits; golden comparisons are greedy-id + 1e-3
-  level, so this is safe, but keep `decode_pq2_0_row` and the exactness tests
-  untouched as the numeric anchor.
-- **Threading**: all parallel work is read-only over the mmap + shared `x`;
-  KV/GDN caches mutate only on the single decode thread. Never share the
-  current `File`-based reader across threads (seek position races) - that is
-  exactly why mmap must land first.
-- **Memory**: 7.1 GB mapped + page cache, 9.7 GB available, zram swap 30 GB.
-  Fine today, but anything else that grabs RAM during a long reasoning run
-  will push mapped pages out and stall decode on SSD re-reads.
-- The **LM head** is 1.27e9 MAC (248k rows) per token - ~5% of the model but
-  248k of the ~4M rows. After mmap it is just bandwidth; no special casing
-  needed initially.
+- **Toolchain risk on gfx902**: ROCm 6.0 does not officially support
+  gfx900-class; OpenCL (AMD-APP) does enumerate it today. If gfx902 kernels
+  misbehave, validate G0/G1 kernels against CPU math on the same data without
+  needing the GPU to be fast - only correct.
+- **OpenCL perf on RDNA3**: officially supported but historically a bit under
+  HIP. Budget a HIP port of the matvec kernel as plan B (same math).
+- **Numeric drift**: GPU summation order differs from CPU; expected ~1e-6 rel
+  on logits. Golden checks are greedy-id + 1e-3 level, so safe.
+- **8 GB VRAM is tight**: 7.1 GB weights + ~0.5-1 GB runtime/KV/workspace.
+  Watch context growth (KV f16 later) and driver reserved memory.
+- **Autovectorization will not happen by itself** (CPU). Rust rarely
+  vectorizes byte-scattered loops; the CPU AVX2 path (if ever needed) must be
+  explicit intrinsics.
+- **Threading (CPU)**: parallel work is read-only over the mmap + shared x;
+  KV/GDN caches mutate only on the single decode thread. mmap must land before
+  any threading (never share the File-based reader).
 
-## Suggested sequencing (commit per step, mirroring M1..M7 style)
+## Sequencing
 
-1. `M8.1 mmap` - GGUF payload view, slice-based row kernel, same numbers.
-2. `M8.2 scalar` - hoisted scale + 4-per-byte unroll, bench in matbench.
-3. `M8.3 threads` - scoped row-parallel matvecs, bench whole decode.
-4. `M8.4 AVX2` - intrinsics dot with scalar fallback + check mode, bench.
-5. `M9 batched prefill` (optional) - block matvec over prompt tokens.
+1. M8.1 mmap - GGUF payload view, slice-based row kernel, same numbers.
+2. M8.3 threads - scoped row-parallel matvecs (CPU decode ~5-8 s/token while
+   waiting for the card).
+3. G0 OpenCL kernels + CPU-vs-GPU row checks (runs on the iGPU today).
+4. G1 device weight store + G2 single-stream GPU decode; golden id 8160 on the
+   iGPU.
+5. When the RX 7600 arrives: benchmark, tune to bus bandwidth, then G3
+   batched prefill and (later) dspark speculative decode.
