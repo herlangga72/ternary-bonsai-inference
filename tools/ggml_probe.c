@@ -175,6 +175,42 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(op, "rope") == 0 && argc == 8) {
+        const char * outpath = argv[2];
+        const char * inpath  = argv[3];
+        int pt = atoi(argv[4]);
+        int ph = atoi(argv[5]);
+        int pw = atoi(argv[6]);
+        int pe = atoi(argv[7]);
+
+        const int64_t head_dim = 256, n_head = 1, n_dims = 64;
+        int sections[4] = { 11, 11, 10, 0 };
+
+        size_t l = 0;
+        unsigned char * inb = load_file(inpath, &l);
+
+        struct ggml_init_params ip = { .mem_size = 64 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context * ctx = ggml_init(ip);
+        struct ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_head);
+        memcpy(ggml_get_data(a), inb, (size_t) head_dim * n_head * 4);
+        free(inb);
+        int32_t pos[4] = { pt, ph, pw, pe };
+        struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+        memcpy(ggml_get_data(b), pos, sizeof(pos));
+
+        struct ggml_tensor * y = ggml_rope_multi(ctx, a, b, NULL,
+                n_dims, sections, GGML_ROPE_TYPE_IMROPE,
+                /*n_ctx_orig=*/4096, /*freq_base=*/1e7f, /*freq_scale=*/1.0f,
+                /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+                /*beta_fast=*/32.0f, /*beta_slow=*/1.0f);
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), ggml_nbytes(y));
+        ggml_free(ctx);
+        return 0;
+    }
+
     fprintf(stderr, "unknown usage\n");
     return 1;
 }
