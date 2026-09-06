@@ -31,7 +31,9 @@ build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
 | `src/main.rs` | Rust driver: model load, chat template, tokenize, sample, stream, timing |
 | `src/sampler.rs` | Pure-Rust sampler (top-k/top-p/min-p/temp/dist) replacing the llama sampler chain |
 | `src/gguf.rs` | Pure-Rust GGUF reader: metadata, tensor index, PQ2_0/F16/F32 dequant, layout checks, retag |
+| `src/tokenizer.rs` | Pure-Rust qwen35 BPE tokenizer + GPT-2 byte decoder (detokenizer) |
 | `src/bin/bonsai-gguf.rs` | CLI: `inspect`, `probe` (decode a tensor window), `retag` (42 -> 142) |
+| `src/bin/bonsai-tokcmp.rs` | Tokenizer verification: Rust vs `llama_tokenize` over a corpus |
 | `tools/retag_gguf.py` | Original Python retag (superseded by the Rust tool; kept for reference) |
 | `build.rs` | Links the static PrismML llama.cpp libraries |
 

@@ -8,6 +8,7 @@
 mod gguf;
 mod llama;
 mod sampler;
+mod tokenizer;
 
 use sampler::{Sampler, SamplerConfig};
 
@@ -169,40 +170,22 @@ fn apply_qwen35_template(system: &str, user: &str) -> String {
     out
 }
 
-// Tokenize a text (parse_special=true) into token ids.
-fn tokenize_text(vocab: *const llama_vocab, text: &str) -> Vec<llama_token> {
-    let c = cstr(text);
-    let mut cap = (text.len() * 4 + 64) as i32;
-    let mut toks: Vec<llama_token> = vec![0; cap as usize];
-    loop {
-        let n = unsafe {
-            llama_tokenize(
-                vocab,
-                c.as_ptr(),
-                text.len() as i32,
-                toks.as_mut_ptr(),
-                cap,
-                0,
-                1, // parse_special: resolve <|...|> style tokens
-            )
-        };
-        if n < 0 {
-            cap = -n;
-            toks.resize(cap as usize, 0);
-            continue;
-        }
-        toks.truncate(n as usize);
-        return toks;
-    }
+// Tokenize a text (parse_special=true) with the pure-Rust tokenizer.
+fn tokenize_rust(vocab: &tokenizer::Vocab, text: &str) -> Vec<llama_token> {
+    tokenizer::encode(
+        text,
+        vocab,
+        &tokenizer::TokenizeOptions { add_special: false, parse_special: true },
+    )
 }
 
 // Find single-token ids for the given special token strings (e.g. <|im_end|>),
 // so generation can stop cleanly at them.
-fn find_stop_tokens(vocab: *const llama_vocab, wants: &[&str]) -> Vec<llama_token> {
+fn find_stop_tokens(vocab: &tokenizer::Vocab, wants: &[&str]) -> Vec<llama_token> {
     wants
         .iter()
         .filter_map(|w| {
-            let toks = tokenize_text(vocab, w);
+            let toks = tokenize_rust(vocab, w);
             if toks.len() == 1 {
                 Some(toks[0])
             } else {
@@ -262,14 +245,31 @@ fn main() {
     );
     let vocab = unsafe { llama_model_get_vocab(model) };
 
+    // Rust vocabulary (tokenizer + detokenizer live in pure Rust)
+    let gf = match gguf::GGUF::open(&cli.model) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(1);
+        }
+    };
+    let rvocab = match tokenizer::Vocab::from_gguf(&gf) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(1);
+        }
+    };
+    drop(gf);
+
     // ---- build the formatted prompt (qwen35 chat template, thinking mode) ---
     let prompt = apply_qwen35_template(&cli.system, &cli.prompt);
     if cli.verbose {
         eprintln!("{prompt}\n");
     }
 
-    // ---- tokenize ----------------------------------------------------------
-    let mut toks = tokenize_text(vocab, &prompt);
+    // ---- tokenize (pure Rust) ------------------------------------------------
+    let mut toks = tokenize_rust(&rvocab, &prompt);
     if toks.is_empty() {
         eprintln!("error: tokenize failed");
         exit(1);
@@ -311,7 +311,7 @@ fn main() {
     );
 
     // stop tokens: chat end markers (EOG handled separately)
-    let stop_ids = find_stop_tokens(vocab, &["<|im_end|>", "<|resp_end|>"]);
+    let stop_ids = find_stop_tokens(&rvocab, &["<|im_end|>", "<|resp_end|>"]);
     eprintln!("stops: {stop_ids:?}");
 
     // ---- prefill ------------------------------------------------------------
@@ -357,7 +357,6 @@ fn main() {
     let mut stdout = std::io::stdout();
     let t0 = Instant::now();
     let mut n_gen: i64 = 0;
-    let mut piece_buf: Vec<u8> = vec![0; 1024];
 
     loop {
         // sample from the logits of the token at batch position `logits_at`
@@ -373,26 +372,10 @@ fn main() {
             break;
         }
 
-        // token -> text
-        loop {
-            let n = unsafe {
-                llama_token_to_piece(
-                    vocab,
-                    id,
-                    piece_buf.as_mut_ptr() as *mut c_char,
-                    piece_buf.len() as i32,
-                    0,
-                    0,
-                )
-            };
-            if n < 0 {
-                piece_buf.resize((-n) as usize, 0);
-                continue;
-            }
-            let _ = stdout.write_all(&piece_buf[..n as usize]);
-            let _ = stdout.flush();
-            break;
-        }
+        // token -> text (pure Rust detokenizer)
+        let piece = rvocab.piece_bytes(id);
+        let _ = stdout.write_all(&piece);
+        let _ = stdout.flush();
         n_gen += 1;
         if n_gen >= cli.n_predict as i64 {
             break;

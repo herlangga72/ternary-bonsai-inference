@@ -6,6 +6,7 @@ description = "Rust inference driver for Ternary-Bonsai-27B GGUF via the PrismML
 build = "build.rs"
 
 [dependencies]
+unicode-general-category = "1.0"
 
 [profile.release]
 opt-level = 3
