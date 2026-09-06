@@ -13,7 +13,7 @@ mod kernels;
 mod vk;
 
 use gguf::GGUF;
-use std::time::Instant;
+
 
 const DEFAULT_TENSORS: &[&str] = &[
     "blk.0.ffn_up.weight",   // 17408 x 5120 (recurrent FFN gate/up shape)
@@ -35,7 +35,7 @@ fn rand_floats(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn check_tensor(g: &GGUF, gpu: &vk::Gpu, name: &str) -> Result<(), String> {
+fn check_tensor(g: &GGUF, gpu: &mut vk::Gpu, name: &str) -> Result<(), String> {
     let info = g
         .tensors
         .iter()
@@ -51,16 +51,15 @@ fn check_tensor(g: &GGUF, gpu: &vk::Gpu, name: &str) -> Result<(), String> {
     let payload_len = payload.len();
     let x = rand_floats(0x9E3779B9 ^ name.len() as u64, ne0);
 
-    // warmup once, then time 3 runs
-    gpu.pq2_matvec(payload, ne0, 0, rows, &x)?;
-    let n_iter = 3;
-    let t0 = Instant::now();
-    for _ in 0..n_iter {
-        gpu.pq2_matvec(payload, ne0, 0, rows, &x)?;
-    }
-    let dt = t0.elapsed().as_secs_f64() / n_iter as f64;
+    // Enough iterations for a stable kernel-throughput number without
+    // over-running on the 248k-row LM head.
+    let macs = rows as u64 * ne0 as u64;
+    let iters: u32 = if macs < 200_000_000 { 30 } else { 6 };
 
-    let ygpu = gpu.pq2_matvec(payload, ne0, 0, rows, &x)?;
+    let (dt, ygpu) = gpu
+        .matvec_bench(payload, ne0, 0, rows, &x, iters)
+        .map_err(|e| format!("gpu matvec: {e}"))?;
+
     let mut ycpu = vec![0.0f32; rows];
     kernels::pq2_matvec_range(payload, ne0, 0, rows, &x, &mut ycpu)
         .map_err(|e| format!("cpu matvec: {e}"))?;
@@ -80,7 +79,6 @@ fn check_tensor(g: &GGUF, gpu: &vk::Gpu, name: &str) -> Result<(), String> {
         max_abs = max_abs.max(d);
         max_rel = max_rel.max(rel);
     }
-    let macs = rows as f64 * ne0 as f64;
     println!(
         "{name}: {rows} rows x {ne0} cols, {:.1} MiB payload",
         payload_len as f64 / 1048576.0
@@ -90,8 +88,8 @@ fn check_tensor(g: &GGUF, gpu: &vk::Gpu, name: &str) -> Result<(), String> {
         rows
     );
     println!(
-        "  {:.2} GMAC/s, {:.2} GB/s (payload, {n_iter} iters)",
-        macs / dt / 1e9,
+        "  {:.2} GMAC/s, {:.2} GB/s (device-local weights, {iters} iters in one submit)",
+        macs as f64 / dt / 1e9,
         payload_len as f64 / dt / 1e9
     );
     Ok(())
@@ -111,7 +109,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let gpu = match vk::Gpu::open() {
+    let mut gpu = match vk::Gpu::open() {
         Ok(g) => g,
         Err(e) => {
             eprintln!("no usable Vulkan GPU: {e}");
@@ -132,7 +130,7 @@ fn main() {
 
     let mut failed = false;
     for name in names {
-        if let Err(e) = check_tensor(&g, &gpu, name) {
+        if let Err(e) = check_tensor(&g, &mut gpu, name) {
             eprintln!("{name}: {e}");
             failed = true;
         }

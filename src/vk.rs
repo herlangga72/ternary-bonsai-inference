@@ -54,8 +54,17 @@ pub struct Gpu {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     desc_layout: vk::DescriptorSetLayout,
+    staging: Option<RawBuf>,
     pub name: String,
     pub discrete: bool,
+}
+
+/// Device buffer (typically device-local VRAM). Never mapped directly; upload
+/// through a staging buffer (`Gpu::upload`).
+pub struct DevBuf {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub len: usize,
 }
 
 fn err<T, E: std::fmt::Display>(r: Result<T, E>, what: &str) -> Result<T, String> {
@@ -225,6 +234,7 @@ impl Gpu {
             pipeline,
             pipeline_layout,
             desc_layout,
+            staging: None,
             name,
             discrete,
         })
@@ -285,6 +295,296 @@ impl Gpu {
         self.device.unmap_memory(buf.memory);
         self.device.destroy_buffer(buf.buffer, None);
         self.device.free_memory(buf.memory, None);
+    }
+
+    // ---- G1: device-local buffers + staging uploads -------------------------
+
+    /// Memory type that is device-local (preferred for weights), falling back
+    /// to host-visible if the device has no pure device-local heap (iGPU
+    /// carve-outs usually still do).
+    fn device_local_mem_index(&self) -> Result<u32, String> {
+        let props = unsafe {
+            self._instance
+                .get_physical_device_memory_properties(self.physical)
+        };
+        for (i, mt) in props.memory_types.iter().enumerate() {
+            if mt.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) {
+                return Ok(i as u32);
+            }
+        }
+        self.memory_type_index(
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+    }
+
+    pub fn create_dev_buffer(
+        &self,
+        len: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<DevBuf, String> {
+        unsafe {
+            let info = vk::BufferCreateInfo::default()
+                .size(len as vk::DeviceSize)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = err(self.device.create_buffer(&info, None), "create_dev_buffer")?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let idx = self.device_local_mem_index()?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(idx);
+            let memory = err(self.device.allocate_memory(&alloc, None), "alloc dev memory")?;
+            err(
+                self.device.bind_buffer_memory(buffer, memory, 0),
+                "bind dev buffer",
+            )?;
+            Ok(DevBuf { buffer, memory, len })
+        }
+    }
+
+    pub fn destroy_dev_buffer(&self, b: DevBuf) {
+        unsafe {
+            self.device.destroy_buffer(b.buffer, None);
+            self.device.free_memory(b.memory, None);
+        }
+    }
+
+    /// Grow (or create) the reusable host-visible staging buffer to at least
+    /// `len` bytes. Takes no long-lived borrow so callers can touch other
+    /// fields afterwards.
+    fn ensure_staging_size(&mut self, len: usize) -> Result<(), String> {
+        if let Some(s) = &self.staging {
+            if s.len >= len {
+                return Ok(());
+            }
+        }
+        unsafe {
+            if let Some(old) = self.staging.take() {
+                self.destroy_host_buffer(old);
+            }
+            let s = self.create_host_buffer(len, vk::BufferUsageFlags::TRANSFER_SRC)?;
+            self.staging = Some(s);
+        }
+        Ok(())
+    }
+
+    /// Copy `data` into a device buffer through the staging buffer with a
+    /// dedicated one-shot command buffer + fence.
+    pub fn upload(&mut self, dev: &DevBuf, data: &[u8]) -> Result<(), String> {
+        if data.len() > dev.len {
+            return Err(format!("upload {} > device buffer {}", data.len(), dev.len));
+        }
+        self.ensure_staging_size(data.len())?;
+        unsafe {
+            let staging_ptr = self.staging.as_ref().unwrap().ptr;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), staging_ptr, data.len());
+            let staging_buf = self.staging.as_ref().unwrap().buffer;
+
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cbs = err(
+                self.device.allocate_command_buffers(&cb_info),
+                "upload: alloc cmd",
+            )?;
+            let cb = cbs[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            err(self.device.begin_command_buffer(cb, &begin), "upload: begin")?;
+            let region = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(data.len() as vk::DeviceSize);
+            self.device
+                .cmd_copy_buffer(cb, staging_buf, dev.buffer, &[region]);
+            err(self.device.end_command_buffer(cb), "upload: end")?;
+
+            let fence = err(
+                self.device.create_fence(&vk::FenceCreateInfo::default(), None),
+                "upload: fence",
+            )?;
+            let cbs2 = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs2);
+            err(
+                self.device.queue_submit(self.queue, &[submit], fence),
+                "upload: submit",
+            )?;
+            err(
+                self.device.wait_for_fences(&[fence], true, u64::MAX),
+                "upload: wait",
+            )?;
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            Ok(())
+        }
+    }
+
+    /// Create a descriptor set for one [w, x, y] storage-buffer binding from a
+    /// fresh pool (max_sets 1). Used by the bench and, later, per launch.
+    unsafe fn make_set(
+        &self,
+        w: vk::Buffer,
+        x: vk::Buffer,
+        y: vk::Buffer,
+    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), String> {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(3)];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(1)
+            .pool_sizes(&sizes);
+        let pool = err(
+            self.device.create_descriptor_pool(&pool_info, None),
+            "create_descriptor_pool",
+        )?;
+        let layouts = [self.desc_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(pool)
+            .set_layouts(&layouts);
+        let sets = err(
+            self.device.allocate_descriptor_sets(&alloc_info),
+            "allocate_descriptor_sets",
+        )?;
+        let set = sets[0];
+        let infos = [
+            vk::DescriptorBufferInfo::default().buffer(w).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(x).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(y).range(vk::WHOLE_SIZE),
+        ];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&infos[0..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&infos[1..2]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&infos[2..3]),
+        ];
+        self.device.update_descriptor_sets(&writes, &[]);
+        Ok((pool, set))
+    }
+
+    /// Record the bind + push + one dispatch for the matvec (shared by bench
+    /// and the future decode loop).
+    unsafe fn record_matvec(
+        &self,
+        cb: vk::CommandBuffer,
+        set: vk::DescriptorSet,
+        ne0: u32,
+        base_row: u32,
+        n_rows: usize,
+    ) {
+        self.device
+            .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+        self.device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline_layout,
+            0,
+            &[set],
+            &[],
+        );
+        let pc = [ne0, base_row];
+        let pc_bytes = std::slice::from_raw_parts(
+            pc.as_ptr() as *const u8,
+            std::mem::size_of_val(&pc),
+        );
+        self.device.cmd_push_constants(
+            cb,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            pc_bytes,
+        );
+        let groups = (n_rows as u32).div_ceil(LOCAL_X).max(1);
+        self.device.cmd_dispatch(cb, groups, 1, 1);
+    }
+
+    /// Benchmark + validate matvec with the G1 layout: weights live in a
+    /// device-local buffer uploaded once; x and y are persistent host-visible
+    /// buffers; `iters` dispatches are recorded into one command buffer so the
+    /// reported time is kernel throughput, not per-launch host overhead.
+    /// Returns (seconds per iteration, final y).
+    pub fn matvec_bench(
+        &mut self,
+        payload: &[u8],
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        x: &[f32],
+        iters: u32,
+    ) -> Result<(f64, Vec<f32>), String> {
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let w = self.create_dev_buffer(payload.len(), usage)?;
+        self.upload(&w, payload)?;
+        let mut x_host = unsafe { self.create_host_buffer(ne0 * 4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        let y_len = n_rows * 4;
+        let y_host =
+            unsafe { self.create_host_buffer(y_len, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        unsafe {
+            x_host.data_mut().copy_from_slice(bytemuck_slice(x));
+        }
+
+        let (pool, set) = unsafe { self.make_set(w.buffer, x_host.buffer, y_host.buffer) }?;
+
+        let cb_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { self.device.allocate_command_buffers(&cb_info) }
+            .map_err(|e| format!("bench: alloc cmd: {e}"))?[0];
+
+        let t0 = std::time::Instant::now();
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(cb, &begin)
+                .map_err(|e| format!("bench: begin: {e}"))?;
+            // bind + push once, then dispatch `iters` times back to back
+            self.record_matvec(cb, set, ne0 as u32, base_row, n_rows);
+            for _ in 1..iters {
+                self.device.cmd_dispatch(cb, (n_rows as u32).div_ceil(LOCAL_X).max(1), 1, 1);
+            }
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("bench: end: {e}"))?;
+
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("bench: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("bench: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("bench: wait: {e}"))?;
+            let dt = t0.elapsed().as_secs_f64() / iters as f64;
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            self.device.destroy_descriptor_pool(pool, None);
+
+            let out = y_host.data()[..y_len]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+
+            self.destroy_host_buffer(x_host);
+            self.destroy_host_buffer(y_host);
+            self.destroy_dev_buffer(w);
+            Ok((dt, out))
+        }
     }
 
     /// Run the PQ2_0 matvec over `n_rows` of a payload (row `base_row` +
@@ -438,6 +738,11 @@ impl Drop for Gpu {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(s) = self.staging.take() {
+                self.device.unmap_memory(s.memory);
+                self.device.destroy_buffer(s.buffer, None);
+                self.device.free_memory(s.memory, None);
+            }
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.desc_layout, None);
