@@ -45,25 +45,35 @@ weight stream. With a sane PQ2_0 kernel that is ~20-40 tok/s decode (600-1000x
 today), and prefill for a normal prompt drops to ~1 s. That is the level this
 repo is now being built toward.
 
-### Compute API choice: OpenCL first
+### Compute API choice: Vulkan/RADV over OpenCL (revised 2026-09-06 evening)
 
-Recommended: **OpenCL**, not HIP, for the first GPU backend.
+Initial choice was **OpenCL first** because it was the only compute API verified
+working when the plan was written. Bring-up changed the picture:
 
-- It is the only compute API verified working on this box right now
-  (AMD-APP platform enumerates gfx902), so kernels can be written, run, and
-  validated against the CPU decoder *before* the 7600 arrives.
-- ROCm 6.0 ships the OpenCL runtime for gfx1102, so the same kernels run on
-  the 7600 when it lands.
-- Kernels are plain C with runtime `clBuildProgram` compilation: fast
-  iteration, and trivially mirrors the scalar CPU kernels one-to-one for
-  validation.
-- HIP remains the fallback if OpenCL perf on RDNA3 disappoints; the kernel
-  math ports nearly line-for-line.
+- **ROCm 6.0 OpenCL is defective on this box.** Kernels build and execute, but
+  large device-local writes and `clEnqueueReadBuffer` hang forever on the
+  gfx902 iGPU; we only got validation through by making every buffer
+  host-accessible (`CL_MEM_ALLOC_HOST_PTR`). That is a driver-quality red flag
+  for relying on ROCm's OpenCL on the 7600 too (ROCm 6.0 is already older than
+  the running kernel 6.18).
+- **Vulkan/RADV is installed, current, and working right now**: Mesa
+  25.3.5 (`vulkan-radeon`) enumerates the Vega 8 iGPU, plus `glslangValidator`
+  is present for build-time SPIR-V compilation. Mesa tracks the kernel, and
+  RDNA3 (gfx1102, the 7600) is RADV's best-supported class.
+- Vulkan is vendor-neutral (same code runs on AMD/NVIDIA/Intel), removes the
+  ROCm dependency entirely, and its explicit memory model is what a
+  bandwidth-bound decoder wants: device-local VRAM weights, an in-order queue
+  of per-tensor dispatches, no hidden staging. llama.cpp's Vulkan backend is
+  proof that Vulkan reaches high bandwidth on RDNA3 for quantized decode.
+- Cost: more host boilerplate than OpenCL (instance/device/queue/memory/
+  descriptors/pipelines/command buffers/fences) and a GLSL->SPIR-V build step.
+  The `ash` crate keeps the host layer manageable. The G0 OpenCL work is not
+  wasted: kernel math, the CPU-vs-GPU row checks, and the discovered driver
+  gotchas carry over, and the OpenCL module stays in tree as a fallback.
 
-Keep the CPU path alive as the numeric reference and fallback (it is what the
-golden checks run against). Structurally this is a **compute-backend split**,
-not a rewrite: weights + forward semantics stay in Rust; only matvec-scale
-kernels move behind a trait.
+Decision: primary GPU backend is **Vulkan (RADV)**, validated on the gfx902
+iGPU today, tuned on the 7600. OpenCL remains as a secondary path (module kept,
+not maintained as the main line).
 
 ### Two-track work plan
 
@@ -82,10 +92,15 @@ mmap/upload plumbing + numeric reference the GPU track needs.
 
 | step | work | validates on | expected on 7600 |
 | --- | --- | --- | --- |
-| G0 | OpenCL kernels: PQ2_0 matvec (2-bit unpack, block scales), RMSNorm, silu/softplus/sigmoid, softmax, IMROPE, GDN step. Micro-bench each vs the CPU kernel on random rows | gfx902 (OpenCL works today) | kernel math identical to CPU |
-| G1 | device weight store: upload packed 2-bit tensors from the mmap (no repack, no f32 blowup); KV (f32) + recurrent state buffers on device | gfx902 | 7.1 GB fits 8 GB; KV 64 KB/token |
-| G2 | single-stream GPU decode: layer loop launches kernels per tensor, KV/state stay on device, logits sampled on host | gfx902, then 7600 | decode ~20-40 tok/s |
+| G0 | Vulkan (ash) compute context + PQ2_0 matvec shader (GLSL -> SPIR-V via glslangValidator); CPU-vs-GPU row check on real tensors | gfx902 (RADV, works today) | kernel math identical to CPU |
+| G1 | device weight store: upload packed 2-bit tensors to device-local VRAM; KV (f32) + recurrent state buffers on device | gfx902, then 7600 | 7.1 GB fits 8 GB; KV 64 KB/token |
+| G2 | single-stream GPU decode: in-order queue of per-tensor dispatches, KV/state stay on device, logits read back per token | gfx902, then 7600 | decode ~20-40 tok/s |
 | G3 | batched prefill on device (matmul over N prompt tokens), then tune: wave32/LDS/vectorization, KV f16 at long ctx | 7600 | prefill ~1 s for a 150-token prompt |
+
+Note: G0 was first implemented and validated on the ROCm OpenCL path
+(`src/opencl.rs`, `bonsai-opencl`); the Vulkan port reuses the same kernel
+math, CPU reference checks, and shape coverage. OpenCL stays in tree as a
+fallback, not the main line.
 
 G0-G2 are designed to be validated on the current iGPU for *correctness*
 (golden greedy id 8160 must match), knowing gfx902 throughput is irrelevant;
@@ -147,8 +162,9 @@ the 7600 numbers are the goal.
 1. M8.1 mmap - GGUF payload view, slice-based row kernel, same numbers.
 2. M8.3 threads - scoped row-parallel matvecs (CPU decode ~5-8 s/token while
    waiting for the card).
-3. G0 OpenCL kernels + CPU-vs-GPU row checks (runs on the iGPU today).
-4. G1 device weight store + G2 single-stream GPU decode; golden id 8160 on the
-   iGPU.
+3. G0 Vulkan compute context + PQ2_0 matvec shader; CPU-vs-GPU row checks
+   (runs on the iGPU through RADV today; OpenCL version already validated).
+4. G1 device-local weight store + G2 single-stream GPU decode; golden id 8160
+   on the iGPU.
 5. When the RX 7600 arrives: benchmark, tune to bus bandwidth, then G3
    batched prefill and (later) dspark speculative decode.
