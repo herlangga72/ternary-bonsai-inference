@@ -96,3 +96,10 @@ sections `[11,11,10,0]` (sum 32 = n_dims/2 pairs), head dim 256, freq_base
   `(i, i + n_dims/2)` with cache pair j = i/2; other head dims unchanged.
 - Text-only decode: the four position ids should equal the token position;
   confirm against golden logits during layer validation.
+
+## Scalar engine feasibility (bonsai-matbench)
+
+blk.0.ffn_up mat-vec (5120x17408): 0.26 s single-thread, 0.09 s across 4
+threads (~1 GMAC/s). Whole-model estimate: ~25B MACs/token -> ~25-30 s/token
+for a memory-backed scalar engine, so golden-logit validation runs are feasible
+(~10 min for the 20-token QA prompt).

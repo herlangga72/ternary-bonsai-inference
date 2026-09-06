@@ -86,6 +86,58 @@ pub fn dot_pq2_0_row(
     Ok(acc)
 }
 
+/// Batched PQ2_0 matrix-vector product over a contiguous range of rows.
+/// Computes y[r] = sum_j x[j] * W[base_row + r][j].
+pub fn pq2_matvec_range(
+    gguf: &mut GGUF,
+    info: &TensorInfo,
+    base_row: u64,
+    n_rows: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), String> {
+    if info.ty != TYPE_PQ2_0 {
+        return Err("pq2_matvec_range: tensor is not PQ2_0".into());
+    }
+    let ne0 = info.dims[0] as usize;
+    if x.len() != ne0 {
+        return Err(format!("pq2_matvec_range: x length {} != ne0 {}", x.len(), ne0));
+    }
+    if y.len() < n_rows {
+        return Err("pq2_matvec_range: y too small".into());
+    }
+    let row_bytes = pq2_row_bytes(ne0);
+    let mut raw = vec![0u8; row_bytes];
+    for r in 0..n_rows {
+        let off = info.offset + (base_row + r as u64) * row_bytes as u64;
+        gguf.read_bytes(off, &mut raw)?;
+        let mut acc = 0.0f32;
+        // decode + dot in one pass
+        for block in 0..ne0.div_ceil(PQ2_QK) {
+            let b = block * PQ2_BLOCK;
+            let scale = crate::gguf::half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
+            let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
+            let start = block * PQ2_QK;
+            let end = (start + PQ2_QK).min(ne0);
+            for j in start..end {
+                let code = (qs[(j - start) / 4] >> (((j - start) % 4) * 2)) & 0x03;
+                acc += x[j] * ((code as i32 - 1) as f32 * scale);
+            }
+        }
+        y[r] = acc;
+    }
+    Ok(())
+}
+
+/// Number of rows (ne1) of a tensor.
+pub fn n_rows(info: &TensorInfo) -> u64 {
+    if info.dims.is_empty() {
+        0
+    } else {
+        info.dims[1..].iter().product()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
