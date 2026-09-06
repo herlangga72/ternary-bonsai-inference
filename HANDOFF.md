@@ -29,6 +29,7 @@ tenarybonsai-fast/
     kernels.rs          RMSNorm, PQ2_0 row dequant/dot, batched matvec (M5)
     gdn.rs              gated-delta-net recurrent step (M6, validated)
     rope.rs             IMROPE multi-rope (M6, validated)
+    weights.rs          weight-context engine: qwen35 hyperparams + tensor-name mapping (M6-1)
     main.rs             bonsai-run CLI (still uses llama.cpp for decode)
   src/bin/
     bonsai-gguf         inspect / probe / retag GGUF
@@ -38,6 +39,7 @@ tenarybonsai-fast/
     bonsai-ropecmp      rope.rs vs ggml_rope_multi
     bonsai-logits       capture golden logits (M6 verification oracle)
     bonsai-matbench     scalar matvec throughput benchmark
+    bonsai-weights      weight-context config / tensor-manifest check (M6-1)
   tools/
     ggml_probe.c        C reference harness (rmsnorm, pq2row, pq2deq, gdn, rope)
     retag_gguf.py       superseded Python retag (kept for reference)
@@ -87,27 +89,25 @@ gcc -O2 tools/ggml_probe.c -I /home/server/sdgs/llama.cpp/ggml/include \
 | M6c | IMROPE rope (rope.rs) | vs ggml_rope_multi: < 6e-8 |
 | M6d | batched PQ2_0 matvec + bench | ~1 GMAC/s (4 threads); whole model ~25-30 s/token |
 | M6e | golden logits captures | golden/*.logits.bin for qa + code prompts |
+| M6-1 | weight context engine (weights.rs) | real file: 848/848 per-layer tensors verified; vec/matvec/row smoke; unit tests on synthetic mini-GGUF |
 
 ## Next work, structured (do in order)
 
-1. **M6-1 weight context**: engine module that maps tensor names to our GGUF
-   reader (f32 1-d norm vectors; PQ2_0 matrices via row access). Reuse
-   `gguf.rs`; benchmark already shows reading rows per matvec is fine.
-2. **M6-2 activation helpers**: RMSNorm, L2 norm, SiLU, softplus, sigmoid,
+1. **M6-2 activation helpers**: RMSNorm, L2 norm, SiLU, softplus, sigmoid,
    softmax over head dims. (kernels.rs has rms_norm; add the rest.)
-3. **M6-3 full-attention layer** (il % 4 == 3): wq/wk/wv projections, per-head
+2. **M6-3 full-attention layer** (il % 4 == 3): wq/wk/wv projections, per-head
    RMS norms, IMROPE, KV cache, GQA attention, sigmoid gate, wo projection.
    Follow notes/qwen35-forward-spec.md.
-4. **M6-4 recurrent layer**: wqkv/z/beta/alpha projections, causal conv1d
+3. **M6-4 recurrent layer**: wqkv/z/beta/alpha projections, causal conv1d
    (kernel 4) + SiLU with cached conv state, q/k/v split + L2 norm, gdn.rs,
    ssm_norm gated by silu(z), ssm_out projection.
-5. **M6-5 layer loop + head**: embeddings, residuals, FFN
+4. **M6-5 layer loop + head**: embeddings, residuals, FFN
    (silu(gate·x)⊙up·x → down), output norm, LM head rows. Single-token decode
    first (recurrent state caches per sequence; KV only in attention layers).
-6. **M6-6 golden validation**: compute logits for golden/prompts/qa.txt and
+5. **M6-6 golden validation**: compute logits for golden/prompts/qa.txt and
    compare argmax + logits against golden/qa.logits.bin. Expect first-run
    mismatches; debug layer by layer (instrument per-layer hidden norms).
-7. **M7**: standalone engine binary that no longer links llama.cpp: replace
+6. **M7**: standalone engine binary that no longer links llama.cpp: replace
    `llama_decode` path entirely; drop build.rs linkage and llama.rs usage in
    main.
 

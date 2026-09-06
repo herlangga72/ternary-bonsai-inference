@@ -10,6 +10,7 @@ mod kernels;
 mod llama;
 mod sampler;
 mod tokenizer;
+mod weights;
 
 use sampler::{Sampler, SamplerConfig};
 
