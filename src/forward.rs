@@ -457,10 +457,10 @@ impl Decoder {
             .unwrap_or(0)
     }
 
-    /// Forward one token at absolute position `pos`, returning its logits over
-    /// the full vocabulary. Recurrent/conv caches and attention KV caches are
-    /// advanced as part of the step (causal, single stream).
-    pub fn decode_token(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+    /// Forward one token at absolute position `pos`, updating the recurrent,
+    /// conv and attention caches (causal, single stream). Returns the
+    /// output-normalized hidden vector (length n_embd).
+    pub fn forward_hidden(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, String> {
         let Self {
             w,
             cfg,
@@ -499,14 +499,25 @@ impl Decoder {
             }
         }
 
-        // ---- output norm + LM head -------------------------------------------
+        // ---- output norm ------------------------------------------------------
         let out_norm_w = w.vec_f32("output_norm.weight")?;
-        let h = kernels::rms_norm(&cur, &out_norm_w, eps);
+        Ok(kernels::rms_norm(&cur, &out_norm_w, eps))
+    }
+
+    /// LM head: logits over the full vocabulary for a normalized hidden vector.
+    pub fn head_logits(&mut self, h: &[f32]) -> Result<Vec<f32>, String> {
+        let Self { w, .. } = self;
         let head = w.tensor("output.weight")?.clone();
         let n_vocab = crate::kernels::n_rows(&head) as usize;
         let mut logits = vec![0.0f32; n_vocab];
-        w.matvec_into(&head, 0, n_vocab, &h, &mut logits)?;
+        w.matvec_into(&head, 0, n_vocab, h, &mut logits)?;
         Ok(logits)
+    }
+
+    /// Forward one token and return its logits over the full vocabulary.
+    pub fn decode_token(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+        let h = self.forward_hidden(token, pos)?;
+        self.head_logits(&h)
     }
 }
 

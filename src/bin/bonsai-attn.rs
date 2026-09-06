@@ -5,6 +5,8 @@
 
 #[path = "../gguf.rs"]
 mod gguf;
+#[path = "../gdn.rs"]
+mod gdn;
 #[path = "../kernels.rs"]
 mod kernels;
 #[path = "../rope.rs"]

@@ -1,10 +1,12 @@
 # Migration roadmap: llama.cpp -> pure Rust
 
-The compute engine today is the PrismML llama.cpp fork (C/C++) reached through a
-thin Rust FFI in `src/llama.rs`. This document tracks the incremental migration
-toward a pure-Rust engine. Rule: inference stays working and verified after
-every milestone; each milestone replaces one subsystem and validates against the
-previous behavior before the next starts.
+The compute engine was originally the PrismML llama.cpp fork (C/C++) reached
+through a thin Rust FFI in `src/llama.rs`. This document tracked the incremental
+migration to a pure-Rust engine. The migration is complete: `bonsai-run` is
+standalone, and llama.cpp is only linked by the optional `llama-backend`
+comparison tools. Rule followed: inference stayed working and verified after
+every milestone; each milestone replaced one subsystem and validated against
+the previous behavior before the next started.
 
 ## Strategy
 
@@ -28,15 +30,17 @@ Migrate from the outside in:
 | M4 | Rust detokenizer (vocab text + byte table) | done | output text identical to llama.cpp path; verified in end-to-end run |
 | M5 | Rust kernels: dequant PQ2_0 matmul, RMSNorm, partial RoPE, gates | done (RMSNorm + PQ2_0 dequant; RoPE/gates folded into M6) | RMSNorm 2.3e-7 rel vs ggml; PQ2_0 row dequant bit-exact vs ggml `to_float` on 7 real tensor rows |
 | M6 (prep) | golden logits captures (`bonsai-logits`, `golden/`) + architecture study (`notes/qwen35-arch.md`) | done | captured two llama.cpp logits rows as reference; documented real tensor layout and open graph questions |
-| M6 | Rust forward pass for qwen35 blocks (attention layers every 4 + gated SSM layers), KV + recurrent state, LM head | planned | greedy logits agree with llama.cpp decode on test prompts |
-| M7 | Standalone Rust engine (loader -> decode -> sample) | planned | same prompts produce same/sane output; llama.cpp link removed |
+| M6 | Rust forward pass for qwen35 blocks (attention layers every 4 + gated SSM layers), KV + recurrent state, LM head | done | greedy id matches llama.cpp golden logits on qa (8160) and code prompts; max logit rel diff 3.4-4.0e-3 |
+| M7 | Standalone Rust engine (loader -> decode -> sample) | done | `bonsai-run` decodes + samples without llama.cpp; standalone `cargo build --release` (no BONSAI_LLAMA_DIR); llama link moved behind `llama-backend` feature |
 
 ## Done so far (context)
 
 - PrismML llama.cpp fork builds (shared + static) in `../llama.cpp`.
-- Hand-rolled `llama.h` FFI (`src/llama.rs`); Rust driver `bonsai-run`.
+- Legacy hand-rolled `llama.h` FFI (`src/llama.rs`), now used only by the
+  `llama-backend` comparison tools.
 - Legacy group-128 ternary GGUFs retagged 42 -> 142 (`bonsai-gguf retag`, Rust).
-- Verified inference on Ternary-Bonsai-27B (thinking + answer) at ~0.4-0.8 tok/s.
+- Verified pure-Rust inference on Ternary-Bonsai-27B against llama.cpp golden
+  logits (greedy ids match on both prompts).
 
 ## Done so far (migration)
 
@@ -47,5 +51,6 @@ Migrate from the outside in:
 | GGUF read/dequant | Rust (M2) |
 | tokenizer | Rust (M3), matches llama.cpp on 1581 corpus lines |
 | detokenizer | Rust (M4) |
-| kernels (RMSNorm, PQ2_0 dequant) | Rust (M5), verified bit-exact vs ggml |
-| decode / KV / EOG | llama.cpp (M6-M7 remain) |
+| kernels (RMSNorm, PQ2_0 dequant, activations) | Rust (M5/M6-2), verified vs ggml probes |
+| forward pass (attn + GDN + FFN + head) | Rust (M6), greedy matches golden logits |
+| decode / KV / EOG | Rust (M7), standalone, llama.cpp link removed |

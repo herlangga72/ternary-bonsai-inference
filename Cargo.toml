@@ -2,8 +2,25 @@
 name = "bonsai-run"
 version = "0.1.0"
 edition = "2021"
-description = "Rust inference driver for Ternary-Bonsai-27B GGUF via the PrismML llama.cpp engine"
+description = "Pure-Rust CPU inference engine for Ternary-Bonsai-27B (qwen35 GGUF)"
 build = "build.rs"
+
+[features]
+default = []
+# Enables the legacy llama.cpp-backed comparison tools (bonsai-logits golden
+# capture, bonsai-tokcmp oracle tokenizer). Requires BONSAI_LLAMA_DIR to point
+# at the PrismML llama.cpp fork build tree. The engine itself never links it.
+llama-backend = []
+
+[[bin]]
+name = "bonsai-logits"
+path = "src/bin/bonsai-logits.rs"
+required-features = ["llama-backend"]
+
+[[bin]]
+name = "bonsai-tokcmp"
+path = "src/bin/bonsai-tokcmp.rs"
+required-features = ["llama-backend"]
 
 [dependencies]
 unicode-general-category = "1.0"

@@ -1,29 +1,21 @@
-//! bonsai-run: run Ternary-Bonsai-27B (ternary Q2_0 GGUF, arch qwen35) on CPU
-//! from Rust, using the PrismML llama.cpp fork as the compute engine.
-//!
-//! The GGUF file is read and the ternary tensors are executed inside llama.cpp;
-//! everything around it (model load, chat template, tokenization, sampling
-//! policy, streaming, timing) lives here in Rust.
+//! bonsai-run: run Ternary-Bonsai-27B (ternary qwen35 GGUF) on CPU entirely in
+//! Rust (M7). No llama.cpp is linked or called: GGUF reading, weight context,
+//! tokenizer/detokenizer, the 64-layer forward pass and the sampler all live
+//! in this crate.
 
+mod forward;
 mod gguf;
 mod gdn;
 mod kernels;
-mod llama;
 mod rope;
 mod sampler;
 mod tokenizer;
 mod weights;
 
-mod forward;
-
+use forward::Decoder;
 use sampler::{Sampler, SamplerConfig};
-
-use llama::*;
-use std::ffi::CString;
 use std::io::{Read, Write};
-use std::os::raw::{c_char, c_void};
 use std::process::exit;
-use std::ptr;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -34,14 +26,11 @@ struct Cli {
     prompt: String,
     system: String,
     n_predict: usize,
-    n_ctx: u32,
-    n_batch: u32,
     temp: f32,
     top_k: i32,
     top_p: f32,
     min_p: f32,
     seed: u32,
-    n_threads: i32,
     verbose: bool,
 }
 
@@ -51,17 +40,12 @@ impl Cli {
             model: String::new(),
             prompt: String::new(),
             system: String::new(),
-            n_predict: 64,
-            n_ctx: 4096,
-            n_batch: 512,
+            n_predict: 8,
             temp: 0.6,
             top_k: 20,
             top_p: 0.9,
             min_p: 0.0,
             seed: 0xFFFF_FFFF, // random
-            n_threads: std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(4),
             verbose: false,
         };
         let mut i = 0;
@@ -79,11 +63,9 @@ impl Cli {
                 "-n" | "--n-predict" => {
                     c.n_predict = need(&mut i, "--n-predict")?.parse().map_err(|_| "--n-predict must be an int")?
                 }
-                "-c" | "--ctx" => {
-                    c.n_ctx = need(&mut i, "--ctx")?.parse().map_err(|_| "--ctx must be an int")?
-                }
-                "-t" | "--threads" => {
-                    c.n_threads = need(&mut i, "--threads")?.parse().map_err(|_| "--threads must be an int")?
+                "-c" | "--ctx" | "-t" | "--threads" | "--n-batch" => {
+                    let flag = args[i].clone();
+                    let _ = need(&mut i, &flag);
                 }
                 "--temp" => c.temp = need(&mut i, "--temp")?.parse().map_err(|_| "--temp must be a float")?,
                 "--top-k" => c.top_k = need(&mut i, "--top-k")?.parse().map_err(|_| "--top-k must be an int")?,
@@ -121,42 +103,18 @@ fn print_usage() {
         "usage: bonsai-run --model <path.gguf> [options]\n\
          \n\
          options:\n\
-         \x20 -m, --model <file>     ternary Q2_0 GGUF (e.g. Ternary-Bonsai-27B-Q2_0.gguf)\n\
+         \x20 -m, --model <file>     ternary PQ2_0 GGUF (arch qwen35)\n\
          \x20 -p, --prompt <text>     user prompt (default: read stdin)\n\
          \x20 -s, --system <text>     system prompt (optional)\n\
-         \x20 -n, --n-predict <n>     max tokens to generate (default 64)\n\
-         \x20 -c, --ctx <n>           context window (default 4096)\n\
-         \x20 -t, --threads <n>       cpu threads (default: all cores)\n\
+         \x20 -n, --n-predict <n>     max tokens to generate (default 8)\n\
          \x20     --temp <f>          temperature (default 0.6)\n\
          \x20     --top-k <n>         top-k (default 20)\n\
          \x20     --top-p <f>         top-p (default 0.9)\n\
          \x20     --min-p <f>         min-p (default 0)\n\
          \x20     --seed <u32>        sampler seed (default random)\n\
-         \x20 -v, --verbose           print timing/debug to stderr\n\
+         \x20 -v, --verbose           print timing to stderr\n\
          \x20 -h, --help              this help"
     );
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-fn cstr(s: &str) -> CString {
-    CString::new(s).unwrap_or_else(|_| CString::new("<invalid utf8>").unwrap())
-}
-
-fn unsafe_cstr<'a>(p: *const c_char) -> &'a str {
-    if p.is_null() {
-        return "";
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(p) };
-    s.to_str().unwrap_or("<non-utf8>")
-}
-
-// forward llama.cpp log output to stderr
-unsafe extern "C" fn log_cb(level: i32, text: *const c_char, _user: *mut c_void) {
-    if level != GGML_LOG_LEVEL_CONT {
-        eprint!("{}", unsafe_cstr(text));
-    }
 }
 
 // Plain-text path of the qwen35 chat template (from the GGUF jinja): wraps
@@ -176,34 +134,6 @@ fn apply_qwen35_template(system: &str, user: &str) -> String {
     out
 }
 
-// Tokenize a text (parse_special=true) with the pure-Rust tokenizer.
-fn tokenize_rust(vocab: &tokenizer::Vocab, text: &str) -> Vec<llama_token> {
-    tokenizer::encode(
-        text,
-        vocab,
-        &tokenizer::TokenizeOptions { add_special: false, parse_special: true },
-    )
-}
-
-// Find single-token ids for the given special token strings (e.g. <|im_end|>),
-// so generation can stop cleanly at them.
-fn find_stop_tokens(vocab: &tokenizer::Vocab, wants: &[&str]) -> Vec<llama_token> {
-    wants
-        .iter()
-        .filter_map(|w| {
-            let toks = tokenize_rust(vocab, w);
-            if toks.len() == 1 {
-                Some(toks[0])
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match Cli::parse(&args) {
@@ -215,43 +145,20 @@ fn main() {
         }
     };
 
-    if cli.verbose {
-        eprintln!("llama.cpp {}", unsafe_cstr(unsafe { llama_version() }));
-    }
-    unsafe {
-        llama_backend_init();
-        llama_log_set(log_cb as *const c_void, ptr::null_mut());
-    }
-
-    // ---- load model -------------------------------------------------------
-    let mpath = cstr(&cli.model);
-    let mut mparams = unsafe { llama_model_default_params() };
-    mparams.n_gpu_layers = 0; // CPU-only
-    eprintln!("loading model {} ...", cli.model);
-    let t_load = Instant::now();
-    let model = unsafe { llama_model_load_from_file(mpath.as_ptr(), mparams) };
-    if model.is_null() {
-        eprintln!("error: failed to load model {}", cli.model);
-        exit(1);
-    }
-    eprintln!("model loaded in {:.1}s", t_load.elapsed().as_secs_f32());
-
-    let mut desc_buf = vec![0u8; 512];
-    unsafe {
-        llama_model_desc(model, desc_buf.as_mut_ptr() as *mut c_char, desc_buf.len());
-    }
-    let desc = unsafe_cstr(desc_buf.as_ptr() as *const c_char);
-    let size_mb = unsafe { llama_model_size(model) } as f64 / (1024.0 * 1024.0);
-    let n_params = unsafe { llama_model_n_params(model) };
-    let n_ctx_train = unsafe { llama_model_n_ctx_train(model) };
+    // ---- load model + tokenizer (pure Rust) ---------------------------------
+    let mut dec = match Decoder::open(&cli.model) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(1);
+        }
+    };
+    let n_vocab = dec.vocab_size();
     eprintln!(
-        "{desc}: {:.0} MiB, {:.2}B params, {n_ctx_train} ctx",
-        size_mb,
-        n_params as f64 / 1e9
+        "model: {} layers, n_embd {}, vocab {}",
+        dec.cfg.n_layer, dec.cfg.n_embd, n_vocab
     );
-    let vocab = unsafe { llama_model_get_vocab(model) };
 
-    // Rust vocabulary (tokenizer + detokenizer live in pure Rust)
     let gf = match gguf::GGUF::open(&cli.model) {
         Ok(g) => g,
         Err(e) => {
@@ -266,43 +173,53 @@ fn main() {
             exit(1);
         }
     };
-    drop(gf);
+    let eos_id = gf
+        .get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.as_u32())
+        .map(|x| x as u32);
 
-    // ---- build the formatted prompt (qwen35 chat template, thinking mode) ---
+    // ---- build the formatted prompt (thinking mode) --------------------------
     let prompt = apply_qwen35_template(&cli.system, &cli.prompt);
     if cli.verbose {
         eprintln!("{prompt}\n");
     }
-
-    // ---- tokenize (pure Rust) ------------------------------------------------
-    let mut toks = tokenize_rust(&rvocab, &prompt);
+    let toks: Vec<u32> = tokenizer::encode(
+        &prompt,
+        &rvocab,
+        &tokenizer::TokenizeOptions { add_special: false, parse_special: true },
+    )
+    .into_iter()
+    .map(|t| t as u32)
+    .collect();
     if toks.is_empty() {
         eprintln!("error: tokenize failed");
         exit(1);
     }
     eprintln!("prompt: {} chars -> {} tokens", prompt.len(), toks.len());
 
-    // ---- context ------------------------------------------------------------
-    let mut cparams = unsafe { llama_context_default_params() };
-    let ctx_size = if cli.n_ctx == 0 {
-        n_ctx_train as u32
-    } else {
-        cli.n_ctx.min(n_ctx_train as u32)
-    };
-    cparams.n_ctx = ctx_size;
-    cparams.n_batch = cli.n_batch;
-    cparams.n_ubatch = cli.n_batch;
-    cparams.n_threads = cli.n_threads;
-    cparams.n_threads_batch = cli.n_threads;
-    let ctx = unsafe { llama_init_from_model(model, cparams) };
-    if ctx.is_null() {
-        eprintln!("error: failed to create context with n_ctx={ctx_size}");
-        exit(1);
+    // stop tokens: chat end markers + eos
+    let mut stop_ids: Vec<u32> = ["<|im_end|>", "<|resp_end|>", "<|endoftext|>"]
+        .iter()
+        .filter_map(|w| {
+            let t = tokenizer::encode(
+                w,
+                &rvocab,
+                &tokenizer::TokenizeOptions { add_special: false, parse_special: true },
+            );
+            if t.len() == 1 {
+                Some(t[0] as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if let Some(e) = eos_id {
+        stop_ids.push(e);
     }
-    eprintln!("context created: n_ctx={ctx_size}, n_batch={}", cli.n_batch);
+    if cli.verbose {
+        eprintln!("stops: {stop_ids:?}");
+    }
 
-    // ---- Rust sampler -------------------------------------------------------
-    let n_vocab = unsafe { llama_vocab_n_tokens(vocab) } as usize;
     let sampler_cfg = SamplerConfig {
         top_k: cli.top_k,
         top_p: cli.top_p,
@@ -316,109 +233,73 @@ fn main() {
         cli.temp, cli.top_k, cli.top_p, cli.min_p
     );
 
-    // stop tokens: chat end markers (EOG handled separately)
-    let stop_ids = find_stop_tokens(&rvocab, &["<|im_end|>", "<|resp_end|>"]);
-    eprintln!("stops: {stop_ids:?}");
-
-    // ---- prefill ------------------------------------------------------------
+    // ---- prefill (forward each prompt token, cache the final hidden) ---------
+    eprintln!("prefill ...");
     let t_gen0 = Instant::now();
-    let n_prompt = toks.len();
-    let mut n_past: i32 = 0;
-    let mut pos_buf: Vec<llama_pos> = Vec::new();
-    let mut start = 0;
-    let mut logits_at: i32 = 0; // batch position whose logits we read
-    while start < n_prompt {
-        let chunk = (n_prompt - start).min(cli.n_batch as usize);
-        if start + chunk == n_prompt {
-            logits_at = chunk as i32 - 1; // last prompt token
-        }
-        pos_buf.clear();
-        pos_buf.extend((n_past..n_past + chunk as i32).map(|p| p as llama_pos));
-        let batch = llama_batch {
-            n_tokens: chunk as i32,
-            token: toks[start..start + chunk].as_mut_ptr(),
-            embd: ptr::null_mut(),
-            pos: pos_buf.as_mut_ptr(),
-            n_seq_id: ptr::null_mut(),
-            seq_id: ptr::null_mut(),
-            // NULL logits => only the last token of the batch emits logits
-            logits: ptr::null_mut(),
+    let mut last_h = Vec::new();
+    for (pos, &tok) in toks.iter().enumerate() {
+        last_h = match dec.forward_hidden(tok, pos) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error at prefill pos {pos}: {e}");
+                exit(1);
+            }
         };
-        let rc = unsafe { llama_decode(ctx, batch) };
-        if rc != 0 {
-            eprintln!("error: llama_decode (prefill chunk) failed rc={rc}");
-            exit(1);
-        }
-        n_past += chunk as i32;
-        start += chunk;
     }
     let t_prefill = t_gen0.elapsed();
     eprintln!(
-        "prefill done in {:.2}s ({:.1} tok/s)",
+        "prefill done in {:.0}s ({:.2} s/tok)",
         t_prefill.as_secs_f32(),
-        n_prompt as f32 / t_prefill.as_secs_f32().max(1e-6)
+        t_prefill.as_secs_f32() / toks.len() as f32
     );
 
     // ---- decode loop ----------------------------------------------------------
     let mut stdout = std::io::stdout();
     let t0 = Instant::now();
-    let mut n_gen: i64 = 0;
+    let mut n_gen: u64 = 0;
+    let mut logits = match dec.head_logits(&last_h) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit(1);
+        }
+    };
 
     loop {
-        // sample from the logits of the token at batch position `logits_at`
-        let logits_ptr = unsafe { llama_get_logits_ith(ctx, logits_at) };
-        if logits_ptr.is_null() {
-            eprintln!("error: no logits available");
+        let id = sampler.sample(&logits, &sampler_cfg) as u32;
+        if stop_ids.contains(&id) {
             break;
         }
-        let logits = unsafe { std::slice::from_raw_parts(logits_ptr, n_vocab) };
-        let id = sampler.sample(logits, &sampler_cfg);
-
-        if unsafe { llama_vocab_is_eog(vocab, id) != 0 } || stop_ids.contains(&id) {
-            break;
-        }
-
-        // token -> text (pure Rust detokenizer)
-        let piece = rvocab.piece_bytes(id);
+        let piece = rvocab.piece_bytes(id as i32);
         let _ = stdout.write_all(&piece);
         let _ = stdout.flush();
         n_gen += 1;
-        if n_gen >= cli.n_predict as i64 {
+        if n_gen >= cli.n_predict as u64 {
             break;
         }
 
-        // decode the sampled token as a 1-token batch
-        let mut tok_slot = id;
-        let mut pos_slot = n_past;
-        let batch = llama_batch {
-            n_tokens: 1,
-            token: &mut tok_slot,
-            embd: ptr::null_mut(),
-            pos: &mut pos_slot,
-            n_seq_id: ptr::null_mut(),
-            seq_id: ptr::null_mut(),
-            logits: ptr::null_mut(),
+        let pos = toks.len() + n_gen as usize - 1;
+        let h = match dec.forward_hidden(id, pos) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("\nerror: decode failed at pos {pos}: {e}");
+                exit(1);
+            }
         };
-        let rc = unsafe { llama_decode(ctx, batch) };
-        if rc != 0 {
-            eprintln!("\nerror: llama_decode (generation) failed rc={rc}");
-            break;
-        }
-        logits_at = 0; // next sample reads this token's row
-        n_past += 1;
+        logits = match dec.head_logits(&h) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("\nerror: head failed: {e}");
+                exit(1);
+            }
+        };
     }
 
     let el = t0.elapsed();
     let _ = stdout.flush();
     eprintln!(
-        "\n\n{n_gen} tokens in {:.2}s ({:.1} tok/s, {:.1} ms/tok)",
+        "\n\n{n_gen} tokens in {:.0}s ({:.2} s/tok)",
         el.as_secs_f32(),
-        n_gen as f32 / el.as_secs_f32().max(1e-6),
-        el.as_secs_f32() * 1000.0 / n_gen.max(1) as f32,
+        el.as_secs_f32() / n_gen.max(1) as f32,
     );
-
-    unsafe {
-        llama_free(ctx);
-        llama_model_free(model);
-    }
 }

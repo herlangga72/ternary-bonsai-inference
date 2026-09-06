@@ -1,7 +1,11 @@
 # tenarybonsai-fast
 
 Rust-driven CPU inference for **Ternary-Bonsai-27B**, PrismML's ternary-weight
-build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
+build of Qwen3.6-27B. The engine is pure Rust: GGUF parsing, tokenizer,
+64-layer qwen35 forward pass, sampler and detokenizer, with no llama.cpp link.
+The [PrismML llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp)
+(`prism` branch) is only needed to regenerate the golden-logit captures used
+for validation (`llama-backend` cargo feature).
 
 ## How Ternary Bonsai works
 
@@ -15,9 +19,9 @@ build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
   is one of {-1, 0, +1}, packed 2 bits each, with one FP16 group scale per 128
   weights (`PQ2_0`, ggml type 142). ~1.71 effective bits/weight, ~95% of the
   FP16 model's benchmark score, no higher-precision escape hatches.
-- **Runtime**: llama.cpp is the reference runtime, but only the 1-bit variant is
-  upstream. The ternary weights need the [PrismML llama.cpp fork]
-  (https://github.com/PrismML-Eng/llama.cpp) (`prism` branch).
+- **Runtime**: llama.cpp was the reference while the forward pass was being
+  ported. The migration is complete: `bonsai-run` decodes in pure Rust and the
+  engine builds without the fork (see Build).
 
 ## What is in this repo
 
@@ -27,18 +31,24 @@ build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
 | `Ternary-Bonsai-27B-PQ2_0.gguf` | Header-retagged copy (type 42 -> 142) that the current prism branch loads |
 | `Ternary-Bonsai-27B-dspark-Q4_1.gguf` | DeepSpark speculator sidecar (3.6B, Q4_1 + TQ1_0, one legacy ternary tensor); not standalone |
 | `Ternary-Bonsai-27B-dspark-PQ2_0.gguf` | Same, retagged so the speculative loader accepts it |
-| `src/llama.rs` | Hand-rolled FFI to the fork's `llama.h` (structs transcribed) |
-| `src/main.rs` | Rust driver: model load, chat template, tokenize, sample, stream, timing |
-| `src/sampler.rs` | Pure-Rust sampler (top-k/top-p/min-p/temp/dist) replacing the llama sampler chain |
+| `src/llama.rs` | Legacy hand-rolled FFI to `llama.h`; only used by the `llama-backend` compare tools |
+| `src/main.rs` | Pure-Rust `bonsai-run` driver: load, chat template, tokenize, decode, sample, stream |
+| `src/sampler.rs` | Pure-Rust sampler (top-k/top-p/min-p/temp/dist) |
 | `src/gguf.rs` | Pure-Rust GGUF reader: metadata, tensor index, PQ2_0/F16/F32 dequant, layout checks, retag |
 | `src/tokenizer.rs` | Pure-Rust qwen35 BPE tokenizer + GPT-2 byte decoder (detokenizer) |
+| `src/weights.rs` | Weight context: qwen35 hyperparams + name-indexed tensor access (M6-1) |
+| `src/forward.rs` | Forward pass: full-attention, recurrent (GDN), FFN, full decoder (M6-3..M6-5) |
+| `src/kernels.rs` | Pure-Rust kernels: RMSNorm, L2 norm, SiLU/softplus/sigmoid, softmax, PQ2_0 row dequant/dot |
+| `src/rope.rs` / `src/gdn.rs` | IMROPE multi-rope / gated-delta-net step (validated vs ggml) |
 | `src/bin/bonsai-gguf.rs` | CLI: `inspect`, `probe` (decode a tensor window), `retag` (42 -> 142) |
-| `src/bin/bonsai-tokcmp.rs` | Tokenizer verification: Rust vs `llama_tokenize` over a corpus |
-| `src/kernels.rs` | Pure-Rust kernels: RMSNorm, PQ2_0 row dequant/dot (M5) |
-| `src/bin/bonsai-kerncmp.rs` | Kernel verification vs ggml reference (`tools/ggml_probe`) |
+| `src/bin/bonsai-weights.rs` | Weight-context config / tensor-manifest check |
+| `src/bin/bonsai-*.rs` (attn/ssm/decode/golden) | Layer + decoder smokes and M6-6 golden-logit validation |
+| `src/bin/bonsai-tokcmp.rs` | Tokenizer verification: Rust vs `llama_tokenize` over a corpus (`llama-backend`) |
+| `src/bin/bonsai-logits.rs` | Capture golden logits from llama.cpp (`llama-backend`) |
+| `src/bin/bonsai-kerncmp.rs` / `bonsai-actcmp.rs` | Kernel/activation verification vs `tools/ggml_probe` |
 | `tools/ggml_probe.c` | C reference harness running single ggml ops on real tensor data |
 | `tools/retag_gguf.py` | Original Python retag (superseded by the Rust tool; kept for reference) |
-| `build.rs` | Links the static PrismML llama.cpp libraries |
+| `build.rs` | No-op unless the `llama-backend` feature is enabled, then links the static fork libs |
 
 ## The format gotcha (important)
 
@@ -78,20 +88,28 @@ follow-up rather than part of the basic inference path.
 
 ## Build
 
-1. Clone and build the PrismML fork (static libs):
+The engine is pure Rust and builds standalone (no llama.cpp needed):
 
-   ```sh
-   git clone -b prism https://github.com/PrismML-Eng/llama.cpp
-   cd llama.cpp
-   cmake -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-   cmake --build build-static -j
-   ```
+```sh
+cargo build --release
+```
 
-2. Build the Rust driver:
+The legacy llama.cpp-backed comparison tools (`bonsai-logits` golden capture,
+`bonsai-tokcmp` oracle tokenizer) need the PrismML fork and the `llama-backend`
+feature:
 
-   ```sh
-   BONSAI_LLAMA_DIR=/path/to/llama.cpp/build-static cargo build --release
-   ```
+```sh
+git clone -b prism https://github.com/PrismML-Eng/llama.cpp
+cd llama.cpp
+cmake -B build-static -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+cmake --build build-static -j
+cd ..
+export BONSAI_LLAMA_DIR=/path/to/llama.cpp/build-static
+cargo build --release --features llama-backend
+```
+
+`tools/ggml_probe.c` is compiled separately against the fork's ggml headers
+when you want to re-run the kernel/activation reference checks.
 
 ## Run
 
@@ -99,39 +117,37 @@ follow-up rather than part of the basic inference path.
 ./target/release/bonsai-run \
   -m Ternary-Bonsai-27B-PQ2_0.gguf \
   -p "What is the capital of France?" \
-  -n 24 --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0 -t 4
+  -n 24 --temp 0.5 --top-p 0.85 --top-k 20 --min-p 0
 ```
 
 Sampling defaults are Bonsai-flavored (top-k 20, top-p 0.9, temp 0.6); the docs
-recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`.
+recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`. The scalar Rust
+decoder is slow, so start with `-n 1..4` and a short prompt.
 
 ## Performance expectations
 
 27B ternary weights stream from RAM every token. Measured on a 4-core Ryzen
-3200G (15 GB RAM, DDR4):
+3200G (15 GB RAM, DDR4) with the scalar pure-Rust decoder:
 
 | phase | rate |
 | --- | --- |
-| model load (mmap) | ~1 s |
-| prefill | ~0.8 tok/s (first call also cold-maps the 6.8 GB file) |
-| decode | ~0.4-0.8 tok/s (~1.7-2.3 s/token) |
+| model load (header + tensor index) | ~1 s |
+| prefill | ~32 s/token (no parallel matvec yet) |
+| decode | ~23-34 s/token (LM head included) |
 
 The model is a reasoning model. The prompt is seeded with `<think>`, the model
 streams its reasoning, closes `</think>`, then gives the final answer and stops
 at `<|im_end|>`. A short factual prompt needs ~150-200 generated tokens, so
-budget a few minutes per run on CPU-only hardware.
+budget ~1-2 hours per full answer on CPU-only hardware (or use the golden
+logits + short prompts for validation).
 
 ## Sample run
 
 ```
-prompt: 104 chars -> 20 tokens
-prefill done in 25.98s (0.8 tok/s)
-Here's a thinking process:
-1.  **Analyze User Input:**
-    - Question: "What is the capital of France?"
-    - Constraint: "Answer briefly."
-...
-</think>
-Paris.
-164 tokens in 371.53s (0.4 tok/s)
+prompt: 86 chars -> 20 tokens
+prefill done in 649s (32.43 s/tok)
+Here's a
+3 tokens in 69s (23.09 s/tok)
 ```
+
+(The model was mid-reasoning; a full answer needs many more tokens.)

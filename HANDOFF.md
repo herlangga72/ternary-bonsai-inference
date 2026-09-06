@@ -14,8 +14,8 @@ code is required.
 
 ```
 tenarybonsai-fast/
-  Cargo.toml            single package, several bins; links llama.cpp (build.rs)
-  build.rs              links static PrismML llama.cpp libs (BONSAI_LLAMA_DIR)
+  Cargo.toml            single package, several bins; `llama-backend` feature gates llama tools
+  build.rs              links static PrismML llama.cpp libs only under `llama-backend`
   README.md             project + model explainer, build/run instructions
   ROADMAP.md            milestone table with verification notes
   notes/qwen35-arch.md       tensor layout, layer facts, open questions
@@ -31,7 +31,8 @@ tenarybonsai-fast/
     rope.rs             IMROPE multi-rope (M6, validated)
     weights.rs          weight-context engine: qwen35 hyperparams + tensor-name mapping (M6-1)
     forward.rs          qwen35 forward pieces: attn+recurrent layers, FFN, Decoder (M6-3..M6-5)
-    main.rs             bonsai-run CLI (still uses llama.cpp for decode)
+    main.rs             bonsai-run CLI (pure-Rust engine, M7)
+    llama.rs            legacy FFI, only compiled by `llama-backend` feature bins
   src/bin/
     bonsai-gguf         inspect / probe / retag GGUF
     bonsai-tokcmp       Rust tokenizer vs llama_tokenize on corpus
@@ -62,23 +63,36 @@ External dependency: `/home/server/sdgs/llama.cpp` = PrismML fork clone with
 ## Build / verify commands
 
 ```sh
-export BONSAI_LLAMA_DIR=/home/server/sdgs/llama.cpp/build-static
+# pure engine (standalone, no llama.cpp needed)
 cargo build --release
+
+# llama.cpp-backed comparison tools (golden capture, tokenizer oracle)
+export BONSAI_LLAMA_DIR=/home/server/sdgs/llama.cpp/build-static
+cargo build --release --features llama-backend
+
 cargo test --release
+
 gcc -O2 tools/ggml_probe.c -I /home/server/sdgs/llama.cpp/ggml/include \
   -o target/ggml_probe -L /home/server/sdgs/llama.cpp/build-static/ggml/src \
   -lggml-base -lggml-cpu -lggml -lstdc++ -lgomp -lm -lpthread -ldl
 
-# tokenizer corpus check (Rust vs llama.cpp)
+# tokenizer corpus check (Rust vs llama.cpp, needs llama-backend build)
 ./target/release/bonsai-tokcmp Ternary-Bonsai-27B-PQ2_0.gguf < /tmp/corpus2.txt
 
 # kernel / op reference checks
 ./target/release/bonsai-kerncmp Ternary-Bonsai-27B-PQ2_0.gguf ./target/ggml_probe
 ./target/release/bonsai-gdncmp ./target/ggml_probe
 ./target/release/bonsai-ropecmp ./target/ggml_probe
+./target/release/bonsai-actcmp ./target/ggml_probe
 
-# capture golden logits (llama.cpp), for M6
-./target/release/bonsai-logits Ternary-Bonsai-27B-PQ2_0.gguf golden/prompts/qa.txt golden/qa.logits.bin
+# weight-context and forward smokes on the real model
+./target/release/bonsai-weights check Ternary-Bonsai-27B-PQ2_0.gguf
+./target/release/bonsai-attn Ternary-Bonsai-27B-PQ2_0.gguf 3 3
+./target/release/bonsai-ssm Ternary-Bonsai-27B-PQ2_0.gguf 0 3
+
+# golden-logit validation (pure Rust decode vs llama.cpp capture)
+./target/release/bonsai-golden Ternary-Bonsai-27B-PQ2_0.gguf \
+  golden/prompts/qa.txt golden/qa.logits.bin
 ```
 
 ## What works (verified)
@@ -100,13 +114,13 @@ gcc -O2 tools/ggml_probe.c -I /home/server/sdgs/llama.cpp/ggml/include \
 | M6-3 | full-attention layer (forward.rs) | smoke on blk.3 over 3 synthetic tokens: finite outputs, KV cache grows per pos; unit test on cache layout |
 | M6-4 | recurrent layer (forward.rs) | smoke on blk.0 over 3 synthetic tokens: causal conv cache + GDN state evolve; finite outputs |
 | M6-5 | full decoder (Decoder in forward.rs) | single-token decode through all 64 layers + LM head on real model: finite logits over 248k vocab; ~34 s/token |
-| M6-6 | golden-logit validation | qa prompt: greedy id 8160 matches golden, logits rel diff 4.0e-3 (first run, no layer debugging) |
+| M6-6 | golden-logit validation | qa prompt: greedy id 8160 matches golden, logits rel diff 4.0e-3; code prompt: greedy 8160, rel diff 3.4e-3 (both first-run, no layer debugging) |
+| M7 | standalone pure-Rust engine | bonsai-run decodes + samples with no llama.cpp link; cargo build --release works without BONSAI_LLAMA_DIR; llama tools behind llama-backend feature |
 
 ## Next work, structured (do in order)
 
-1. **M7**: standalone engine binary that no longer links llama.cpp: replace
-   `llama_decode` path entirely; drop build.rs linkage and llama.rs usage in
-   main.
+None: the M1..M7 migration is complete. Remaining ideas are optimizations
+(see "Later optimizations") and the dspark speculative sidecar.
 
 Later optimizations (not required for correctness): mmap tensor data, cache
 row decode buffers, SIMD dot via `std::arch`, fuse layers, speculative dspark.

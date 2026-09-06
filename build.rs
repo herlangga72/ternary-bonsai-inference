@@ -1,12 +1,15 @@
 use std::env;
 use std::path::PathBuf;
 
-// Links against the PrismML llama.cpp fork build.
-//
-// The fork is required for ternary Q2_0 GGUFs (arch qwen35). Point BONSAI_LLAMA_DIR
-// at a cmake build tree of https://github.com/PrismML-Eng/llama.cpp (prism branch),
-// e.g. BONSAI_LLAMA_DIR=/home/server/sdgs/llama.cpp/build
+// Links against the PrismML llama.cpp fork build, but ONLY for the legacy
+// `llama-backend` comparison tools (golden-logit capture, oracle tokenizer).
+// The pure-Rust engine never links llama.cpp, so without that feature this
+// script is a no-op and no external build tree is required.
 fn main() {
+    if env::var("CARGO_FEATURE_LLAMA_BACKEND").is_err() {
+        return;
+    }
+
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
     // Candidates for the llama.cpp cmake build tree, in priority order.
