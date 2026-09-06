@@ -148,8 +148,10 @@ unsafe extern "C" fn log_cb(level: i32, text: *const c_char, _user: *mut c_void)
     }
 }
 
-// Fallback chatml prompt when the model template cannot be applied.
-fn fallback_chatml(system: &str, user: &str) -> String {
+// Plain-text path of the qwen35 chat template (from the GGUF jinja): wraps
+// messages in <|im_start|> markers and starts the assistant turn in thinking
+// mode with a <think> tag. Text-only chats, no tools/vision.
+fn apply_qwen35_template(system: &str, user: &str) -> String {
     let mut out = String::new();
     if !system.is_empty() {
         out.push_str("<|im_start|>system\n");
@@ -159,26 +161,51 @@ fn fallback_chatml(system: &str, user: &str) -> String {
     out.push_str("<|im_start|>user\n");
     out.push_str(user);
     out.push_str("<|im_end|>\n");
-    out.push_str("<|im_start|>assistant\n");
+    out.push_str("<|im_start|>assistant\n<think>\n");
     out
 }
 
-// Scan the vocabulary for special token ids used as generation stops.
-fn find_stop_tokens(vocab: *const llama_vocab, wants: &[&str]) -> Vec<llama_token> {
-    let n = unsafe { llama_vocab_n_tokens(vocab) };
-    let mut found: Vec<Option<llama_token>> = vec![None; wants.len()];
-    for tok in 0..n {
-        let text = unsafe_cstr(unsafe { llama_vocab_get_text(vocab, tok) });
-        for (i, w) in wants.iter().enumerate() {
-            if found[i].is_none() && text == *w {
-                found[i] = Some(tok);
-            }
+// Tokenize a text (parse_special=true) into token ids.
+fn tokenize_text(vocab: *const llama_vocab, text: &str) -> Vec<llama_token> {
+    let c = cstr(text);
+    let mut cap = (text.len() * 4 + 64) as i32;
+    let mut toks: Vec<llama_token> = vec![0; cap as usize];
+    loop {
+        let n = unsafe {
+            llama_tokenize(
+                vocab,
+                c.as_ptr(),
+                text.len() as i32,
+                toks.as_mut_ptr(),
+                cap,
+                0,
+                1, // parse_special: resolve <|...|> style tokens
+            )
+        };
+        if n < 0 {
+            cap = -n;
+            toks.resize(cap as usize, 0);
+            continue;
         }
-        if found.iter().all(|f| f.is_some()) {
-            break;
-        }
+        toks.truncate(n as usize);
+        return toks;
     }
-    found.into_iter().flatten().collect()
+}
+
+// Find single-token ids for the given special token strings (e.g. <|im_end|>),
+// so generation can stop cleanly at them.
+fn find_stop_tokens(vocab: *const llama_vocab, wants: &[&str]) -> Vec<llama_token> {
+    wants
+        .iter()
+        .filter_map(|w| {
+            let toks = tokenize_text(vocab, w);
+            if toks.len() == 1 {
+                Some(toks[0])
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -231,72 +258,19 @@ fn main() {
     );
     let vocab = unsafe { llama_model_get_vocab(model) };
 
-    // ---- build the formatted prompt with the model's chat template ---------
-    let role_sys = cstr("system");
-    let role_user = cstr("user");
-    let content_sys = cstr(&cli.system);
-    let content_user = cstr(&cli.prompt);
-
-    let prompt: String;
-    let tmpl = unsafe { llama_model_chat_template(model, ptr::null()) };
-    if !tmpl.is_null() {
-        let mut messages: Vec<llama_chat_message> = Vec::new();
-        if !cli.system.is_empty() {
-            messages.push(llama_chat_message {
-                role: role_sys.as_ptr(),
-                content: content_sys.as_ptr(),
-            });
-        }
-        messages.push(llama_chat_message {
-            role: role_user.as_ptr(),
-            content: content_user.as_ptr(),
-        });
-        let needed = unsafe {
-            llama_chat_apply_template(tmpl, messages.as_ptr(), messages.len(), 1, ptr::null_mut(), 0)
-        };
-        if needed > 0 {
-            let mut buf = vec![0u8; (needed + 1) as usize];
-            let n = unsafe {
-                llama_chat_apply_template(
-                    tmpl,
-                    messages.as_ptr(),
-                    messages.len(),
-                    1,
-                    buf.as_mut_ptr() as *mut c_char,
-                    needed + 1,
-                )
-            };
-            if n > 0 {
-                buf.truncate(n as usize);
-                prompt = String::from_utf8_lossy(&buf).to_string();
-            } else {
-                prompt = fallback_chatml(&cli.system, &cli.prompt);
-            }
-        } else {
-            prompt = fallback_chatml(&cli.system, &cli.prompt);
-        }
-    } else {
-        prompt = fallback_chatml(&cli.system, &cli.prompt);
-    }
-
-    // ---- tokenize ----------------------------------------------------------
-    let ptext = cstr(&prompt);
-    let n_tok = unsafe {
-        llama_tokenize(vocab, ptext.as_ptr(), -1, ptr::null_mut(), 0, 0, 1)
-    };
-    let n_tok = if n_tok < 0 { -n_tok } else { n_tok };
-    if n_tok <= 0 {
-        eprintln!("error: tokenize failed");
-        exit(1);
-    }
-    let mut toks: Vec<llama_token> = vec![0; n_tok as usize];
-    unsafe {
-        llama_tokenize(vocab, ptext.as_ptr(), -1, toks.as_mut_ptr(), n_tok, 0, 1);
-    }
-    eprintln!("prompt: {} chars -> {} tokens", prompt.len(), toks.len());
+    // ---- build the formatted prompt (qwen35 chat template, thinking mode) ---
+    let prompt = apply_qwen35_template(&cli.system, &cli.prompt);
     if cli.verbose {
         eprintln!("{prompt}\n");
     }
+
+    // ---- tokenize ----------------------------------------------------------
+    let mut toks = tokenize_text(vocab, &prompt);
+    if toks.is_empty() {
+        eprintln!("error: tokenize failed");
+        exit(1);
+    }
+    eprintln!("prompt: {} chars -> {} tokens", prompt.len(), toks.len());
 
     // ---- context ------------------------------------------------------------
     let mut cparams = unsafe { llama_context_default_params() };
@@ -331,7 +305,7 @@ fn main() {
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli.seed));
     }
 
-    // stop tokens: chatml end markers + eog handled separately
+    // stop tokens: chat end markers (EOG handled separately)
     let stop_ids = find_stop_tokens(vocab, &["<|im_end|>", "<|resp_end|>"]);
     eprintln!(
         "sampler: temp={} top_k={} top_p={} min_p={}; stops: {:?}",
