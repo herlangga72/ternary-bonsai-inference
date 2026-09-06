@@ -100,13 +100,11 @@ gcc -O2 tools/ggml_probe.c -I /home/server/sdgs/llama.cpp/ggml/include \
 | M6-3 | full-attention layer (forward.rs) | smoke on blk.3 over 3 synthetic tokens: finite outputs, KV cache grows per pos; unit test on cache layout |
 | M6-4 | recurrent layer (forward.rs) | smoke on blk.0 over 3 synthetic tokens: causal conv cache + GDN state evolve; finite outputs |
 | M6-5 | full decoder (Decoder in forward.rs) | single-token decode through all 64 layers + LM head on real model: finite logits over 248k vocab; ~34 s/token |
+| M6-6 | golden-logit validation | qa prompt: greedy id 8160 matches golden, logits rel diff 4.0e-3 (first run, no layer debugging) |
 
 ## Next work, structured (do in order)
 
-1. **M6-6 golden validation**: compute logits for golden/prompts/qa.txt and
-   compare argmax + logits against golden/qa.logits.bin. Expect first-run
-   mismatches; debug layer by layer (instrument per-layer hidden norms).
-2. **M7**: standalone engine binary that no longer links llama.cpp: replace
+1. **M7**: standalone engine binary that no longer links llama.cpp: replace
    `llama_decode` path entirely; drop build.rs linkage and llama.rs usage in
    main.
 
