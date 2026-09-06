@@ -288,24 +288,27 @@ impl Weights {
         match t.ty {
             TYPE_PQ2_0 => {
                 let row_bytes = kernels::pq2_row_bytes(ne0);
-                let mut raw = vec![0u8; row_bytes];
-                self.gguf
-                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * row_bytes as u64, &mut raw)?;
-                Ok(kernels::decode_pq2_0_row(&raw, ne0))
+                let raw = self.gguf.slice_at(
+                    self.gguf.tensor_data_offset(&t) + row * row_bytes as u64,
+                    row_bytes,
+                )?;
+                Ok(kernels::decode_pq2_0_row(raw, ne0))
             }
             TYPE_F32 => {
-                let mut raw = vec![0u8; ne0 * 4];
-                self.gguf
-                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 4, &mut raw)?;
+                let raw = self.gguf.slice_at(
+                    self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 4,
+                    ne0 * 4,
+                )?;
                 Ok(raw
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect())
             }
             TYPE_F16 => {
-                let mut raw = vec![0u8; ne0 * 2];
-                self.gguf
-                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 2, &mut raw)?;
+                let raw = self.gguf.slice_at(
+                    self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 2,
+                    ne0 * 2,
+                )?;
                 Ok(raw
                     .chunks_exact(2)
                     .map(|c| crate::gguf::half_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -363,7 +366,8 @@ impl Weights {
                 y.len()
             ));
         }
-        kernels::pq2_matvec_range(&mut self.gguf, t, base_row as u64, n_rows, x, y)
+        let payload = self.gguf.payload_slice(t)?;
+        kernels::pq2_matvec_range(&payload, ne0, base_row as u64, n_rows, x, y)
     }
 
     /// Name-based `matvec_into`: fetch, validate, and run a row slice.
@@ -731,7 +735,9 @@ mod tests {
             .unwrap()
             .clone();
         let mut ref_y = vec![0.0f32; cfg.n_ff];
-        kernels::pq2_matvec_range(&mut raw, &t2, 0, cfg.n_ff, &x, &mut ref_y).unwrap();
+        let t2_ne0 = t2.dims[0] as usize;
+        let payload2 = raw.payload_slice(&t2).unwrap();
+        kernels::pq2_matvec_range(&payload2, t2_ne0, 0, cfg.n_ff, &x, &mut ref_y).unwrap();
         assert_eq!(y, ref_y);
 
         // row_f32 agrees with the raw kernel row path

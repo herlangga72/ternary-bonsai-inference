@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use crate::gguf::{GGUF, TensorInfo, TYPE_PQ2_0};
+use crate::gguf::{half_to_f32, TensorInfo};
 
 /// RMSNorm: out_i = x_i * w_i * rsqrt(mean(x^2) + eps)
 pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
@@ -170,16 +170,14 @@ pub fn decode_pq2_0_row(raw: &[u8], ne0: usize) -> Vec<f32> {
 }
 
 /// Dot product of a row of a PQ2_0 tensor with `x` (length ne0).
+/// `payload` must be the tensor's whole contiguous data (see
+/// `GGUF::payload_slice`); row `row` starts at `payload[row * row_bytes]`.
 pub fn dot_pq2_0_row(
-    gguf: &mut GGUF,
-    info: &TensorInfo,
+    payload: &[u8],
+    ne0: usize,
     row: u64,
     x: &[f32],
 ) -> Result<f32, String> {
-    if info.ty != TYPE_PQ2_0 {
-        return Err("dot_pq2_0_row: tensor is not PQ2_0".into());
-    }
-    let ne0 = info.dims[0] as usize;
     if x.len() != ne0 {
         return Err(format!(
             "dot_pq2_0_row: x length {} != ne0 {}",
@@ -188,11 +186,18 @@ pub fn dot_pq2_0_row(
         ));
     }
     let row_bytes = pq2_row_bytes(ne0);
-    let mut raw = vec![0u8; row_bytes];
-    gguf.read_bytes(gguf.tensor_data_offset(info) + row * row_bytes as u64, &mut raw)?;
+    let start = row as usize * row_bytes;
+    let end = start + row_bytes;
+    if end > payload.len() {
+        return Err(format!(
+            "dot_pq2_0_row: row {row} needs bytes {start}..{end}, payload is {}",
+            payload.len()
+        ));
+    }
+    let raw = &payload[start..end];
 
     let mut acc = 0.0f32;
-    for (v, w) in x.iter().zip(decode_pq2_0_row(&raw, ne0).iter()) {
+    for (v, w) in x.iter().zip(decode_pq2_0_row(raw, ne0).iter()) {
         acc += v * w;
     }
     Ok(acc)
@@ -200,18 +205,21 @@ pub fn dot_pq2_0_row(
 
 /// Batched PQ2_0 matrix-vector product over a contiguous range of rows.
 /// Computes y[r] = sum_j x[j] * W[base_row + r][j].
+/// `payload` is the tensor's whole contiguous data section; rows are laid out
+/// back to back with `row_bytes` stride (see `GGUF::payload_slice`). No file
+/// I/O and no per-row scratch: the caller passes an mmap-backed slice.
+///
+/// Large row ranges are split across the available cores (scoped threads,
+/// read-only payload + x, disjoint y chunks). Small ranges run inline to keep
+/// per-matvec launch overhead out of the dozens of small tensors per layer.
 pub fn pq2_matvec_range(
-    gguf: &mut GGUF,
-    info: &TensorInfo,
+    payload: &[u8],
+    ne0: usize,
     base_row: u64,
     n_rows: usize,
     x: &[f32],
     y: &mut [f32],
 ) -> Result<(), String> {
-    if info.ty != TYPE_PQ2_0 {
-        return Err("pq2_matvec_range: tensor is not PQ2_0".into());
-    }
-    let ne0 = info.dims[0] as usize;
     if x.len() != ne0 {
         return Err(format!("pq2_matvec_range: x length {} != ne0 {}", x.len(), ne0));
     }
@@ -219,15 +227,70 @@ pub fn pq2_matvec_range(
         return Err("pq2_matvec_range: y too small".into());
     }
     let row_bytes = pq2_row_bytes(ne0);
-    let mut raw = vec![0u8; row_bytes];
-    for r in 0..n_rows {
-        let off = gguf.tensor_data_offset(info) + (base_row + r as u64) * row_bytes as u64;
-        gguf.read_bytes(off, &mut raw)?;
+    let byte_len = (base_row as usize + n_rows)
+        .checked_mul(row_bytes)
+        .ok_or("pq2_matvec_range: row range byte length overflows")?;
+    if byte_len > payload.len() {
+        return Err(format!(
+            "pq2_matvec_range: rows {base_row}..{} need {byte_len} bytes, payload is {}",
+            base_row + n_rows as u64,
+            payload.len()
+        ));
+    }
+    let base = base_row as usize;
+    // Minimum rows per matvec before spawning threads (the tiny ssm_alpha /
+    // ssm_beta / norm-side projections stay inline).
+    const MIN_PARALLEL_ROWS: usize = 1024;
+    let n_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if n_rows < MIN_PARALLEL_ROWS || n_cores <= 1 {
+        dot_rows_into(payload, ne0, base, 0..n_rows, x, &mut y[..n_rows]);
+        return Ok(());
+    }
+
+    // Split rows into ~one contiguous chunk per core; each chunk writes a
+    // disjoint, contiguous y range (no false sharing) and reads its own rows.
+    let n_workers = n_cores.min(n_rows);
+    let chunk = n_rows.div_ceil(n_workers);
+    let ranges: Vec<std::ops::Range<usize>> = (0..n_workers)
+        .map(|w| {
+            let s = w * chunk;
+            let e = (s + chunk).min(n_rows);
+            s..e
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        let mut y_rest = &mut y[..n_rows];
+        for range in ranges {
+            let (head, tail) = y_rest.split_at_mut(range.len());
+            y_rest = tail;
+            let head: &mut [f32] = head;
+            scope.spawn(move || dot_rows_into(payload, ne0, base, range, x, head));
+        }
+    });
+    Ok(())
+}
+
+/// Dot rows `base + range` (local row index within `range`) into `y`, one
+/// output float per row. Shared by the scalar and the per-thread paths so the
+/// decode math is bit-identical either way.
+fn dot_rows_into(
+    payload: &[u8],
+    ne0: usize,
+    base: usize,
+    rows: std::ops::Range<usize>,
+    x: &[f32],
+    y: &mut [f32],
+) {
+    debug_assert_eq!(y.len(), rows.len());
+    let row_bytes = pq2_row_bytes(ne0);
+    let n_blocks = ne0.div_ceil(PQ2_QK);
+    for (out, r) in y.iter_mut().zip(rows) {
+        let raw = &payload[(base + r) * row_bytes..(base + r + 1) * row_bytes];
         let mut acc = 0.0f32;
         // decode + dot in one pass
-        for block in 0..ne0.div_ceil(PQ2_QK) {
+        for block in 0..n_blocks {
             let b = block * PQ2_BLOCK;
-            let scale = crate::gguf::half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
+            let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
             let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
             let start = block * PQ2_QK;
             let end = (start + PQ2_QK).min(ne0);
@@ -236,9 +299,8 @@ pub fn pq2_matvec_range(
                 acc += x[j] * ((code as i32 - 1) as f32 * scale);
             }
         }
-        y[r] = acc;
+        *out = acc;
     }
-    Ok(())
 }
 
 /// Number of rows (ne1) of a tensor.

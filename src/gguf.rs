@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use memmap2::Mmap;
 
 pub const TYPE_F32: u32 = 0;
 pub const TYPE_F16: u32 = 1;
@@ -99,6 +100,9 @@ pub struct GGUF {
     /// absolute file offset where tensor data begins (aligned)
     pub data_start: u64,
     file: File,
+    /// whole-file read-only mapping; tensor payloads are read from here so
+    /// per-row access is a slice, not a seek+read syscall (M8.1).
+    map: Mmap,
 }
 
 impl GGUF {
@@ -135,6 +139,7 @@ impl GGUF {
         }
 
         let data_start = align_up(file.stream_position().map_err(|e| e.to_string())?, 32);
+        let map = unsafe { Mmap::map(&file) }.map_err(|e| format!("mmap {path}: {e}"))?;
 
         Ok(GGUF {
             version,
@@ -143,6 +148,7 @@ impl GGUF {
             tensors,
             data_start,
             file,
+            map,
         })
     }
 
@@ -258,17 +264,38 @@ impl GGUF {
     }
 
     /// Read raw bytes at an absolute file offset (kernels, tools).
-    pub fn read_bytes(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+    pub fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
         self.read_bytes_at(offset, buf)
     }
 
-    fn read_bytes_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| format!("seek {offset}: {e}"))?;
-        self.file
-            .read_exact(buf)
-            .map_err(|e| format!("read at {offset}: {e}"))
+    fn read_bytes_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+        buf.copy_from_slice(self.slice_at(offset, buf.len())?);
+        Ok(())
+    }
+
+    /// Borrow `len` bytes at an absolute file offset straight from the mmap.
+    pub fn slice_at(&self, offset: u64, len: usize) -> Result<&[u8], String> {
+        let start: usize = offset
+            .try_into()
+            .map_err(|_| format!("slice_at: offset {offset} does not fit usize"))?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| format!("slice_at: {offset}+{len} overflows"))?;
+        if end > self.map.len() {
+            return Err(format!(
+                "slice_at: {offset}..{end} past mmap end {}",
+                self.map.len()
+            ));
+        }
+        Ok(&self.map[start..end])
+    }
+
+    /// Borrow the whole contiguous payload of a tensor from the mmap. Rows of a
+    /// matrix tensor are contiguous inside this slice (row `r` starts at
+    /// `payload[r * row_bytes]`), which is what the slice-based PQ2_0 matvec
+    /// kernels consume.
+    pub fn payload_slice(&self, info: &TensorInfo) -> Result<&[u8], String> {
+        self.slice_at(self.tensor_data_offset(info), self.tensor_nbytes(info) as usize)
     }
 
     /// Verify the tensor offsets form a contiguous, aligned chain and that the
