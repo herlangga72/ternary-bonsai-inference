@@ -17,6 +17,7 @@
 
 #![allow(dead_code)]
 
+use crate::gdn::{gdn_step, zero_state};
 use crate::kernels;
 use crate::rope::rope_imrope;
 use crate::weights::{Qwen35, Weights};
@@ -219,6 +220,176 @@ pub fn full_attention_layer(
     let wo = w.tensor(&name("attn_output.weight"))?.clone();
     let mut y = vec![0.0f32; n_embd];
     w.matvec_into(&wo, 0, n_embd, &s.out, &mut y)?;
+    Ok(y)
+}
+
+// ---------------------------------------------------------------------------
+// M6-4: recurrent (gated delta net / SSM) layers
+// ---------------------------------------------------------------------------
+
+/// Per-sequence recurrent caches for the SSM branch.
+///
+/// `conv[il]` holds the last (conv_kernel - 1) pre-conv inputs per channel,
+/// oldest first, channel-major (3 * conv_channels floats per layer). `state[il]`
+/// is the gated-delta-net state, H_v transposed S x S matrices (48*128*128).
+pub struct SsmCache {
+    pub conv: Vec<Vec<f32>>,
+    pub state: Vec<Vec<f32>>,
+}
+
+impl SsmCache {
+    pub fn new(cfg: &Qwen35) -> SsmCache {
+        let n_prev = cfg.ssm_conv_kernel - 1;
+        let ch = cfg.ssm_conv_channels();
+        let mut conv = vec![Vec::new(); cfg.n_layer];
+        let mut state = vec![Vec::new(); cfg.n_layer];
+        for il in 0..cfg.n_layer {
+            if cfg.is_recurrent(il) {
+                conv[il] = vec![0.0; n_prev * ch];
+                state[il] = zero_state();
+            }
+        }
+        SsmCache { conv, state }
+    }
+}
+
+/// Scratch buffers for one recurrent layer step.
+pub struct SsmScratch {
+    pub qkv: Vec<f32>,
+    pub z: Vec<f32>,
+    pub beta: Vec<f32>,
+    pub alpha: Vec<f32>,
+    pub gate: Vec<f32>,
+    pub conv_out: Vec<f32>,
+    pub window: Vec<f32>,
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub attn: Vec<f32>,
+    pub normed: Vec<f32>,
+}
+
+impl SsmScratch {
+    pub fn new(cfg: &Qwen35) -> SsmScratch {
+        let ch = cfg.ssm_conv_channels();
+        let dk = cfg.ssm_key_dim(); // q and k rows (2 * group_count * state)
+        let di = cfg.ssm_inner;
+        SsmScratch {
+            qkv: vec![0.0; ch],
+            z: vec![0.0; di],
+            beta: vec![0.0; cfg.ssm_dt_rank],
+            alpha: vec![0.0; cfg.ssm_dt_rank],
+            gate: vec![0.0; cfg.ssm_dt_rank],
+            conv_out: vec![0.0; ch],
+            window: vec![0.0; cfg.ssm_conv_kernel],
+            q: vec![0.0; dk],
+            k: vec![0.0; dk],
+            v: vec![0.0; di],
+            attn: vec![0.0; di],
+            normed: vec![0.0; di],
+        }
+    }
+}
+
+/// One recurrent layer for a single token.
+///
+/// `x` is the already `attn_norm`-ed token embedding (length n_embd).
+/// Returns the layer output before the attention residual is added.
+pub fn recurrent_layer(
+    w: &mut Weights,
+    cfg: &Qwen35,
+    il: usize,
+    x: &[f32],
+    cache: &mut SsmCache,
+    s: &mut SsmScratch,
+) -> Result<Vec<f32>, String> {
+    debug_assert!(cfg.is_recurrent(il), "layer {il} is not recurrent");
+    let n_embd = cfg.n_embd;
+    let ch = cfg.ssm_conv_channels();
+    let dk = cfg.ssm_key_dim();
+    let di = cfg.ssm_inner;
+    let n_v = cfg.ssm_dt_rank; // 48 v-heads
+    let sdim = cfg.ssm_state; // 128
+    let n_prev = cfg.ssm_conv_kernel - 1; // 3
+    let eps = cfg.eps;
+    let name = |suffix: &str| cfg.blk_name(il, suffix);
+
+    // ---- projections -------------------------------------------------------
+    let qkv = w.matvec(&name("attn_qkv.weight"), x)?;
+    let zraw = w.matvec(&name("attn_gate.weight"), x)?;
+    let beta_raw = w.matvec(&name("ssm_beta.weight"), x)?;
+    let alpha_raw = w.matvec(&name("ssm_alpha.weight"), x)?;
+    if qkv.len() != ch || zraw.len() != di || beta_raw.len() != n_v || alpha_raw.len() != n_v {
+        return Err(format!(
+            "recurrent_layer({il}): unexpected projection rows ({} / {} / {} / {})",
+            qkv.len(),
+            zraw.len(),
+            beta_raw.len(),
+            alpha_raw.len()
+        ));
+    }
+    s.qkv.copy_from_slice(&qkv);
+    s.z.copy_from_slice(&zraw);
+
+    // beta = sigmoid(ssm_beta @ x); alpha = softplus(ssm_alpha @ x + dt.bias)
+    let dt_bias = w.vec_f32(&name("ssm_dt.bias"))?;
+    for h in 0..n_v {
+        s.beta[h] = kernels::sigmoid(beta_raw[h]);
+        s.alpha[h] = kernels::softplus(alpha_raw[h] + dt_bias[h]);
+    }
+    // gate = alpha * ssm_a  (ssm_a < 0: negative log-decay per v-head)
+    let ssm_a = w.vec_f32(&name("ssm_a"))?;
+    for h in 0..n_v {
+        s.gate[h] = s.alpha[h] * ssm_a[h];
+    }
+
+    // ---- causal conv1d over the qkv channels with cached state --------------
+    // CPU ssm_conv semantics: out[c] = sum_j w[j][c] * win[j], win = [3 prev
+    // inputs oldest..newest, current input]. New state = last 3 of win.
+    let conv_w = w.vec_f32(&name("ssm_conv1d.weight"))?; // kernel x channels
+    let conv_state = &cache.conv[il];
+    for c in 0..ch {
+        let base = c * n_prev;
+        for j in 0..n_prev {
+            s.window[j] = conv_state[base + j];
+        }
+        s.window[n_prev] = s.qkv[c];
+        let mut acc = 0.0f32;
+        for j in 0..cfg.ssm_conv_kernel {
+            acc += conv_w[c * cfg.ssm_conv_kernel + j] * s.window[j];
+        }
+        s.conv_out[c] = kernels::silu(acc);
+    }
+    // rotate cache: drop the oldest sample, append current per channel
+    for c in 0..ch {
+        let base = c * n_prev;
+        for j in 0..n_prev - 1 {
+            cache.conv[il][base + j] = cache.conv[il][base + j + 1];
+        }
+        cache.conv[il][base + n_prev - 1] = s.qkv[c];
+    }
+
+    // ---- split q / k / v from the convolved channels, l2-normalize q, k -----
+    s.q.copy_from_slice(&s.conv_out[..dk]);
+    s.k.copy_from_slice(&s.conv_out[dk..2 * dk]);
+    s.v.copy_from_slice(&s.conv_out[2 * dk..]);
+    let q = kernels::l2_norm_rows(&s.q, sdim, eps)?;
+    let k = kernels::l2_norm_rows(&s.k, sdim, eps)?;
+
+    // ---- fused gated-delta-net recurrence -----------------------------------
+    gdn_step(&q, &k, &s.v, &s.gate, &s.beta, &mut cache.state[il], &mut s.attn);
+
+    // ---- gated output norm: rms_norm(out) * silu(z), then ssm_out -----------
+    let ssm_norm_w = w.vec_f32(&name("ssm_norm.weight"))?;
+    let normed = kernels::rms_norm_rows(&s.attn, &ssm_norm_w, sdim, eps)?;
+    s.normed.copy_from_slice(&normed);
+    for i in 0..di {
+        s.normed[i] *= kernels::silu(s.z[i]);
+    }
+    let ssm_out = w.tensor(&name("ssm_out.weight"))?.clone();
+    let mut y = vec![0.0f32; n_embd];
+    w.matvec_into(&ssm_out, 0, n_embd, &s.normed, &mut y)?;
+    let _ = n_v;
     Ok(y)
 }
 

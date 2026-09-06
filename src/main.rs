@@ -6,6 +6,7 @@
 //! policy, streaming, timing) lives here in Rust.
 
 mod gguf;
+mod gdn;
 mod kernels;
 mod llama;
 mod rope;
