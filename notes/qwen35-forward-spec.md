@@ -79,3 +79,20 @@ band math before implementation:
   head dim 256 and three bands [11,11,10,0].
 - ggml_silu/softplus/sigmoid are elementwise; conv1d is causal with cached
   per-seq state of (kernel-1) previous inputs per channel.
+
+## MRoPE port notes (from ggml rope kernel)
+
+qwen35 uses `ggml_rope_multi` with `rope.dimension_count` = n_rot/n_dims = 64,
+sections `[11,11,10,0]` (sum 32 = n_dims/2 pairs), head dim 256, freq_base
+1e7, ext_factor 0.
+
+- Cache: for pair j in 0..31 pick theta band t (j<11), h (11<=j<22),
+  w (22<=j<32); e unused (sections[3]=0). Four theta bases start at the four
+  position ids p_t/p_h/p_w/p_e and are each multiplied by
+  `theta_scale = freq_base^(-2/n_dims)` every pair (global index j).
+- ext_factor 0 and mscale 1 reduce YaRN to `cos = cos(theta)`,
+  `sin = sin(theta)`.
+- Application: NEOX ordering, rotate first n_dims=64 dims pairing
+  `(i, i + n_dims/2)` with cache pair j = i/2; other head dims unchanged.
+- Text-only decode: the four position ids should equal the token position;
+  confirm against golden logits during layer validation.
