@@ -83,6 +83,31 @@ recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`.
 
 ## Performance expectations
 
-27B ternary weights stream from RAM every token. On a 4-core Ryzen 3200G with
-~20 GB/s memory bandwidth, expect roughly **0.1-0.3 tokens/s** (3-10 s/token)
-CPU-only. The model is a reasoning model, so responses start in thinking mode.
+27B ternary weights stream from RAM every token. Measured on a 4-core Ryzen
+3200G (15 GB RAM, DDR4):
+
+| phase | rate |
+| --- | --- |
+| model load (mmap) | ~1 s |
+| prefill | ~0.8 tok/s (first call also cold-maps the 6.8 GB file) |
+| decode | ~0.4-0.8 tok/s (~1.7-2.3 s/token) |
+
+The model is a reasoning model. The prompt is seeded with `<think>`, the model
+streams its reasoning, closes `</think>`, then gives the final answer and stops
+at `<|im_end|>`. A short factual prompt needs ~150-200 generated tokens, so
+budget a few minutes per run on CPU-only hardware.
+
+## Sample run
+
+```
+prompt: 104 chars -> 20 tokens
+prefill done in 25.98s (0.8 tok/s)
+Here's a thinking process:
+1.  **Analyze User Input:**
+    - Question: "What is the capital of France?"
+    - Constraint: "Answer briefly."
+...
+</think>
+Paris.
+164 tokens in 371.53s (0.4 tok/s)
+```
