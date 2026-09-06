@@ -6,6 +6,9 @@
 //! policy, streaming, timing) lives here in Rust.
 
 mod llama;
+mod sampler;
+
+use sampler::{Sampler, SamplerConfig};
 
 use llama::*;
 use std::ffi::CString;
@@ -291,26 +294,24 @@ fn main() {
     }
     eprintln!("context created: n_ctx={ctx_size}, n_batch={}", cli.n_batch);
 
-    // ---- sampler chain ------------------------------------------------------
-    // Bonsai-flavored sampling: top-k -> top-p -> min-p -> temperature -> dist
-    let sp = unsafe { llama_sampler_chain_default_params() };
-    let smpl = unsafe { llama_sampler_chain_init(sp) };
-    unsafe {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(cli.top_k));
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(cli.top_p, 1));
-        if cli.min_p > 0.0 {
-            llama_sampler_chain_add(smpl, llama_sampler_init_min_p(cli.min_p, 1));
-        }
-        llama_sampler_chain_add(smpl, llama_sampler_init_temp(cli.temp));
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(cli.seed));
-    }
+    // ---- Rust sampler -------------------------------------------------------
+    let n_vocab = unsafe { llama_vocab_n_tokens(vocab) } as usize;
+    let sampler_cfg = SamplerConfig {
+        top_k: cli.top_k,
+        top_p: cli.top_p,
+        min_p: cli.min_p,
+        temp: cli.temp,
+        seed: cli.seed as u64,
+    };
+    let mut sampler = Sampler::new(&sampler_cfg);
+    eprintln!(
+        "sampler (rust): temp={} top_k={} top_p={} min_p={}",
+        cli.temp, cli.top_k, cli.top_p, cli.min_p
+    );
 
     // stop tokens: chat end markers (EOG handled separately)
     let stop_ids = find_stop_tokens(vocab, &["<|im_end|>", "<|resp_end|>"]);
-    eprintln!(
-        "sampler: temp={} top_k={} top_p={} min_p={}; stops: {:?}",
-        cli.temp, cli.top_k, cli.top_p, cli.min_p, stop_ids
-    );
+    eprintln!("stops: {stop_ids:?}");
 
     // ---- prefill ------------------------------------------------------------
     let t_gen0 = Instant::now();
@@ -318,8 +319,12 @@ fn main() {
     let mut n_past: i32 = 0;
     let mut pos_buf: Vec<llama_pos> = Vec::new();
     let mut start = 0;
+    let mut logits_at: i32 = 0; // batch position whose logits we read
     while start < n_prompt {
         let chunk = (n_prompt - start).min(cli.n_batch as usize);
+        if start + chunk == n_prompt {
+            logits_at = chunk as i32 - 1; // last prompt token
+        }
         pos_buf.clear();
         pos_buf.extend((n_past..n_past + chunk as i32).map(|p| p as llama_pos));
         let batch = llama_batch {
@@ -354,8 +359,14 @@ fn main() {
     let mut piece_buf: Vec<u8> = vec![0; 1024];
 
     loop {
-        // sample from the most recent decoded token (idx -1)
-        let id = unsafe { llama_sampler_sample(smpl, ctx, -1) };
+        // sample from the logits of the token at batch position `logits_at`
+        let logits_ptr = unsafe { llama_get_logits_ith(ctx, logits_at) };
+        if logits_ptr.is_null() {
+            eprintln!("error: no logits available");
+            break;
+        }
+        let logits = unsafe { std::slice::from_raw_parts(logits_ptr, n_vocab) };
+        let id = sampler.sample(logits, &sampler_cfg);
 
         if unsafe { llama_vocab_is_eog(vocab, id) != 0 } || stop_ids.contains(&id) {
             break;
@@ -403,6 +414,7 @@ fn main() {
             eprintln!("\nerror: llama_decode (generation) failed rc={rc}");
             break;
         }
+        logits_at = 0; // next sample reads this token's row
         n_past += 1;
     }
 
@@ -416,7 +428,6 @@ fn main() {
     );
 
     unsafe {
-        llama_sampler_free(smpl);
         llama_free(ctx);
         llama_model_free(model);
     }
