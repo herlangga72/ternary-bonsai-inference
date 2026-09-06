@@ -393,6 +393,123 @@ pub fn recurrent_layer(
     Ok(y)
 }
 
+// ---------------------------------------------------------------------------
+// M6-5: FFN, full layer loop and LM head
+// ---------------------------------------------------------------------------
+
+/// Dense FFN (LLM_FFN_PAR): down(silu(gate @ x) ⊙ (up @ x)).
+pub fn ffn_layer(w: &mut Weights, cfg: &Qwen35, il: usize, x: &[f32]) -> Result<Vec<f32>, String> {
+    let n_ff = cfg.n_ff;
+    let name = |suffix: &str| cfg.blk_name(il, suffix);
+    let gate = w.matvec(&name("ffn_gate.weight"), x)?;
+    let up = w.matvec(&name("ffn_up.weight"), x)?;
+    if gate.len() != n_ff || up.len() != n_ff {
+        return Err(format!("ffn_layer({il}): unexpected rows ({} / {})", gate.len(), up.len()));
+    }
+    let mut h = vec![0.0f32; n_ff];
+    for i in 0..n_ff {
+        h[i] = kernels::silu(gate[i]) * up[i];
+    }
+    let down = w.tensor(&name("ffn_down.weight"))?.clone();
+    let mut y = vec![0.0f32; cfg.n_embd];
+    w.matvec_into(&down, 0, cfg.n_embd, &h, &mut y)?;
+    Ok(y)
+}
+
+/// Full single-token decoder: embeddings -> 64 layers -> LM head logits.
+pub struct Decoder {
+    pub w: Weights,
+    pub cfg: Qwen35,
+    pub attn: AttnCache,
+    pub attn_s: AttnScratch,
+    pub ssm: SsmCache,
+    pub ssm_s: SsmScratch,
+}
+
+impl Decoder {
+    pub fn open(path: &str) -> Result<Decoder, String> {
+        let w = Weights::open(path)?;
+        let cfg = w.config().clone();
+        let attn = AttnCache::new(&cfg);
+        let attn_s = AttnScratch::new(&cfg);
+        let ssm = SsmCache::new(&cfg);
+        let ssm_s = SsmScratch::new(&cfg);
+        Ok(Decoder {
+            w,
+            cfg,
+            attn,
+            attn_s,
+            ssm,
+            ssm_s,
+        })
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.w
+            .tensor("output.weight")
+            .map(|t| {
+                if t.dims.len() > 1 {
+                    t.dims[1] as usize
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    /// Forward one token at absolute position `pos`, returning its logits over
+    /// the full vocabulary. Recurrent/conv caches and attention KV caches are
+    /// advanced as part of the step (causal, single stream).
+    pub fn decode_token(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+        let Self {
+            w,
+            cfg,
+            attn,
+            attn_s,
+            ssm,
+            ssm_s,
+        } = self;
+        let eps = cfg.eps;
+        let n_embd = cfg.n_embd;
+
+        // ---- token embedding row -------------------------------------------
+        let mut cur = w.row_f32("token_embd.weight", token as u64)?;
+        if cur.len() != n_embd {
+            return Err(format!("decode_token: embedding len {} != n_embd", cur.len()));
+        }
+
+        // ---- transformer layers ----------------------------------------------
+        for il in 0..cfg.n_layer {
+            let attn_norm_w = w.vec_f32(&cfg.blk_name(il, "attn_norm.weight"))?;
+            let x_norm = kernels::rms_norm(&cur, &attn_norm_w, eps);
+            let attn_out = if cfg.is_recurrent(il) {
+                recurrent_layer(w, cfg, il, &x_norm, ssm, ssm_s)?
+            } else {
+                full_attention_layer(w, cfg, il, &x_norm, pos, attn, attn_s)?
+            };
+            for i in 0..n_embd {
+                cur[i] += attn_out[i];
+            }
+
+            let post_w = w.vec_f32(&cfg.blk_name(il, "post_attention_norm.weight"))?;
+            let ffn_in = kernels::rms_norm(&cur, &post_w, eps);
+            let ffn_out = ffn_layer(w, cfg, il, &ffn_in)?;
+            for i in 0..n_embd {
+                cur[i] += ffn_out[i];
+            }
+        }
+
+        // ---- output norm + LM head -------------------------------------------
+        let out_norm_w = w.vec_f32("output_norm.weight")?;
+        let h = kernels::rms_norm(&cur, &out_norm_w, eps);
+        let head = w.tensor("output.weight")?.clone();
+        let n_vocab = crate::kernels::n_rows(&head) as usize;
+        let mut logits = vec![0.0f32; n_vocab];
+        w.matvec_into(&head, 0, n_vocab, &h, &mut logits)?;
+        Ok(logits)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

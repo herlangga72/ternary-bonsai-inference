@@ -30,7 +30,7 @@ tenarybonsai-fast/
     gdn.rs              gated-delta-net recurrent step (M6, validated)
     rope.rs             IMROPE multi-rope (M6, validated)
     weights.rs          weight-context engine: qwen35 hyperparams + tensor-name mapping (M6-1)
-    forward.rs          qwen35 forward pieces: full-attention + recurrent layers, caches (M6-3/M6-4)
+    forward.rs          qwen35 forward pieces: attn+recurrent layers, FFN, Decoder (M6-3..M6-5)
     main.rs             bonsai-run CLI (still uses llama.cpp for decode)
   src/bin/
     bonsai-gguf         inspect / probe / retag GGUF
@@ -44,6 +44,8 @@ tenarybonsai-fast/
     bonsai-weights      weight-context config / tensor-manifest check (M6-1)
     bonsai-attn         full-attention layer smoke on real model (M6-3)
     bonsai-ssm          recurrent (gated delta net) layer smoke on real model (M6-4)
+    bonsai-decode       full single-token decoder smoke on real model (M6-5)
+    bonsai-golden       M6-6 golden-logit validation runner
   tools/
     ggml_probe.c        C reference harness (rmsnorm, pq2row, pq2deq, gdn, rope, rmsrows, l2norm, unary, softmax)
     retag_gguf.py       superseded Python retag (kept for reference)
@@ -97,16 +99,14 @@ gcc -O2 tools/ggml_probe.c -I /home/server/sdgs/llama.cpp/ggml/include \
 | M6-2 | activation helpers (kernels.rs) | row RMSNorm ~3e-7, L2/sigmoid/softplus 0, silu 1.2e-7, masked softmax 1.4e-7 vs ggml probes |
 | M6-3 | full-attention layer (forward.rs) | smoke on blk.3 over 3 synthetic tokens: finite outputs, KV cache grows per pos; unit test on cache layout |
 | M6-4 | recurrent layer (forward.rs) | smoke on blk.0 over 3 synthetic tokens: causal conv cache + GDN state evolve; finite outputs |
+| M6-5 | full decoder (Decoder in forward.rs) | single-token decode through all 64 layers + LM head on real model: finite logits over 248k vocab; ~34 s/token |
 
 ## Next work, structured (do in order)
 
-1. **M6-5 layer loop + head**: embeddings, residuals, FFN
-   (silu(gate·x)⊙up·x → down), output norm, LM head rows. Single-token decode
-   first (recurrent state caches per sequence; KV only in attention layers).
-2. **M6-6 golden validation**: compute logits for golden/prompts/qa.txt and
+1. **M6-6 golden validation**: compute logits for golden/prompts/qa.txt and
    compare argmax + logits against golden/qa.logits.bin. Expect first-run
    mismatches; debug layer by layer (instrument per-layer hidden norms).
-3. **M7**: standalone engine binary that no longer links llama.cpp: replace
+2. **M7**: standalone engine binary that no longer links llama.cpp: replace
    `llama_decode` path entirely; drop build.rs linkage and llama.rs usage in
    main.
 
