@@ -51,6 +51,17 @@ static struct ggml_tensor *load_f32(struct ggml_context *ctx, const char *path, 
     return t;
 }
 
+static struct ggml_tensor *load_f32_2d(struct ggml_context *ctx, const char *path, int64_t row_len, int64_t n_rows) {
+    size_t len = 0;
+    unsigned char *buf = load_file(path, &len);
+    size_t need = (size_t) row_len * n_rows * sizeof(float);
+    if (len < need) { fprintf(stderr, "short file %s\n", path); exit(2); }
+    struct ggml_tensor *t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, row_len, n_rows);
+    memcpy(ggml_get_data(t), buf, need);
+    free(buf);
+    return t;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return 1;
     const char *op = argv[1];
@@ -207,6 +218,105 @@ int main(int argc, char **argv) {
         ggml_build_forward_expand(gf, y);
         if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
         write_file(outpath, ggml_get_data(y), ggml_nbytes(y));
+        ggml_free(ctx);
+        return 0;
+    }
+
+    if (strcmp(op, "rmsrows") == 0 && argc == 8) {
+        // x = rows x row_len, w = row_len; RMSNorm each row then * w (per-head norm)
+        const char * xpath  = argv[2];
+        const char * wpath  = argv[3];
+        int64_t n_rows = atoll(argv[4]);
+        int64_t row_len = atoll(argv[5]);
+        float eps = (float) atof(argv[6]);
+        const char * outpath = argv[7];
+
+        struct ggml_init_params ip = { .mem_size = 64 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context *ctx = ggml_init(ip);
+        struct ggml_tensor *x = load_f32_2d(ctx, xpath, row_len, n_rows);
+        struct ggml_tensor *w = load_f32(ctx, wpath, row_len, 1);
+        struct ggml_tensor *nrm = ggml_rms_norm(ctx, x, eps);
+        struct ggml_tensor *y = ggml_mul(ctx, nrm, w);
+
+        struct ggml_cgraph *gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), (size_t) row_len * n_rows * sizeof(float));
+        ggml_free(ctx);
+        return 0;
+    }
+
+    if (strcmp(op, "l2norm") == 0 && argc == 7) {
+        // x = rows x row_len, L2-normalize each row
+        const char * xpath = argv[2];
+        int64_t n_rows = atoll(argv[3]);
+        int64_t row_len = atoll(argv[4]);
+        float eps = (float) atof(argv[5]);
+        const char * outpath = argv[6];
+
+        struct ggml_init_params ip = { .mem_size = 64 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context *ctx = ggml_init(ip);
+        struct ggml_tensor *x = load_f32_2d(ctx, xpath, row_len, n_rows);
+        struct ggml_tensor *y = ggml_l2_norm(ctx, x, eps);
+
+        struct ggml_cgraph *gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), (size_t) row_len * n_rows * sizeof(float));
+        ggml_free(ctx);
+        return 0;
+    }
+
+    if (strcmp(op, "unary") == 0 && argc == 5) {
+        // elementwise activation over a 1-d f32 buffer
+        const char * which = argv[2];
+        const char * xpath = argv[3];
+        const char * outpath = argv[4];
+
+        size_t xlen = 0;
+        unsigned char *xbuf = load_file(xpath, &xlen);
+        int64_t n = (int64_t) (xlen / sizeof(float));
+        free(xbuf);
+
+        struct ggml_init_params ip = { .mem_size = 64 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context *ctx = ggml_init(ip);
+        struct ggml_tensor *x = load_f32(ctx, xpath, n, 1);
+        struct ggml_tensor *y;
+        if (strcmp(which, "silu") == 0) {
+            y = ggml_silu(ctx, x);
+        } else if (strcmp(which, "softplus") == 0) {
+            y = ggml_softplus(ctx, x);
+        } else if (strcmp(which, "sigmoid") == 0) {
+            y = ggml_sigmoid(ctx, x);
+        } else {
+            fprintf(stderr, "unknown unary op %s\n", which);
+            return 2;
+        }
+
+        struct ggml_cgraph *gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), (size_t) n * sizeof(float));
+        ggml_free(ctx);
+        return 0;
+    }
+
+    if (strcmp(op, "softmax") == 0 && argc == 6) {
+        // rows x row_len, stable softmax per row (no mask/scale)
+        const char * xpath = argv[2];
+        int64_t n_rows = atoll(argv[3]);
+        int64_t row_len = atoll(argv[4]);
+        const char * outpath = argv[5];
+
+        struct ggml_init_params ip = { .mem_size = 64 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context *ctx = ggml_init(ip);
+        struct ggml_tensor *x = load_f32_2d(ctx, xpath, row_len, n_rows);
+        struct ggml_tensor *y = ggml_soft_max(ctx, x);
+
+        struct ggml_cgraph *gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), (size_t) row_len * n_rows * sizeof(float));
         ggml_free(ctx);
         return 0;
     }
