@@ -1,0 +1,12 @@
+[package]
+name = "bonsai-run"
+version = "0.1.0"
+edition = "2021"
+description = "Rust inference driver for Ternary-Bonsai-27B GGUF via the PrismML llama.cpp engine"
+build = "build.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
