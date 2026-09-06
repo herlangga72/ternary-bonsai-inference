@@ -27,6 +27,7 @@ Migrate from the outside in:
 | M3 | Rust tokenizer: qwen35 pre-tokenizer + BPE merges + special tokens | done | token ids match `llama_tokenize` on 1581 corpus lines (0 mismatches); wired into bonsai-run |
 | M4 | Rust detokenizer (vocab text + byte table) | done | output text identical to llama.cpp path; verified in end-to-end run |
 | M5 | Rust kernels: dequant PQ2_0 matmul, RMSNorm, partial RoPE, gates | done (RMSNorm + PQ2_0 dequant; RoPE/gates folded into M6) | RMSNorm 2.3e-7 rel vs ggml; PQ2_0 row dequant bit-exact vs ggml `to_float` on 7 real tensor rows |
+| M6 (prep) | golden logits captures (`bonsai-logits`, `golden/`) + architecture study (`notes/qwen35-arch.md`) | done | captured two llama.cpp logits rows as reference; documented real tensor layout and open graph questions |
 | M6 | Rust forward pass for qwen35 blocks (attention layers every 4 + gated SSM layers), KV + recurrent state, LM head | planned | greedy logits agree with llama.cpp decode on test prompts |
 | M7 | Standalone Rust engine (loader -> decode -> sample) | planned | same prompts produce same/sane output; llama.cpp link removed |
 
