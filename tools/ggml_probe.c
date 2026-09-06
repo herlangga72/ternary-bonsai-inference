@@ -136,6 +136,45 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (strcmp(op, "gdn") == 0 && argc == 10) {
+        const char * outpath = argv[2];
+        const char * qpath   = argv[3];
+        const char * kpath   = argv[4];
+        const char * vpath   = argv[5];
+        const char * gpath   = argv[6];
+        const char * betapath= argv[7];
+        const char * statepath = argv[8];
+        int64_t K = atoll(argv[9]);
+
+        const int64_t S = 128, H_k = 16, H_v = 48, nt = 1, ns = 1;
+
+        struct ggml_init_params ip = { .mem_size = 512 * 1024 * 1024, .mem_buffer = NULL, .no_alloc = false };
+        struct ggml_context * ctx = ggml_init(ip);
+
+        struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, nt, ns);
+        struct ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_k, nt, ns);
+        struct ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, nt, ns);
+        struct ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, nt, ns);
+        struct ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, nt, ns);
+        struct ggml_tensor * st = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H_v, ns);
+
+        size_t l = 0; unsigned char * b;
+        b = load_file(qpath, &l); memcpy(ggml_get_data(q), b, (size_t) S*H_k*nt*ns*4); free(b);
+        b = load_file(kpath, &l); memcpy(ggml_get_data(k), b, (size_t) S*H_k*nt*ns*4); free(b);
+        b = load_file(vpath, &l); memcpy(ggml_get_data(v), b, (size_t) S*H_v*nt*ns*4); free(b);
+        b = load_file(gpath, &l); memcpy(ggml_get_data(g), b, (size_t) H_v*4); free(b);
+        b = load_file(betapath, &l); memcpy(ggml_get_data(beta), b, (size_t) H_v*4); free(b);
+        b = load_file(statepath, &l); memcpy(ggml_get_data(st), b, (size_t) S*S*H_v*ns*4); free(b);
+
+        struct ggml_tensor * y = ggml_gated_delta_net(ctx, q, k, v, g, beta, st, K);
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, y);
+        if (ggml_graph_compute_with_ctx(ctx, gf, 1) != 0) { return 3; }
+        write_file(outpath, ggml_get_data(y), ggml_nbytes(y));
+        ggml_free(ctx);
+        return 0;
+    }
+
     fprintf(stderr, "unknown usage\n");
     return 1;
 }
