@@ -158,6 +158,54 @@ The block-matmul kernel from M8.4 generalizes (same row kernel, batch of x).
   small constant-factor wins once M8 lands; do them only if profiling shows
   they matter.
 
+## GPU? (question, 2026-09-06)
+
+Hardware facts on this box:
+
+- One GPU: the Vega 8 iGPU (Picasso/Raven2, gfx902, 8 CUs / 512 SP, ~1.25 GHz,
+  ~1.3 TFLOPS FP32 peak). No discrete card in the PCIe slots.
+- It is usable today: `/dev/kfd` present, OpenCL platform works
+  (`clinfo`: AMD-APP, gfx902), 512 MB carve-out, ~8 GB host-visible global.
+  ROCm 6.0 no longer officially supports gfx900-class, so treat HIP as
+  experimental.
+- The iGPU shares the same DDR4 as the CPU. Measured RAM scan is ~18 GB/s for
+  the CPU; the iGPU reads the same memory controller, so it does not add
+  bandwidth.
+
+Why the iGPU does not change the decode plan:
+
+- Decode streams ~7.1 GB of weights per token. The floor is DRAM bandwidth
+  (~0.4 s/token), and that floor is shared with the CPU. Adding the iGPU
+  cannot lower it; it would only move the same FMA work to a device that is
+  also waiting on the same memory.
+- The packed-PQ2_0 dot is not iGPU-compute-limited either: streaming 7.1 GB
+  at 18 GB/s needs only ~68 GMAC/s (3.76 MAC/byte), well under what the Vega
+  can do once dequantized, so the iGPU would idle on bandwidth like the CPU.
+- 15 GB total RAM with the 7.1 GB model page-cached already leaves ~9 GB
+  free. GPU-side copies of weights would fight the CPU page cache for the
+  same 15 GB and push mapped pages out (SSD re-read stalls).
+
+Where a GPU would actually pay:
+
+1. **Discrete card with its own VRAM/bandwidth** (e.g. any 8 GB+ card:
+   224-288 GB/s vs 18 GB/s) - that is the only hardware on this box that
+   lowers the decode wall (floor ~30-60 ms/token compute-side, real-world
+   maybe 3-8 tok/s for this ternary model) and makes batched prefill fast.
+   Cost: weight upload over PCIe at load, a HIP/OpenCL/Vulkan PQ2_0 kernel,
+   and reworking the pure-Rust no-llama.cpp architecture. Separate project.
+2. **Batched prefill (M9)** is compute-bound once weights stream once per
+   prompt (N tokens x 27e9 MAC); extra FLOPS help there. The iGPU could cut
+   prefill time for long prompts even though it cannot help decode.
+3. **dspark speculative decode** - once M8/M9 land, the verifier is
+   bandwidth-bound; a GPU only helps the draft-model compute, not the wall.
+
+Recommendation: do M8 on CPU first - it reaches the shared-DRAM decode wall
+(~0.5-1 s/token) with a fraction of the effort of any GPU path and is a
+prerequisite data point (kernel design, golden checks) for a later GPU port.
+Revisit "add GPU" only if (a) a discrete card becomes available, or (b) M9
+prefill on long prompts is the dominant user pain and the iGPU's extra FLOPs
+are worth an OpenCL experiment.
+
 ## Risks / watch-outs
 
 - **Autovectorization will not happen by itself.** Rust rarely vectorizes
