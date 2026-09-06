@@ -59,7 +59,7 @@ fn main() {
     let n_rows = t.n_elem() / ne0 as u64;
     let nbytes = g.tensor_nbytes(&t) as usize;
     let mut data = vec![0u8; nbytes];
-    g.read_bytes(t.offset, &mut data).unwrap();
+    g.read_bytes(g.tensor_data_offset(&t), &mut data).unwrap();
     drop(g);
 
     let x = rand_floats(3, ne0);

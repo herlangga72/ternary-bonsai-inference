@@ -126,3 +126,8 @@ row decode buffers, SIMD dot via `std::arch`, fuse layers, speculative dspark.
   instead. GDN/rope probes above compare scalar math exactly.
 - qwen35 rope type is IMROPE (interleaved), not plain MROPE.
 - GDN state is stored transposed (M[j][i] = S[i][j]) per v-head.
+- GGUF tensor offsets are relative to the aligned data section start, NOT
+  absolute file positions. Always read tensor bytes at
+  `data_start + info.offset` (see `gguf::GGUF::tensor_data_offset`); the
+  reader used to skip `data_start`, silently decoding garbage for every
+  tensor. Fixed 2026-09-06; synthetic writers must store relative offsets too.

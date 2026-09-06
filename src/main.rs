@@ -8,9 +8,12 @@
 mod gguf;
 mod kernels;
 mod llama;
+mod rope;
 mod sampler;
 mod tokenizer;
 mod weights;
+
+mod forward;
 
 use sampler::{Sampler, SamplerConfig};
 

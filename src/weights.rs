@@ -290,13 +290,13 @@ impl Weights {
                 let row_bytes = kernels::pq2_row_bytes(ne0);
                 let mut raw = vec![0u8; row_bytes];
                 self.gguf
-                    .read_bytes(t.offset + row * row_bytes as u64, &mut raw)?;
+                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * row_bytes as u64, &mut raw)?;
                 Ok(kernels::decode_pq2_0_row(&raw, ne0))
             }
             TYPE_F32 => {
                 let mut raw = vec![0u8; ne0 * 4];
                 self.gguf
-                    .read_bytes(t.offset + row * ne0 as u64 * 4, &mut raw)?;
+                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 4, &mut raw)?;
                 Ok(raw
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -305,7 +305,7 @@ impl Weights {
             TYPE_F16 => {
                 let mut raw = vec![0u8; ne0 * 2];
                 self.gguf
-                    .read_bytes(t.offset + row * ne0 as u64 * 2, &mut raw)?;
+                    .read_bytes(self.gguf.tensor_data_offset(&t) + row * ne0 as u64 * 2, &mut raw)?;
                 Ok(raw
                     .chunks_exact(2)
                     .map(|c| crate::gguf::half_to_f32(u16::from_le_bytes([c[0], c[1]])))
@@ -566,7 +566,8 @@ mod tests {
         let header_len = 4 + 4 + 8 + 8 + meta.len() as u64 + info_len;
         let data_start = align32(header_len);
 
-        let mut off = data_start;
+        // GGUF tensor offsets are relative to the data section start.
+        let mut off = 0u64;
         let mut offsets = Vec::with_capacity(specs.len());
         for (_, ty, dims) in specs {
             offsets.push(off);
@@ -704,6 +705,12 @@ mod tests {
         // vec_f32 mapping: f32 tensor values reachable under the right name
         let norm = w.vec_f32("blk.0.attn_norm.weight").unwrap();
         assert_eq!(norm.len(), cfg.n_embd);
+        // independent oracle: payload writer emits (seed 1) values directly
+        // (not through the GGUF reader), so this guards data-start offsets.
+        let expect: Vec<f32> = (0..cfg.n_embd)
+            .map(|i| (((i as u64 * 31 + 7) % 251) as f32 - 125.0) / 64.0)
+            .collect();
+        assert_eq!(norm, expect, "vec_f32 must read real payload bytes");
         let mut raw = GGUF::open(path.to_str().unwrap()).unwrap();
         let t = raw
             .tensors
@@ -739,7 +746,7 @@ mod tests {
         let ne0 = t3.dims[0] as usize;
         let row_bytes = kernels::pq2_row_bytes(ne0);
         let mut raw_bytes = vec![0u8; row_bytes];
-        raw.read_bytes(t3.offset + 7 * row_bytes as u64, &mut raw_bytes)
+        raw.read_bytes(raw.tensor_data_offset(&t3) + 7 * row_bytes as u64, &mut raw_bytes)
             .unwrap();
         assert_eq!(row, kernels::decode_pq2_0_row(&raw_bytes, ne0));
 

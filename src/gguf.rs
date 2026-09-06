@@ -166,6 +166,12 @@ impl GGUF {
         nblocks * type_size
     }
 
+    /// Absolute file offset of a tensor's data. GGUF stores tensor offsets
+    /// relative to the start of the aligned data section; add `data_start`.
+    pub fn tensor_data_offset(&self, info: &TensorInfo) -> u64 {
+        self.data_start + info.offset
+    }
+
     /// Decode the whole tensor into f32. Intended for small tensors; big ones
     /// should use `read_tensor_range`.
     pub fn read_tensor(&mut self, info: &TensorInfo) -> Result<Vec<f32>, String> {
@@ -178,14 +184,14 @@ impl GGUF {
         match info.ty {
             TYPE_F32 => {
                 let mut buf = vec![0u8; nbytes as usize];
-                self.read_bytes_at(info.offset, &mut buf)?;
+                self.read_bytes_at(self.tensor_data_offset(info), &mut buf)?;
                 for (i, chunk) in buf.chunks_exact(4).enumerate() {
                     out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
             }
             TYPE_F16 => {
                 let mut buf = vec![0u8; nbytes as usize];
-                self.read_bytes_at(info.offset, &mut buf)?;
+                self.read_bytes_at(self.tensor_data_offset(info), &mut buf)?;
                 for (i, chunk) in buf.chunks_exact(2).enumerate() {
                     out[i] = half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
                 }
@@ -235,7 +241,7 @@ impl GGUF {
         let last_block = (elem_start + count - 1) / QK;
         let blocks = last_block - first_block + 1;
         let mut buf = vec![0u8; blocks * 34];
-        let byte_off = info.offset + (first_block as u64) * 34;
+        let byte_off = self.tensor_data_offset(info) + (first_block as u64) * 34;
         self.read_bytes_at(byte_off, &mut buf)?;
 
         for i in 0..count {

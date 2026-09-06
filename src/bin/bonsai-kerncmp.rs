@@ -164,7 +164,7 @@ fn main() {
         let ne0 = t.dims[0] as usize;
         let row_bytes = kernels::pq2_row_bytes(ne0);
         let mut raw = vec![0u8; row_bytes];
-        if g.read_bytes(t.offset + row * row_bytes as u64, &mut raw).is_err() {
+        if g.read_bytes(g.tensor_data_offset(&t) + row * row_bytes as u64, &mut raw).is_err() {
             continue;
         }
         fs::write(&row_path, &raw).unwrap();

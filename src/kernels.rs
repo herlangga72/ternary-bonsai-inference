@@ -189,7 +189,7 @@ pub fn dot_pq2_0_row(
     }
     let row_bytes = pq2_row_bytes(ne0);
     let mut raw = vec![0u8; row_bytes];
-    gguf.read_bytes(info.offset + row * row_bytes as u64, &mut raw)?;
+    gguf.read_bytes(gguf.tensor_data_offset(info) + row * row_bytes as u64, &mut raw)?;
 
     let mut acc = 0.0f32;
     for (v, w) in x.iter().zip(decode_pq2_0_row(&raw, ne0).iter()) {
@@ -221,7 +221,7 @@ pub fn pq2_matvec_range(
     let row_bytes = pq2_row_bytes(ne0);
     let mut raw = vec![0u8; row_bytes];
     for r in 0..n_rows {
-        let off = info.offset + (base_row + r as u64) * row_bytes as u64;
+        let off = gguf.tensor_data_offset(info) + (base_row + r as u64) * row_bytes as u64;
         gguf.read_bytes(off, &mut raw)?;
         let mut acc = 0.0f32;
         // decode + dot in one pass
