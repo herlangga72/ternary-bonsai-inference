@@ -54,3 +54,11 @@ Migrate from the outside in:
 | kernels (RMSNorm, PQ2_0 dequant, activations) | Rust (M5/M6-2), verified vs ggml probes |
 | forward pass (attn + GDN + FFN + head) | Rust (M6), greedy matches golden logits |
 | decode / KV / EOG | Rust (M7), standalone, llama.cpp link removed |
+
+## Next: inference performance (M8+)
+
+The migration is done; the remaining gap is speed (~23-34 s/token vs a ~0.4 s/token
+memory-bandwidth floor on this box). See `notes/perf-plan.md` for the measured
+breakdown and the ordered plan: mmap the payload (kill the 4M row syscalls/token),
+tighten the scalar PQ2_0 dot, thread the matvecs over the 4 cores, then add an
+AVX2 dequant-dot (target ~1 s/token decode), and finally batched prefill.
