@@ -25,7 +25,8 @@ build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
 | --- | --- |
 | `Ternary-Bonsai-27B-Q2_0.gguf` | Original download: legacy group-128 ternary under ggml type id 42 |
 | `Ternary-Bonsai-27B-PQ2_0.gguf` | Header-retagged copy (type 42 -> 142) that the current prism branch loads |
-| `Ternary-Bonsai-27B-dspark-Q4_1.gguf` | DeepSpark draft/speculator companion (Q4_1 + TQ1_0, one legacy ternary tensor) |
+| `Ternary-Bonsai-27B-dspark-Q4_1.gguf` | DeepSpark speculator sidecar (3.6B, Q4_1 + TQ1_0, one legacy ternary tensor); not standalone |
+| `Ternary-Bonsai-27B-dspark-PQ2_0.gguf` | Same, retagged so the speculative loader accepts it |
 | `src/llama.rs` | Hand-rolled FFI to the fork's `llama.h` (structs transcribed) |
 | `src/main.rs` | Rust driver: model load, chat template, tokenize, sample, stream, timing |
 | `tools/retag_gguf.py` | Header-only 42 -> 142 retag for legacy ternary GGUFs |
@@ -49,8 +50,23 @@ codec, so a header-only retag fixes the file without touching weights:
 python3 tools/retag_gguf.py Ternary-Bonsai-27B-Q2_0.gguf Ternary-Bonsai-27B-PQ2_0.gguf
 ```
 
-The `dspark` file also carries one legacy ternary tensor (`token_embd.weight`)
-and needs the same retag before it can be loaded.
+The `dspark` file is a **DeepSpark speculator sidecar** (3.6B, 6 blocks, 40
+heads, markov rank 256 + confidence + log-SNR heads) whose extra tensors are
+fused into the main qwen35 graph by the fork's speculative path
+(`common/speculative.cpp`, spec-type `draft-dspark`). It is deliberately not a
+standalone model: `general.architecture = dspark` is unknown to the standalone
+loader by design. It also carries one legacy ternary tensor and needs the same
+retag before the speculative loader accepts it:
+
+```sh
+python3 tools/retag_gguf.py \
+  Ternary-Bonsai-27B-dspark-Q4_1.gguf \
+  Ternary-Bonsai-27B-dspark-PQ2_0.gguf
+```
+
+Wiring dspark speculation into this Rust driver is not exposed as a single
+`llama.h` call; it lives in the fork's C++ acceptance loop, so it remains a
+follow-up rather than part of the basic inference path.
 
 ## Build
 
