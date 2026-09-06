@@ -29,7 +29,10 @@ build of Qwen3.6-27B, using the PrismML llama.cpp fork as the compute engine.
 | `Ternary-Bonsai-27B-dspark-PQ2_0.gguf` | Same, retagged so the speculative loader accepts it |
 | `src/llama.rs` | Hand-rolled FFI to the fork's `llama.h` (structs transcribed) |
 | `src/main.rs` | Rust driver: model load, chat template, tokenize, sample, stream, timing |
-| `tools/retag_gguf.py` | Header-only 42 -> 142 retag for legacy ternary GGUFs |
+| `src/sampler.rs` | Pure-Rust sampler (top-k/top-p/min-p/temp/dist) replacing the llama sampler chain |
+| `src/gguf.rs` | Pure-Rust GGUF reader: metadata, tensor index, PQ2_0/F16/F32 dequant, layout checks, retag |
+| `src/bin/bonsai-gguf.rs` | CLI: `inspect`, `probe` (decode a tensor window), `retag` (42 -> 142) |
+| `tools/retag_gguf.py` | Original Python retag (superseded by the Rust tool; kept for reference) |
 | `build.rs` | Links the static PrismML llama.cpp libraries |
 
 ## The format gotcha (important)

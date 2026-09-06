@@ -5,6 +5,7 @@
 //! everything around it (model load, chat template, tokenization, sampling
 //! policy, streaming, timing) lives here in Rust.
 
+mod gguf;
 mod llama;
 mod sampler;
 

@@ -23,7 +23,7 @@ Migrate from the outside in:
 | # | Milestone | Status | How it is verified |
 | --- | --- | --- | --- |
 | M1 | Rust sampler (top-k, top-p, min-p, temp, seeded dist) replaces the `llama_sampler_*` chain | done | `bonsai-run` generates coherent text without llama sampler calls |
-| M2 | Rust GGUF reader: metadata, tensor index, block decode (F32, PQ2_0, Q4_1, TQ1_0) | planned | parsed header matches Python tool; retag moves from Python to Rust |
+| M2 | Rust GGUF reader: metadata, tensor index, block decode (F32, PQ2_0, Q4_1, TQ1_0) | done | header matches Python tool; Rust retag byte-identical to Python; PQ2_0 dequant matches C formula; layout chain verified on 6.7 GB file |
 | M3 | Rust tokenizer: qwen35 pre-tokenizer + BPE merges + special tokens | planned | token ids match `llama_tokenize` on a text corpus |
 | M4 | Rust detokenizer (vocab text + byte table) | planned | output bytes match `llama_token_to_piece` |
 | M5 | Rust kernels: dequant PQ2_0 matmul, RMSNorm, partial RoPE, gates | planned | probe against ggml reference graphs on real model tensors |
