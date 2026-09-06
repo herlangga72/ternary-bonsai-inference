@@ -251,6 +251,11 @@ impl GGUF {
         Ok(())
     }
 
+    /// Read raw bytes at an absolute file offset (kernels, tools).
+    pub fn read_bytes(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
+        self.read_bytes_at(offset, buf)
+    }
+
     fn read_bytes_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), String> {
         self.file
             .seek(SeekFrom::Start(offset))

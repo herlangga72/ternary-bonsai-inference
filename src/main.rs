@@ -6,6 +6,7 @@
 //! policy, streaming, timing) lives here in Rust.
 
 mod gguf;
+mod kernels;
 mod llama;
 mod sampler;
 mod tokenizer;
