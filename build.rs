@@ -1,11 +1,75 @@
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+/// Compile every GLSL compute shader under `shaders/` to SPIR-V in OUT_DIR.
+/// `glslangValidator` ships with the Vulkan SDK; the pure-CPU engine never
+/// needs it, but the Vulkan backend (`bonsai-vk`) fails to build without the
+/// generated modules.
+fn compile_shaders() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let shader_dir = manifest.join("shaders");
+    let tool = find_in_path("glslangValidator");
+    let Some(tool) = tool else {
+        println!(
+            "cargo:warning=glslangValidator not found in PATH: Vulkan SPIR-V modules will not \
+             be compiled (the bonsai-vk binary needs it)"
+        );
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&shader_dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("comp") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let dst = out.join(format!("{name}.spv"));
+        println!("cargo:rerun-if-changed={}", path.display());
+        let status = Command::new(&tool)
+            .arg("-V")
+            .arg("--target-env")
+            .arg("vulkan1.2")
+            .arg("-o")
+            .arg(&dst)
+            .arg(&path)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("cargo:rerun-if-changed={}", dst.display());
+            }
+            other => {
+                println!(
+                    "cargo:warning=glslangValidator failed for {}: {:?}",
+                    path.display(),
+                    other
+                );
+            }
+        }
+    }
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
 
 // Links against the PrismML llama.cpp fork build, but ONLY for the legacy
 // `llama-backend` comparison tools (golden-logit capture, oracle tokenizer).
 // The pure-Rust engine never links llama.cpp, so without that feature this
 // script is a no-op and no external build tree is required.
 fn main() {
+    compile_shaders();
+
     if env::var("CARGO_FEATURE_LLAMA_BACKEND").is_err() {
         return;
     }

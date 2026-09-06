@@ -1,0 +1,66 @@
+#version 450
+
+// PQ2_0 (ternary, group-128) matvec: y[gid] = W[base_row + gid] . x.
+// Mirrors kernels.rs / the OpenCL pq2_matvec kernel. Payload layout is the
+// GGUF tensor data (rows back to back, each row nblocks * 34 bytes).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer WeightBytes { uint data[]; } w;
+layout(set = 0, binding = 1, std430) readonly buffer Activations { float data[]; } x;
+layout(set = 0, binding = 2, std430) buffer Outputs { float data[]; } y;
+
+layout(push_constant) uniform Params {
+    uint ne0;
+    uint base_row;
+} pc;
+
+uint u8_at(uint byte_offset) {
+    return (w.data[byte_offset >> 2] >> ((byte_offset & 3u) << 3)) & 0xffu;
+}
+
+float half_to_float(uint h) {
+    uint sign = (h >> 15) & 1u;
+    uint exp  = (h >> 10) & 0x1fu;
+    uint man  = h & 0x3ffu;
+    uint bits;
+    if (exp == 0u) {
+        if (man == 0u) {
+            bits = sign << 31;
+        } else {
+            int e = 127 - 15 + 1;
+            uint m = man;
+            while ((m & 0x400u) == 0u) { m <<= 1; e -= 1; }
+            m &= 0x3ffu;
+            bits = (sign << 31) | (uint(e) << 23) | (m << 13);
+        }
+    } else if (exp == 0x1fu) {
+        bits = (sign << 31) | 0x7f800000u | (man << 13);
+    } else {
+        bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (man << 13);
+    }
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint r = gid + pc.base_row;
+    uint nblocks = (pc.ne0 + 127u) / 128u;
+    uint row_bytes = nblocks * 34u;
+    uint row_start = r * row_bytes;
+
+    float acc = 0.0f;
+    for (uint b = 0u; b < nblocks; ++b) {
+        uint blk = row_start + b * 34u;
+        float scale = half_to_float(u8_at(blk) | (u8_at(blk + 1u) << 8));
+        uint base = b * 128u;
+        uint cnt = min(128u, pc.ne0 - base);
+        float block_acc = 0.0f;
+        for (uint l = 0u; l < cnt; ++l) {
+            uint code = (u8_at(blk + 2u + (l >> 2)) >> ((l & 3u) << 1)) & 3u;
+            block_acc += x.data[base + l] * float(int(code) - 1);
+        }
+        acc += scale * block_acc;
+    }
+    y.data[gid] = acc;
+}

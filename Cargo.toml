@@ -25,6 +25,7 @@ required-features = ["llama-backend"]
 [dependencies]
 unicode-general-category = "1.0"
 memmap2 = "0.9"
+ash = "0.38.0"
 
 [profile.release]
 opt-level = 3
