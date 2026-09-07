@@ -11,6 +11,8 @@ mod gguf;
 mod kernels;
 #[path = "../weights.rs"]
 mod weights;
+#[path = "../vk.rs"]
+mod vk;
 
 use std::process::exit;
 use std::time::Instant;

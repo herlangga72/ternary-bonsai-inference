@@ -429,6 +429,21 @@ pub struct Decoder {
 impl Decoder {
     pub fn open(path: &str) -> Result<Decoder, String> {
         let w = Weights::open(path)?;
+        Self::from_weights(w)
+    }
+
+    /// Like `open`, but routes every PQ2_0 matvec through a Vulkan device
+    /// (weights uploaded to VRAM at load). Needs a working Vulkan GPU; the
+    /// layer norms, attention, rope and gdn math still run on the CPU path.
+    pub fn open_gpu(path: &str) -> Result<Decoder, String> {
+        let mut w = Weights::open(path)?;
+        w.enable_gpu()?;
+        let dec = Self::from_weights(w)?;
+        eprintln!("[gpu] decode accelerator active");
+        Ok(dec)
+    }
+
+    fn from_weights(w: Weights) -> Result<Decoder, String> {
         let cfg = w.config().clone();
         let attn = AttnCache::new(&cfg);
         let attn_s = AttnScratch::new(&cfg);

@@ -5,6 +5,7 @@
 
 mod forward;
 mod gguf;
+mod vk;
 mod gdn;
 mod kernels;
 mod rope;

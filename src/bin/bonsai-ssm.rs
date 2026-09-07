@@ -15,6 +15,8 @@ mod rope;
 mod weights;
 #[path = "../forward.rs"]
 mod forward;
+#[path = "../vk.rs"]
+mod vk;
 
 use forward::{recurrent_layer, SsmCache, SsmScratch};
 use std::process::exit;

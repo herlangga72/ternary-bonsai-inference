@@ -15,6 +15,8 @@ mod rope;
 mod weights;
 #[path = "../forward.rs"]
 mod forward;
+#[path = "../vk.rs"]
+mod vk;
 
 use forward::{full_attention_layer, AttnCache, AttnScratch};
 use std::process::exit;

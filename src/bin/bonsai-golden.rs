@@ -19,6 +19,8 @@ mod tokenizer;
 mod weights;
 #[path = "../forward.rs"]
 mod forward;
+#[path = "../vk.rs"]
+mod vk;
 
 use forward::Decoder;
 use std::process::exit;

@@ -364,6 +364,15 @@ impl Gpu {
         )
     }
 
+    /// Device buffer for weights: storage + transfer-dst, allocated on the
+    /// preferred device-local heap. Convenience used by the Weights accel.
+    pub fn create_weight_buffer(&mut self, len: usize) -> Result<DevBuf, String> {
+        self.create_dev_buffer(
+            len,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        )
+    }
+
     pub fn create_dev_buffer(
         &self,
         len: usize,
@@ -1085,6 +1094,72 @@ impl Gpu {
             self.destroy_host_buffer(sb);
             self.destroy_host_buffer(ob);
             self.destroy_host_buffer(dummy);
+            Ok(out)
+        }
+    }
+
+    /// PQ2_0 matvec against an already-uploaded device buffer `w`
+    /// (rows `base_row + gid`). Host x in, host y out, one submit per call.
+    pub fn matvec_on(
+        &mut self,
+        w: &DevBuf,
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        x: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        if x.len() != ne0 {
+            return Err(format!(
+                "matvec_on: x length {} != ne0 {ne0}",
+                x.len()
+            ));
+        }
+        unsafe {
+            let mut xb = self.create_host_buffer(ne0 * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let yb = self.create_host_buffer(n_rows * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            xb.data_mut().copy_from_slice(bytemuck_slice(x));
+            let (pool, set) = self.make_set(w.buffer, xb.buffer, yb.buffer)?;
+
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cb = self
+                .device
+                .allocate_command_buffers(&cb_info)
+                .map_err(|e| format!("matvec_on: alloc: {e}"))?[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cb, &begin)
+                .map_err(|e| format!("matvec_on: begin: {e}"))?;
+            self.record_matvec(cb, set, ne0 as u32, base_row, n_rows);
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("matvec_on: end: {e}"))?;
+
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("matvec_on: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("matvec_on: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("matvec_on: wait: {e}"))?;
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            self.device.destroy_descriptor_pool(pool, None);
+
+            let out = yb.data()[..n_rows * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(xb);
+            self.destroy_host_buffer(yb);
             Ok(out)
         }
     }

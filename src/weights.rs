@@ -21,7 +21,17 @@
 
 use crate::gguf::{GGUF, TensorInfo, TYPE_F16, TYPE_F32, TYPE_PQ2_0};
 use crate::kernels;
+use crate::vk;
 use std::collections::HashMap;
+
+/// Optional Vulkan matvec accelerator (G2c). Holds a Gpu plus one device-local
+/// buffer per PQ2_0 tensor, uploaded once at load. `Weights::matvec_into`
+/// routes matvecs to the GPU when the tensor is present here; all other reads
+/// (norm vectors, embedding rows) stay on the CPU mmap path.
+pub struct GpuAccel {
+    pub gpu: vk::Gpu,
+    pub dev: HashMap<String, vk::DevBuf>,
+}
 
 /// Largest whole-tensor decode allowed through `vec_f32` (16 MiB of f32).
 /// Matrices must be touched via `matvec*` row access instead.
@@ -198,6 +208,7 @@ pub struct Weights {
     gguf: GGUF,
     by_name: HashMap<String, TensorInfo>,
     f32_cache: HashMap<String, Vec<f32>>,
+    accel: Option<GpuAccel>,
 }
 
 impl Weights {
@@ -213,7 +224,43 @@ impl Weights {
             gguf,
             by_name,
             f32_cache: HashMap::new(),
+            accel: None,
         })
+    }
+
+    /// Open a Vulkan device and upload every PQ2_0 tensor payload into
+    /// device-local VRAM. Subsequent `matvec_into` calls for those tensors run
+    /// on the GPU; everything else still reads the mmap. Fails with a clear
+    /// error when no Vulkan GPU is available.
+    pub fn enable_gpu(&mut self) -> Result<(), String> {
+        if self.accel.is_some() {
+            return Ok(());
+        }
+        let gpu = vk::Gpu::open()?;
+        let mut dev: HashMap<String, vk::DevBuf> = HashMap::new();
+        // clone the index so the gguf borrow ends before we need &mut gpu
+        let tensors = self.gguf.tensors.clone();
+        let mut gpu = gpu;
+        for t in &tensors {
+            if t.ty != TYPE_PQ2_0 {
+                continue;
+            }
+            let len = self.gguf.tensor_nbytes(t) as usize;
+            let buf = gpu.create_weight_buffer(len)?;
+            let payload = self.gguf.payload_slice(t)?;
+            gpu.upload(&buf, payload)?;
+            dev.insert(t.name.clone(), buf);
+        }
+        eprintln!(
+            "[gpu] uploaded {} PQ2_0 tensors to device-local memory",
+            dev.len()
+        );
+        self.accel = Some(GpuAccel { gpu, dev });
+        Ok(())
+    }
+
+    pub fn gpu_active(&self) -> bool {
+        self.accel.is_some()
     }
 
     pub fn config(&self) -> &Qwen35 {
@@ -365,6 +412,13 @@ impl Weights {
                 "Weights: matvec {t_name}: y buffer too small ({} < {n_rows})",
                 y.len()
             ));
+        }
+        if let Some(a) = self.accel.as_mut() {
+            if let Some(buf) = a.dev.get(&t_name) {
+                let yv = a.gpu.matvec_on(buf, ne0, base_row as u32, n_rows, x)?;
+                y[..n_rows].copy_from_slice(&yv);
+                return Ok(());
+            }
         }
         let payload = self.gguf.payload_slice(t)?;
         kernels::pq2_matvec_range(&payload, ne0, base_row as u64, n_rows, x, y)
