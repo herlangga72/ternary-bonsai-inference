@@ -70,6 +70,20 @@ pub const SPLIT_QGATE_SPV: &[u8] =
 pub const KV_STORE_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/kv_store.spv"));
 
+/// SPIR-V for recurrent-layer kernels (conv1d+silu, l2 in place, gdn prep).
+pub const CONV1D_SILU_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/conv1d_silu.spv"));
+pub const L2_INPLACE_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/l2_inplace.spv"));
+pub const GDN_PREP_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/gdn_prep.spv"));
+
+/// Storage + transfer-dst usage for device buffers created by the decode
+/// module (weights and scratch alike).
+pub fn storage_usage() -> vk::BufferUsageFlags {
+    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+}
+
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
 pub const GDN_DK: usize = 2048; // H_K * S
 pub const GDN_DI: usize = 6144; // H_V * S
@@ -127,6 +141,7 @@ pub struct Gpu {
 
 /// Device buffer (typically device-local VRAM). Never mapped directly; upload
 /// through a staging buffer (`Gpu::upload`).
+#[derive(Clone, Copy)]
 pub struct DevBuf {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
