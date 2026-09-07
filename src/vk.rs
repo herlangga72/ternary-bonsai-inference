@@ -61,6 +61,15 @@ pub const PQ2_PARTIAL_SPV: &[u8] =
 pub const PQ2_ROWSUM_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum.spv"));
 
+/// SPIR-V for device arena ops (slice 1 of the full decode):
+/// residual add, fused q|gate split, KV append.
+pub const ADD_RESIDUAL_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/add_residual.spv"));
+pub const SPLIT_QGATE_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/split_qgate.spv"));
+pub const KV_STORE_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/kv_store.spv"));
+
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
 pub const GDN_DK: usize = 2048; // H_K * S
 pub const GDN_DI: usize = 6144; // H_V * S
