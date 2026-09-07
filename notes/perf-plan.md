@@ -102,12 +102,15 @@ Note: G0 was first implemented and validated on the ROCm OpenCL path
 math, CPU reference checks, and shape coverage. OpenCL stays in tree as a
 fallback, not the main line.
 
-G2 status (2026-09-07): matvec (device-local, G1) and the first layer
-kernels are validated on RADV via `bonsai-vk` self-check modes: rms_norm
-(max rel 8.4e-7) and fused elementwise silu/sigmoid/softplus + gate
-multiplies (max abs < 1e-6). Remaining G2 kernels: row-wise RMS/L2 norms,
-masked softmax, IMROPE, gated-delta-net step, then the single-command-buffer
-decode orchestrator (per-token submit) validated by golden qa (id 8160).
+G2 status (2026-09-07): matvec (device-local, G1) and every per-layer kernel
+the decode needs are validated on RADV via `bonsai-vk` self-check modes:
+rms_norm (max rel 8.4e-7), fused elementwise silu/sigmoid/softplus + gate
+multiplies (max abs < 1e-6), row-wise RMS/L2 norms (5e-7 / 1.5e-8), masked
+softmax_row (4.7e-10), IMROPE rope (3.9e-6), and the gated-delta-net step
+(attn 9.3e-10, state 1.5e-8). Remaining G2: the full-attention layer kernel
+(q.k scores over the device KV cache + weighted v) and the single-command-
+buffer decode orchestrator (per-token submit) validated by golden qa (id
+8160), then bandwidth tuning on the RX 7600 (G3).
 
 G0-G2 are designed to be validated on the current iGPU for *correctness*
 (golden greedy id 8160 must match), knowing gfx902 throughput is irrelevant;
