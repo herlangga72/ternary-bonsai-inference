@@ -9,6 +9,8 @@
 mod gguf;
 #[path = "../kernels.rs"]
 mod kernels;
+#[path = "../rope.rs"]
+mod rope;
 #[path = "../vk.rs"]
 mod vk;
 
@@ -200,24 +202,86 @@ fn check_normrows(gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_softmax(gpu: &mut vk::Gpu) -> Result<(), String> {
+    // attention-row shape with a masked tail (-inf like the causal mask)
+    let n = 2048usize;
+    let mut x: Vec<f32> = rand_floats(0x6666, n).iter().map(|v| v * 6.0).collect();
+    for v in x[n - 512..].iter_mut() {
+        *v = f32::NEG_INFINITY;
+    }
+    let y_cpu = kernels::softmax_rows(&x, n)?;
+    let y_gpu = gpu.softmax_row(&x)?;
+    let mut max_abs = 0.0f32;
+    let mut bad = 0usize;
+    for i in 0..n {
+        let d = (y_gpu[i] - y_cpu[i]).abs();
+        if d > 1e-5 {
+            bad += 1;
+        }
+        max_abs = max_abs.max(d);
+    }
+    println!("softmax_row (n {n}, 512 masked): max abs {max_abs:.3e}, mismatched {bad}/{n}");
+    if bad != 0 {
+        return Err("softmax_row mismatch".into());
+    }
+    Ok(())
+}
+
+fn check_rope(gpu: &mut vk::Gpu) -> Result<(), String> {
+    // full-attention q layout: 24 heads x 256, n_dims 64, sections [11,11,10,0]
+    let hd = 256usize;
+    let n_dims = 64usize;
+    let nheads = 24usize;
+    let pos: i64 = 37;
+    let freq: f32 = 1e7;
+    let sections_i32 = [11i32, 11, 10, 0];
+    let heads: Vec<f32> = rand_floats(0x7777, nheads * hd);
+    let mut y_cpu = heads.clone();
+    for h in 0..nheads {
+        rope::rope_imrope(
+            &mut y_cpu[h * hd..(h + 1) * hd],
+            pos,
+            pos,
+            pos,
+            pos,
+            n_dims,
+            sections_i32,
+            freq,
+        );
+    }
+    let y_gpu = gpu.rope_imrope(&heads, hd, n_dims, pos as u32, freq, [11, 11, 10, 0])?;
+    let mut max_abs = 0.0f32;
+    for i in 0..heads.len() {
+        max_abs = max_abs.max((y_gpu[i] - y_cpu[i]).abs());
+    }
+    println!("rope_imrope ({nheads} heads x {hd}, pos {pos}): max abs {max_abs:.3e}");
+    if max_abs > 1e-4 {
+        return Err("rope_imrope mismatch".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "usage: bonsai-vk <model.gguf> [tensor_name]\n   or: bonsai-vk rmsnorm <model.gguf>\n   or: bonsai-vk normrows | elem"
+            "usage: bonsai-vk <model.gguf> [tensor_name]\n   or: bonsai-vk rmsnorm <model.gguf>\n   or: bonsai-vk normrows | elem | softmax | rope"
         );
         std::process::exit(1);
     }
     let rms_mode = args[0] == "rmsnorm";
     let elem_mode = args[0] == "elem";
     let normrows_mode = args[0] == "normrows";
+    let softmax_mode = args[0] == "softmax";
+    let rope_mode = args[0] == "rope";
+    let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode;
     let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
         std::process::exit(1);
     }
     let mut g: Option<GGUF> = None;
-    if !elem_mode && !normrows_mode {
+    if !no_model {
         g = Some(match GGUF::open(&model) {
             Ok(g) => g,
             Err(e) => {
@@ -247,6 +311,32 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("ELEM CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if softmax_mode {
+        match check_softmax(&mut gpu) {
+            Ok(()) => {
+                println!("SOFTMAX CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("SOFTMAX CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if rope_mode {
+        match check_rope(&mut gpu) {
+            Ok(()) => {
+                println!("ROPE CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("ROPE CHECK FAILED: {e}");
                 std::process::exit(1);
             }
         }

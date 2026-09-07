@@ -1,0 +1,55 @@
+#version 450
+
+// IMROPE (interleaved multi-rope) for full-attention q/k heads. Mirrors
+// rope::rope_imrope for pure-text decode (all four positions equal `pos`).
+// One workgroup per head; lane j (j < n_dims/2) rotates pair (j, j+n_dims/2)
+// inside the first n_dims elements of the head vector.
+// Bindings: 0 = x (in-place rotate), 2 unused output alias kept for the
+// shared layout. Push: { hd, n_dims, pos, freq_base_bits, s0, s1, s2, s3 }.
+//
+// The band selection mirrors the reference loop exactly: cache index i0=2*j,
+// sector = (i0/2) % (s0+s1+s2+s3), theta = theta_p * freq_base^(-2j/n_dims)
+// where theta_p is picked by sector band, all equal to `pos` for text.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Head { float data[]; } h;
+
+layout(push_constant) uniform PC {
+    uint hd;
+    uint n_dims;
+    uint pos;
+    uint freq_base_bits;
+    uint s0;
+    uint s1;
+    uint s2;
+    uint s3;
+} pc;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint lane = gl_LocalInvocationID.x;
+    uint halfd = pc.n_dims >> 1;
+    if (lane >= halfd) { return; }
+
+    uint sect_dims = pc.s0 + pc.s1 + pc.s2 + pc.s3;
+    uint sector = lane % sect_dims;
+    uint r = sector % 3u;
+    uint theta_p = pc.pos;
+    // All four positions equal `pos` in text decode; kept for structure.
+    if (r == 1u && sector < 3u * pc.s1) { theta_p = pc.pos; }
+    else if (r == 2u && sector < 3u * pc.s2) { theta_p = pc.pos; }
+    else if (r == 0u && sector < 3u * pc.s0) { theta_p = pc.pos; }
+    else { theta_p = pc.pos; }
+
+    float freq = uintBitsToFloat(pc.freq_base_bits);
+    float theta = float(theta_p) * pow(freq, -2.0 * float(lane) / float(pc.n_dims));
+    float cos_t = cos(theta);
+    float sin_t = sin(theta);
+
+    uint base = head * pc.hd;
+    float x0 = h.data[base + lane];
+    float x1 = h.data[base + lane + halfd];
+    h.data[base + lane] = x0 * cos_t - x1 * sin_t;
+    h.data[base + lane + halfd] = x0 * sin_t + x1 * cos_t;
+}

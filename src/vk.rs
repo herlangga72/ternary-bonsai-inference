@@ -33,6 +33,14 @@ pub const ELEM_SPV: &[u8] =
 pub const NORM_ROWS_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/norm_rows.spv"));
 
+/// SPIR-V for the masked softmax shader (`shaders/softmax_row.comp`).
+pub const SOFTMAX_ROW_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_row.spv"));
+
+/// SPIR-V for the IMROPE shader (`shaders/rope_imrope.comp`).
+pub const ROPE_IMROPE_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rope_imrope.spv"));
+
 /// Shader workgroup width; must match `layout(local_size_x = ...)` in the
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
@@ -834,6 +842,93 @@ impl Gpu {
             self.destroy_host_buffer(xb);
             self.destroy_host_buffer(wb);
             self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok(out)
+        }
+    }
+
+    /// Masked softmax over one row. Mirrors kernels::softmax_rows for a single
+    /// row; -inf entries become zero via exp(-inf).
+    pub fn softmax_row(&mut self, x: &[f32]) -> Result<Vec<f32>, String> {
+        let n = x.len();
+        if n == 0 {
+            return Err("softmax_row: empty input".into());
+        }
+        self.ensure_kernel("softmax_row", SOFTMAX_ROW_SPV)?;
+        unsafe {
+            let mut xb = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut dummy = self.create_host_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            xb.data_mut().copy_from_slice(bytemuck_slice(x));
+            dummy.data_mut().fill(0);
+
+            let (pool, set) = self.make_set(xb.buffer, dummy.buffer, ob.buffer)?;
+            let pc = [n as u32];
+            let pc_bytes =
+                std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc));
+            self.run_registered("softmax_row", set, pc_bytes, 256, 1)?;
+
+            let out = ob.data()[..n * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(xb);
+            self.destroy_host_buffer(dummy);
+            self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok(out)
+        }
+    }
+
+    /// Apply IMROPE to `nheads` contiguous head vectors of `hd` floats each,
+    /// rotating the first `n_dims` elements in place (pure-text positions all
+    /// equal `pos`). Mirrors rope::rope_imrope.
+    pub fn rope_imrope(
+        &mut self,
+        heads: &[f32],
+        hd: usize,
+        n_dims: usize,
+        pos: u32,
+        freq_base: f32,
+        sections: [u32; 4],
+    ) -> Result<Vec<f32>, String> {
+        let total = heads.len();
+        if total == 0 || total % hd != 0 || n_dims > hd || n_dims % 2 != 0 {
+            return Err(format!(
+                "rope_imrope: total {total}, hd {hd}, n_dims {n_dims} invalid"
+            ));
+        }
+        self.ensure_kernel("rope_imrope", ROPE_IMROPE_SPV)?;
+        let nheads = total / hd;
+        unsafe {
+            let mut xb = self.create_host_buffer(total * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut dummy = self.create_host_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            xb.data_mut().copy_from_slice(bytemuck_slice(heads));
+            dummy.data_mut().fill(0);
+
+            // descriptor needs three buffers for the shared layout; binding 1
+            // (dummy) and 2 are unused by this shader
+            let (pool, set) = self.make_set(xb.buffer, dummy.buffer, dummy.buffer)?;
+            let pc = [
+                hd as u32,
+                n_dims as u32,
+                pos,
+                freq_base.to_bits(),
+                sections[0],
+                sections[1],
+                sections[2],
+                sections[3],
+            ];
+            let pc_bytes =
+                std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc));
+            self.run_registered("rope_imrope", set, pc_bytes, 256, nheads as u32)?;
+
+            let out = xb.data()[..total * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(xb);
+            self.destroy_host_buffer(dummy);
             self.device.destroy_descriptor_pool(pool, None);
             Ok(out)
         }

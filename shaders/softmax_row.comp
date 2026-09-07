@@ -1,0 +1,48 @@
+#version 450
+
+// Numerically stable softmax over one row (masked entries come in as -inf and
+// naturally get exp(-inf) = 0). Mirrors kernels::softmax_rows for one row.
+// Bindings: 0 = x, 2 = o. Push: { uint n; }.
+// One workgroup of 256 lanes; loop when n > 256 (attention rows grow with
+// context length).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InX { float data[]; } x;
+layout(set = 0, binding = 2, std430) buffer       Out  { float data[]; } o;
+
+layout(push_constant) uniform PC { uint n; } pc;
+
+shared float red[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint n = pc.n;
+
+    float m = -3.402823466e+38f; // -FLT_MAX
+    for (uint i = lid; i < n; i += 256u) {
+        m = max(m, x.data[i]);
+    }
+    red[lid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) { red[lid] = max(red[lid], red[lid + s]); }
+        barrier();
+    }
+    float mx = red[0];
+
+    float sum = 0.0f;
+    for (uint i = lid; i < n; i += 256u) {
+        sum += exp(x.data[i] - mx);
+    }
+    red[lid] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) { red[lid] += red[lid + s]; }
+        barrier();
+    }
+    float inv = 1.0f / red[0];
+    for (uint i = lid; i < n; i += 256u) {
+        o.data[i] = exp(x.data[i] - mx) * inv;
+    }
+}
