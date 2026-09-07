@@ -19,40 +19,40 @@ use std::ffi::CStr;
 /// SPIR-V for the PQ2_0 matvec shader, compiled from `shaders/pq2_matvec.comp`
 /// by build.rs (glslangValidator) into OUT_DIR.
 pub const PQ2_MATVEC_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_matvec.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_matvec.spv"));
 
 /// SPIR-V for the RMSNorm shader (`shaders/rms_norm.comp`).
 pub const RMS_NORM_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/rms_norm.spv"));
 
 /// SPIR-V for the fused elementwise shader (`shaders/elem.comp`).
 pub const ELEM_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/elem.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/elem.spv"));
 
 /// SPIR-V for the row-wise norm shader (`shaders/norm_rows.comp`).
 pub const NORM_ROWS_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/norm_rows.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/norm_rows.spv"));
 
 /// SPIR-V for the masked softmax shader (`shaders/softmax_row.comp`).
 pub const SOFTMAX_ROW_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_row.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/softmax_row.spv"));
 
 /// SPIR-V for the IMROPE shader (`shaders/rope_imrope.comp`).
 pub const ROPE_IMROPE_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/rope_imrope.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/rope_imrope.spv"));
 
 /// SPIR-V for the gated-delta-net step (`shaders/gdn_step.comp`).
 pub const GDN_STEP_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_step.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/gdn_step.spv"));
 
 /// SPIR-V for the attention trio (`shaders/attn_scores.comp`,
 /// `softmax_inplace.comp`, `attn_out.comp`).
 pub const ATTN_SCORES_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/attn_scores.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/attn_scores.spv"));
 pub const SOFTMAX_INPLACE_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_inplace.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/softmax_inplace.spv"));
 pub const ATTN_OUT_SPV: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/attn_out.spv"));
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/attn_out.spv"));
 
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
 pub const GDN_DK: usize = 2048; // H_K * S

@@ -13,8 +13,8 @@ fn compile_shaders() {
     let tool = find_in_path("glslangValidator");
     let Some(tool) = tool else {
         println!(
-            "cargo:warning=glslangValidator not found in PATH: Vulkan SPIR-V modules will not \
-             be compiled (the bonsai-vk binary needs it)"
+            "cargo:warning=glslangValidator not found in PATH: Vulkan SPIR-V modules will not be \
+             refreshed (vendored copies under spv/ are used by bonsai-vk)"
         );
         return;
     };
