@@ -1,0 +1,44 @@
+#version 450
+// PQ2_0 matvec v3 partial pass: one work item per 128-weight block writes
+// acc*scale into partials[rowlocal * nblocks + block] (no atomics; portable).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer W { uint data[]; } w;
+layout(set = 0, binding = 1, std430) readonly buffer X { float data[]; } x;
+layout(set = 0, binding = 2, std430) buffer P { float data[]; } partials;
+layout(push_constant) uniform PC { uint ne0; uint base_row; } pc;
+uint u8_at(uint off) { return (w.data[off >> 2] >> ((off & 3u) << 3)) & 0xffu; }
+float half_to_float(uint h) {
+    uint sign = (h >> 15) & 1u; uint exp = (h >> 10) & 0x1fu; uint man = h & 0x3ffu;
+    uint bits;
+    if (exp == 0u) { if (man == 0u) { bits = sign << 31; } else {
+        int e = 127 - 15 + 1; uint m = man;
+        while ((m & 0x400u) == 0u) { m <<= 1; e -= 1; } m &= 0x3ffu;
+        bits = (sign << 31) | (uint(e) << 23) | (m << 13); } }
+    else if (exp == 0x1fu) { bits = (sign << 31) | 0x7f800000u | (man << 13); }
+    else { bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (man << 13); }
+    return uintBitsToFloat(bits);
+}
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint nblocks = (pc.ne0 + 127u) / 128u;
+    uint rowlocal = gid / nblocks;
+    uint block = gid % nblocks;
+    uint row = rowlocal + pc.base_row;
+    uint rowbytes = nblocks * 34u;
+    uint blk_start = row * rowbytes + block * 34u;
+    float scale = half_to_float(u8_at(blk_start) | (u8_at(blk_start + 1u) << 8));
+    uint colbase = block * 128u;
+    uint nbytes = min(128u, pc.ne0 - colbase) / 4u;
+    float acc = 0.0f;
+    uint off = blk_start + 2u;
+    for (uint k = 0u; k < nbytes; ++k) {
+        uint cb = u8_at(off + k);
+        uint c0 = cb & 3u; uint c1 = (cb >> 2) & 3u;
+        uint c2 = (cb >> 4) & 3u; uint c3 = (cb >> 6) & 3u;
+        acc += x.data[colbase + 4u * k + 0u] * float(int(c0) - 1);
+        acc += x.data[colbase + 4u * k + 1u] * float(int(c1) - 1);
+        acc += x.data[colbase + 4u * k + 2u] * float(int(c2) - 1);
+        acc += x.data[colbase + 4u * k + 3u] * float(int(c3) - 1);
+    }
+    partials.data[rowlocal * nblocks + block] = acc * scale;
+}

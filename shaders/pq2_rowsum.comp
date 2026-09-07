@@ -1,0 +1,21 @@
+#version 450
+// PQ2_0 matvec v3 reduce pass: one workgroup per row sums nblocks partials.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer P { float data[]; } partials;
+layout(set = 0, binding = 2, std430) buffer Y { float data[]; } y;
+layout(push_constant) uniform PC { uint nblocks; uint pad; } pc;
+shared float red[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint base = row * pc.nblocks;
+    float acc = 0.0f;
+    for (uint i = lid; i < pc.nblocks; i += 256u) { acc += partials.data[base + i]; }
+    red[lid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) { red[lid] += red[lid + s]; }
+        barrier();
+    }
+    if (lid == 0u) { y.data[row] = red[0]; }
+}

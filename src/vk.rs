@@ -54,6 +54,13 @@ pub const SOFTMAX_INPLACE_SPV: &[u8] =
 pub const ATTN_OUT_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/attn_out.spv"));
 
+/// SPIR-V for the two-pass PQ2_0 matvec (`shaders/pq2_partial.comp`,
+/// `shaders/pq2_rowsum.comp`).
+pub const PQ2_PARTIAL_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_partial.spv"));
+pub const PQ2_ROWSUM_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum.spv"));
+
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
 pub const GDN_DK: usize = 2048; // H_K * S
 pub const GDN_DI: usize = 6144; // H_V * S
@@ -724,6 +731,191 @@ impl Gpu {
     }
 
     // ---- G2a: generic kernels on the shared layout ---------------------------
+
+    /// Benchmark the pq2_atom (bandwidth-oriented) matvec kernel: weights in a
+    /// device-local buffer, x/y host-visible, `iters` dispatches recorded into
+    /// one command buffer for kernel-only timing, then a clean single dispatch
+    /// for the returned y. Returns (seconds per iteration, final y).
+    pub fn matvec_bench_atom(
+        &mut self,
+        payload: &[u8],
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        x: &[f32],
+        iters: u32,
+    ) -> Result<(f64, Vec<f32>), String> {
+        self.ensure_kernel("pq2_partial", PQ2_PARTIAL_SPV)?;
+        self.ensure_kernel("pq2_rowsum", PQ2_ROWSUM_SPV)?;
+        let pipeline_p = *self
+            .kernels
+            .get("pq2_partial")
+            .ok_or("pq2_partial not registered")?;
+        let pipeline_r = *self
+            .kernels
+            .get("pq2_rowsum")
+            .ok_or("pq2_rowsum not registered")?;
+        let nblocks = ne0.div_ceil(128);
+        let n_partials = n_rows.saturating_mul(nblocks).max(1);
+        let groups_p = (n_partials as u32).div_ceil(256).max(1);
+        let groups_r = n_rows.max(1) as u32;
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let w = self.create_dev_buffer(payload.len(), usage)?;
+        self.upload(&w, payload)?;
+        let partial_len = n_partials * 4;
+        let partials =
+            self.create_dev_buffer(partial_len, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let mut x_host =
+            unsafe { self.create_host_buffer(ne0 * 4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        let mut y_host =
+            unsafe { self.create_host_buffer(n_rows * 4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        let mut dummy =
+            unsafe { self.create_host_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        unsafe {
+            x_host.data_mut().copy_from_slice(bytemuck_slice(x));
+            dummy.data_mut().fill(0);
+        }
+        let (pool_p, set_p) =
+            unsafe { self.make_set(w.buffer, x_host.buffer, partials.buffer) }?;
+        let (pool_r, set_r) =
+            unsafe { self.make_set(partials.buffer, dummy.buffer, y_host.buffer) }?;
+
+        let cb_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { self.device.allocate_command_buffers(&cb_info) }
+            .map_err(|e| format!("matvec_atom: alloc: {e}"))?[0];
+
+        let pc_p = [ne0 as u32, base_row];
+        let pc_pb = unsafe {
+            std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+        };
+        let pc_r = [nblocks as u32, 0u32];
+        let pc_rb = unsafe {
+            std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
+        };
+        let barrier_bufs = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                )
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(partials.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(
+                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                )
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(y_host.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+
+        let t0 = std::time::Instant::now();
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cb, &begin)
+                .map_err(|e| format!("matvec_atom: begin: {e}"))?;
+            for _ in 0..iters {
+                self.device
+                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline_p);
+                self.device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[set_p],
+                    &[],
+                );
+                self.device.cmd_push_constants(
+                    cb,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    pc_pb,
+                );
+                self.device.cmd_dispatch(cb, groups_p, 1, 1);
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &barrier_bufs,
+                    &[],
+                );
+                self.device
+                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline_r);
+                self.device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[set_r],
+                    &[],
+                );
+                self.device.cmd_push_constants(
+                    cb,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    pc_rb,
+                );
+                self.device.cmd_dispatch(cb, groups_r, 1, 1);
+                self.device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &barrier_bufs,
+                    &[],
+                );
+            }
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("matvec_atom: end: {e}"))?;
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("matvec_atom: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("matvec_atom: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("matvec_atom: wait: {e}"))?;
+            let dt = t0.elapsed().as_secs_f64() / iters as f64;
+
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            self.device.destroy_descriptor_pool(pool_p, None);
+            self.device.destroy_descriptor_pool(pool_r, None);
+
+            let out = y_host.data()[..n_rows * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(x_host);
+            self.destroy_host_buffer(y_host);
+            self.destroy_host_buffer(dummy);
+            self.destroy_dev_buffer(w);
+            self.destroy_dev_buffer(partials);
+            Ok((dt, out))
+        }
+    }
 
     /// Build (once) a compute pipeline from SPIR-V bytes on the shared layout.
     /// Kernels must use at most bindings 0..3 of the descriptor set and an

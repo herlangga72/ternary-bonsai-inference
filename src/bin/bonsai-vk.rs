@@ -60,9 +60,12 @@ fn check_tensor(g: &GGUF, gpu: &mut vk::Gpu, name: &str) -> Result<(), String> {
     let macs = rows as u64 * ne0 as u64;
     let iters: u32 = if macs < 200_000_000 { 30 } else { 6 };
 
-    let (dt, ygpu) = gpu
-        .matvec_bench(payload, ne0, 0, rows, &x, iters)
-        .map_err(|e| format!("gpu matvec: {e}"))?;
+    let use_atom = std::env::var("BONSAI_ATOM").map(|v| v == "1").unwrap_or(false);
+    let (dt, ygpu) = if use_atom {
+        gpu.matvec_bench_atom(payload, ne0, 0, rows, &x, iters)?
+    } else {
+        gpu.matvec_bench(payload, ne0, 0, rows, &x, iters)?
+    };
 
     let mut ycpu = vec![0.0f32; rows];
     kernels::pq2_matvec_range(payload, ne0, 0, rows, &x, &mut ycpu)
