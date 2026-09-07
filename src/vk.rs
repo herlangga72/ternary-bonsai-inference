@@ -29,6 +29,10 @@ pub const RMS_NORM_SPV: &[u8] =
 pub const ELEM_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/elem.spv"));
 
+/// SPIR-V for the row-wise norm shader (`shaders/norm_rows.comp`).
+pub const NORM_ROWS_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/norm_rows.spv"));
+
 /// Shader workgroup width; must match `layout(local_size_x = ...)` in the
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
@@ -196,11 +200,14 @@ impl Gpu {
             "create_descriptor_set_layout",
         )?;
 
-        // ---- pipeline layout: one 8-byte push constant range ----------------
+        // ---- pipeline layout: shared push constant range --------------------
+        // All kernels on the shared layout declare their own push-constant
+        // block at offset 0; 64 bytes covers every current and planned shader
+        // (matvec 8B, rms_norm 8B, elem 8B, row norms 16B, gdn up to 64B).
         let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(8);
+            .size(64);
         let set_layouts = [desc_layout];
         let push_ranges = [push_range];
         let pl_info = vk::PipelineLayoutCreateInfo::default()
@@ -775,6 +782,57 @@ impl Gpu {
                 .collect::<Vec<f32>>();
             self.destroy_host_buffer(ab);
             self.destroy_host_buffer(bb);
+            self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok(out)
+        }
+    }
+
+    /// Row-wise RMS (mode 0) or L2 (mode 1) normalization. `x` holds
+    /// `rows * row_len` floats laid out row-major; `w` (row_len long, rms
+    /// only) is applied per element. Mirrors kernels::rms_norm_rows /
+    /// l2_norm_rows.
+    pub fn norm_rows(
+        &mut self,
+        x: &[f32],
+        w: Option<&[f32]>,
+        mode: u32,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<Vec<f32>, String> {
+        let total = x.len();
+        if total == 0 || total % row_len != 0 {
+            return Err(format!(
+                "norm_rows: total {total} not divisible by row_len {row_len}"
+            ));
+        }
+        if mode == 0 && w.map(|w| w.len()) != Some(row_len) {
+            return Err("norm_rows rms: w must be row_len long".into());
+        }
+        self.ensure_kernel("norm_rows", NORM_ROWS_SPV)?;
+        let rows = total / row_len;
+        unsafe {
+            let mut xb = self.create_host_buffer(total * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let w_len = if mode == 0 { row_len } else { 1 };
+            let mut wb = self.create_host_buffer(w_len * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(total * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            xb.data_mut().copy_from_slice(bytemuck_slice(x));
+            if let Some(wv) = w {
+                wb.data_mut().copy_from_slice(bytemuck_slice(wv));
+            } else {
+                wb.data_mut().fill(0);
+            }
+            let (pool, set) = self.make_set(xb.buffer, wb.buffer, ob.buffer)?;
+            let pc = [total as u32, row_len as u32, mode, eps.to_bits()];
+            let pc_bytes =
+                std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc));
+            self.run_registered("norm_rows", set, pc_bytes, 256, rows as u32)?;
+            let out = ob.data()[..total * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(xb);
+            self.destroy_host_buffer(wb);
             self.destroy_host_buffer(ob);
             self.device.destroy_descriptor_pool(pool, None);
             Ok(out)

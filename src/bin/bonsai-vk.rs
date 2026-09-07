@@ -170,23 +170,54 @@ fn check_elem(gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_normrows(gpu: &mut vk::Gpu) -> Result<(), String> {
+    // rms rows: like q heads (24 rows x 256); l2 rows: like ssm q/k groups
+    let eps = 1e-6f32;
+    let xr: Vec<f32> = rand_floats(0x3333, 24 * 256);
+    let wr: Vec<f32> = rand_floats(0x4444, 256);
+    let yr_cpu = kernels::rms_norm_rows(&xr, &wr, 256, eps)?;
+    let yr_gpu = gpu.norm_rows(&xr, Some(&wr), 0, 256, eps)?;
+    let mut max_abs = 0.0f32;
+    for i in 0..xr.len() {
+        max_abs = max_abs.max((yr_gpu[i] - yr_cpu[i]).abs());
+    }
+    println!("norm_rows rms (24x256): max abs {max_abs:.3e}");
+    if max_abs > 1e-5 {
+        return Err("norm_rows rms mismatch".into());
+    }
+
+    let xl: Vec<f32> = rand_floats(0x5555, 16 * 128);
+    let yl_cpu = kernels::l2_norm_rows(&xl, 128, 1e-12)?;
+    let yl_gpu = gpu.norm_rows(&xl, None, 1, 128, 1e-12)?;
+    let mut max_abs = 0.0f32;
+    for i in 0..xl.len() {
+        max_abs = max_abs.max((yl_gpu[i] - yl_cpu[i]).abs());
+    }
+    println!("norm_rows l2 (16x128): max abs {max_abs:.3e}");
+    if max_abs > 1e-5 {
+        return Err("norm_rows l2 mismatch".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "usage: bonsai-vk <model.gguf> [tensor_name]\n   or: bonsai-vk rmsnorm <model.gguf>\n   or: bonsai-vk elem"
+            "usage: bonsai-vk <model.gguf> [tensor_name]\n   or: bonsai-vk rmsnorm <model.gguf>\n   or: bonsai-vk normrows | elem"
         );
         std::process::exit(1);
     }
     let rms_mode = args[0] == "rmsnorm";
     let elem_mode = args[0] == "elem";
+    let normrows_mode = args[0] == "normrows";
     let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
         std::process::exit(1);
     }
     let mut g: Option<GGUF> = None;
-    if !elem_mode {
+    if !elem_mode && !normrows_mode {
         g = Some(match GGUF::open(&model) {
             Ok(g) => g,
             Err(e) => {
@@ -216,6 +247,19 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("ELEM CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if normrows_mode {
+        match check_normrows(&mut gpu) {
+            Ok(()) => {
+                println!("NORMROWS CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("NORMROWS CHECK FAILED: {e}");
                 std::process::exit(1);
             }
         }
