@@ -33,7 +33,7 @@ const GDN_CH: usize = 2 * GDN_DK + GDN_DI; // 10240
 const STATE_SIZE: usize = 128;
 const GDN_STATE_ELEMS: usize = GDN_HV * STATE_SIZE * STATE_SIZE;
 const KV_STRIDE: usize = N_KV * HEAD_D;
-const N_CTX: usize = 4096;
+const N_CTX: usize = 2048;
 const EPS: f32 = 1e-6;
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
@@ -165,7 +165,9 @@ pub struct GDev {
 }
 
 fn make(gpu: &mut vk::Gpu, n: usize) -> Result<DevBuf, String> {
-    gpu.create_dev_buffer(n.max(1) * 4, vk::storage_usage())
+    // device-local on discrete GPUs; host-visible (RAM) on APUs so the whole
+    // model + caches fit. n is in floats; buffers are sized in bytes.
+    gpu.create_model_weight_buffer(n.max(1) * 4)
 }
 
 impl GDev {
@@ -190,8 +192,14 @@ impl GDev {
             if t.ty != gguf::TYPE_PQ2_0 && t.ty != gguf::TYPE_F32 && t.ty != gguf::TYPE_F16 {
                 continue;
             }
+            // LM head and embeddings stay on the CPU path (head + token row are
+            // host-side); uploading them would cost ~0.7 GB and a 322 MB staging
+            // buffer we do not need.
+            if t.name == "output.weight" || t.name == "token_embd.weight" {
+                continue;
+            }
             let nbytes = gg.tensor_nbytes(t) as usize;
-            let buf = gpu.create_weight_buffer(nbytes)?;
+            let buf = gpu.create_model_weight_buffer(nbytes)?;
             let payload = gg.payload_slice(t)?;
             gpu.upload(&buf, payload)?;
             let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
@@ -402,11 +410,12 @@ impl GDev {
 
         let (wn, _, _) = self.tw(&format!("blk.{il}.attn_norm.weight"))?;
         rec_rms(&mut self.gpu, cur, &wn, xnorm, N_EMBD)?;
+        // gdn_prep reads smalls as [beta_raw(48), alpha_raw(48), ssa(48), dt(48)]
         for (suf, dst, ybase) in [
             ("attn_qkv.weight", &self.qkv, 0usize),
             ("attn_gate.weight", &self.z, 0),
-            ("ssm_alpha.weight", &self.smalls, 0),
-            ("ssm_beta.weight", &self.smalls, GDN_HV),
+            ("ssm_beta.weight", &self.smalls, 0),
+            ("ssm_alpha.weight", &self.smalls, GDN_HV),
         ] {
             let (w, ne0, rows) = self.tw(&format!("blk.{il}.{suf}"))?;
             rec_mat(&mut self.gpu, partials, &w, ne0, rows, xnorm, dst, ybase)?;

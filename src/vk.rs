@@ -495,6 +495,47 @@ impl Gpu {
         )
     }
 
+    /// Host-visible device buffer (system RAM on APUs, GTT on dGPUs). Used for
+    /// weight storage when a discrete card is absent and the device-local heap
+    /// is smaller than the model (gfx902 reports ~6.4 GB < 7.1 GB weights).
+    pub fn create_host_dev_buffer(
+        &self,
+        len: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> Result<DevBuf, String> {
+        unsafe {
+            let info = vk::BufferCreateInfo::default()
+                .size(len as vk::DeviceSize)
+                .usage(usage)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = err(self.device.create_buffer(&info, None), "create_host_dev: buffer")?;
+            let req = self.device.get_buffer_memory_requirements(buffer);
+            let idx = self.memory_type_index(
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(req.size)
+                .memory_type_index(idx);
+            let memory = err(self.device.allocate_memory(&alloc, None), "create_host_dev: mem")?;
+            err(
+                self.device.bind_buffer_memory(buffer, memory, 0),
+                "create_host_dev: bind",
+            )?;
+            Ok(DevBuf { buffer, memory, len })
+        }
+    }
+
+    /// Weight buffer on the memory type that can actually hold the model:
+    /// device-local on discrete cards, host-visible (RAM) on APUs.
+    pub fn create_model_weight_buffer(&mut self, len: usize) -> Result<DevBuf, String> {
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        if self.discrete {
+            self.create_dev_buffer(len, usage)
+        } else {
+            self.create_host_dev_buffer(len, usage)
+        }
+    }
+
     pub fn create_dev_buffer(
         &self,
         len: usize,
