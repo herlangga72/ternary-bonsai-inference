@@ -1,23 +1,22 @@
 #version 450
 // In-place L2 normalization of rows of length 128 (qwen35 ssm q/k: 16 rows).
-// One workgroup (128 lanes) per row; each lane reads its element into a
-// register before the barrier, so write-back cannot clobber pending reads.
-// Binding 0 = x (in/out). Push: { uint rows; uint pad; }
+// Accumulates the row sum of squares in double to match the CPU f64 reference.
+// One workgroup (128 lanes) per row; read-into-register before barrier.
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) buffer X { float data[]; } x;
 layout(push_constant) uniform PC { uint rows; uint base; } pc;
-shared float red[128];
+shared double red[128];
 void main() {
     uint row = gl_WorkGroupID.x;
     uint lid = gl_LocalInvocationID.x;
     uint base = pc.base + row * 128u;
     float v = x.data[base + lid];
-    red[lid] = v * v;
+    red[lid] = double(v) * double(v);
     barrier();
     for (uint s = 64u; s > 0u; s >>= 1) {
         if (lid < s) { red[lid] += red[lid + s]; }
         barrier();
     }
-    float scale = 1.0f / max(sqrt(red[0]), 1e-12f);
+    float scale = 1.0f / max(float(sqrt(red[0])), 1e-12f);
     x.data[base + lid] = v * scale;
 }
