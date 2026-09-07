@@ -390,16 +390,20 @@ unsafe fn row_dot_avx2(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
         let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
         let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
         let xoff = block * PQ2_QK;
-        let mut vacc = _mm_setzero_ps();
-        for k in 0..32 {
-            let byte = qs[k] as usize;
-            let xv = _mm_loadu_ps(x.as_ptr().add(xoff + 4 * k));
-            let wv = _mm_loadu_ps(lut.as_ptr().add(byte * 4));
-            vacc = _mm_fmadd_ps(xv, wv, vacc);
+        let mut vacc = _mm256_setzero_ps();
+        // two bytes per iteration = 8 lanes of x with one 256-bit FMA
+        for k in (0..32).step_by(2) {
+            let byte_a = qs[k] as usize;
+            let byte_b = qs[k + 1] as usize;
+            let xv = _mm256_loadu_ps(x.as_ptr().add(xoff + 8 * (k / 2)));
+            let wa = _mm_loadu_ps(lut.as_ptr().add(byte_a * 4));
+            let wb = _mm_loadu_ps(lut.as_ptr().add(byte_b * 4));
+            let wv = _mm256_insertf128_ps(_mm256_castps128_ps256(wa), wb, 1);
+            vacc = _mm256_fmadd_ps(xv, wv, vacc);
         }
-        let t = _mm_hadd_ps(vacc, vacc);
-        let t = _mm_hadd_ps(t, t);
-        acc += scale * _mm_cvtss_f32(t);
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), vacc);
+        acc += scale * (lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7]);
     }
     // scalar tail for ne0 not a multiple of 128
     let tail_start = n_blocks * PQ2_QK;
