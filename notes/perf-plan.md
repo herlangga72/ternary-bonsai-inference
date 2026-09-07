@@ -84,9 +84,9 @@ mmap/upload plumbing + numeric reference the GPU track needs.
 
 | step | work | expected |
 | --- | --- | --- |
-| M8.1 | mmap the payload; slice-based row kernel (kills 4M syscalls/token, enables threads and GPU upload) | ~10-20% + prerequisite |
-| M8.3 | thread matvecs over 4 cores (read-only row chunks, scoped threads) | decode ~5-8 s/token |
-| (defer) | M8.2 scalar tightening, M8.4 AVX2 - only if CPU stays useful after the GPU lands; the 7600 makes CPU SIMD a hobby path | - |
+| M8.1 | mmap the payload; slice-based row kernel (kills 4M syscalls/token, enables threads and GPU upload) | done | |
+| M8.3 | thread matvecs over 4 cores (read-only row chunks, scoped threads) | done | decode ~13 s/token |
+| M8.4 | AVX2+FMA PQ2_0 row dot (4KB code->float LUT, packed FMAs, runtime detect with scalar fallback) | done 2026-09-08 | decode ~2.1 s/token (5x); golden qa rel 4.03e-3 |
 
 #### Track GPU (target: 7600, build on gfx902 now)
 

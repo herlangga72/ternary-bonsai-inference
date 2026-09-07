@@ -314,7 +314,9 @@ pub fn pq2_matvec_range(
 
 /// Dot rows `base + range` (local row index within `range`) into `y`, one
 /// output float per row. Shared by the scalar and the per-thread paths so the
-/// decode math is bit-identical either way.
+/// decode math is bit-identical either way. On x86-64 with AVX2+FMA the inner
+/// loop uses a 4KB code->float lookup (values -1,0,1,2 per 2-bit code) with
+/// packed FMAs; otherwise it falls back to the scalar decode.
 fn dot_rows_into(
     payload: &[u8],
     ne0: usize,
@@ -325,24 +327,96 @@ fn dot_rows_into(
 ) {
     debug_assert_eq!(y.len(), rows.len());
     let row_bytes = pq2_row_bytes(ne0);
-    let n_blocks = ne0.div_ceil(PQ2_QK);
+    #[cfg(target_arch = "x86_64")]
+    let use_simd = std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma");
     for (out, r) in y.iter_mut().zip(rows) {
         let raw = &payload[(base + r) * row_bytes..(base + r + 1) * row_bytes];
-        let mut acc = 0.0f32;
-        // decode + dot in one pass
-        for block in 0..n_blocks {
-            let b = block * PQ2_BLOCK;
-            let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
-            let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
-            let start = block * PQ2_QK;
-            let end = (start + PQ2_QK).min(ne0);
-            for j in start..end {
-                let code = (qs[(j - start) / 4] >> (((j - start) % 4) * 2)) & 0x03;
-                acc += x[j] * ((code as i32 - 1) as f32 * scale);
+        #[cfg(target_arch = "x86_64")]
+        if use_simd && ne0 % PQ2_QK == 0 {
+            *out = unsafe { row_dot_avx2(raw, ne0, x) };
+            continue;
+        }
+        *out = row_dot_scalar(raw, ne0, x);
+    }
+}
+
+/// Scalar reference row dot (code-1 mapping, scale per 128-block). This is
+/// also what the exactness tests and the SIMD fallback compare against.
+fn row_dot_scalar(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
+    let n_blocks = ne0.div_ceil(PQ2_QK);
+    let mut acc = 0.0f32;
+    for block in 0..n_blocks {
+        let b = block * PQ2_BLOCK;
+        let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
+        let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
+        let start = block * PQ2_QK;
+        let end = (start + PQ2_QK).min(ne0);
+        let mut block_acc = 0.0f32;
+        for j in start..end {
+            let code = (qs[(j - start) / 4] >> (((j - start) % 4) * 2)) & 0x03;
+            block_acc += x[j] * ((code as i32 - 1) as f32);
+        }
+        acc += scale * block_acc;
+    }
+    acc
+}
+
+/// AVX2+FMA row dot. For each 128-weight block a 4KB table maps every byte
+/// (4 two-bit codes) to four f32 multipliers in {-1,0,1,2}; four lanes are
+/// multiplied per FMA. The block scale is applied once after the packed
+/// accumulation, so the result differs from the scalar path only by fp
+/// rounding order (~1e-6 relative).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_dot_avx2(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    static LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        let mut v = vec![0.0f32; 256 * 4];
+        for (byte, group) in v.chunks_exact_mut(4).enumerate() {
+            for k in 0..4 {
+                let code = (byte >> (2 * k)) & 0x03;
+                group[k] = (code as i32 - 1) as f32;
             }
         }
-        *out = acc;
+        v
+    });
+
+    let mut acc = 0.0f32;
+    let n_blocks = ne0 / PQ2_QK;
+    for block in 0..n_blocks {
+        let b = block * PQ2_BLOCK;
+        let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
+        let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
+        let xoff = block * PQ2_QK;
+        let mut vacc = _mm_setzero_ps();
+        for k in 0..32 {
+            let byte = qs[k] as usize;
+            let xv = _mm_loadu_ps(x.as_ptr().add(xoff + 4 * k));
+            let wv = _mm_loadu_ps(lut.as_ptr().add(byte * 4));
+            vacc = _mm_fmadd_ps(xv, wv, vacc);
+        }
+        let t = _mm_hadd_ps(vacc, vacc);
+        let t = _mm_hadd_ps(t, t);
+        acc += scale * _mm_cvtss_f32(t);
     }
+    // scalar tail for ne0 not a multiple of 128
+    let tail_start = n_blocks * PQ2_QK;
+    if tail_start < ne0 {
+        let qs = &raw[n_blocks * PQ2_BLOCK + 2..];
+        let mut tail_acc = 0.0f32;
+        for (j, src) in (tail_start..ne0).enumerate() {
+            let code = (qs[src / 4] >> ((src % 4) * 2)) & 0x03;
+            tail_acc += x[tail_start + j] * ((code as i32 - 1) as f32);
+        }
+        let scale = half_to_f32(u16::from_le_bytes([
+            raw[n_blocks * PQ2_BLOCK],
+            raw[n_blocks * PQ2_BLOCK + 1],
+        ]));
+        acc += scale * tail_acc;
+    }
+    acc
 }
 
 /// Number of rows (ne1) of a tensor.
@@ -450,5 +524,59 @@ mod tests {
             assert!((v - 0.25).abs() < 1e-6);
         }
         assert!(softmax_rows(&x, 3).is_err());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_row_dot_matches_scalar() {
+        use super::*;
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma"))
+        {
+            return;
+        }
+        let ne0 = 5120usize; // model row width, whole 128-blocks only
+        let n_rows = 8usize;
+        let row_bytes = pq2_row_bytes(ne0);
+        let mut raw = vec![0u8; row_bytes * n_rows];
+        // deterministic pseudo-random codes + positive fp16 scales
+        let mut s: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // f32 -> f16 (finite positive values only)
+        let f16 = |v: f32| -> u16 {
+            let b = v.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+            let mant = (b & 0x7f_ffff) >> 13;
+            sign | (((exp as u16) << 10) | mant as u16)
+        };
+        for r in 0..n_rows {
+            for b in 0..ne0 / PQ2_QK {
+                let base = r * row_bytes + b * PQ2_BLOCK;
+                let sc = 0.5 + ((next() >> 8) % 1000) as f32 / 1000.0;
+                let h = f16(sc);
+                raw[base] = (h & 0xff) as u8;
+                raw[base + 1] = (h >> 8) as u8;
+                for k in 0..32 {
+                    raw[base + 2 + k] = (next() % 256) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..ne0).map(|i| ((next() % 2001) as f32 - 1000.0) / 500.0).collect();
+        for r in 0..n_rows {
+            let row = &raw[r * row_bytes..(r + 1) * row_bytes];
+            let scalar = row_dot_scalar(row, ne0, &x);
+            let simd = unsafe { row_dot_avx2(row, ne0, &x) };
+            let scale = scalar.abs().max(1e-6);
+            assert!(
+                (scalar - simd).abs() / scale < 1e-4,
+                "row {r}: scalar {scalar} simd {simd}"
+            );
+        }
     }
 }

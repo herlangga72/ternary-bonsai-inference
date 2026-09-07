@@ -142,18 +142,18 @@ decoder is slow, so start with `-n 1..4` and a short prompt.
 ## Performance expectations
 
 27B ternary weights stream from RAM every token. Measured on a 4-core Ryzen
-3200G (15 GB RAM, DDR4) with the scalar pure-Rust decoder:
+3200G (15 GB RAM, DDR4) with the pure-Rust decoder (AVX2 PQ2_0 dot, 4 threads):
 
 | phase | rate |
 | --- | --- |
 | model load (header + tensor index) | ~1 s |
-| prefill | ~32 s/token (no parallel matvec yet) |
-| decode | ~23-34 s/token (LM head included) |
+| prefill | ~2.0-2.5 s/token |
+| decode | ~1.9-2.5 s/token (LM head included; AVX2 PQ2_0 dot) |
 
 The model is a reasoning model. The prompt is seeded with `<think>`, the model
 streams its reasoning, closes `</think>`, then gives the final answer and stops
 at `<|im_end|>`. A short factual prompt needs ~150-200 generated tokens, so
-budget ~1-2 hours per full answer on CPU-only hardware (or use the golden
+budget ~5-8 minutes per full answer on CPU-only hardware (or use the golden
 logits + short prompts for validation).
 
 ## Sample run
