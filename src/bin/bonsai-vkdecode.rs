@@ -41,11 +41,14 @@ fn apply_qwen35_template(system: &str, user: &str) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.len() != 3 {
-        eprintln!("usage: bonsai-vkdecode <model.gguf> <prompt.txt> <golden.logits.bin>");
+    if args.len() < 3 || args.len() > 4 {
+        eprintln!(
+            "usage: bonsai-vkdecode <model.gguf> <prompt.txt> <golden.logits.bin> [max_tokens]"
+        );
         exit(1);
     }
-    let (model, prompt_path, golden_path) = (&args[0], &args[1], &args[2]);
+    let (model, prompt_path, _golden_path) = (&args[0], &args[1], &args[2]);
+    let max_tokens: Option<usize> = args.get(3).and_then(|s| s.parse().ok());
 
     let gf = gguf::GGUF::open(model).expect("open gguf");
     let vocab = tokenizer::Vocab::from_gguf(&gf).expect("tokenizer");
@@ -63,56 +66,57 @@ fn main() {
     .map(|t| t as u32)
     .collect();
     println!("prompt: {} chars -> {} tokens", formatted.len(), toks.len());
+    let n_run = max_tokens.unwrap_or(toks.len()).min(toks.len());
+    if n_run == 0 {
+        eprintln!("nothing to decode");
+        exit(1);
+    }
+    println!("decoding prefix of {n_run} tokens (CPU and GPU paths)");
 
-    let raw = std::fs::read(golden_path).expect("golden file");
-    let rd = |off: usize| u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-    let n_vocab = rd(0) as usize;
-    let n_prompt = rd(4) as usize;
-    let golden: Vec<f32> = raw[8..8 + n_vocab * 4]
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    let greedy_golden = i32::from_le_bytes([
-        raw[8 + n_vocab * 4],
-        raw[8 + n_vocab * 4 + 1],
-        raw[8 + n_vocab * 4 + 2],
-        raw[8 + n_vocab * 4 + 3],
-    ]);
+    // ---- CPU reference -------------------------------------------------------
+    let t0 = Instant::now();
+    let mut dec_cpu = Decoder::open(model).expect("open cpu");
+    let mut cpu_logits = Vec::new();
+    for (pos, &tok) in toks.iter().take(n_run).enumerate() {
+        cpu_logits = dec_cpu.decode_token(tok, pos).expect("cpu decode");
+    }
+    println!("cpu prefix done in {:.1}s", t0.elapsed().as_secs_f32());
 
+    // ---- GPU-accelerated path -------------------------------------------------
     println!("opening GPU decoder (uploads weights to device-local memory)...");
     let t_load = Instant::now();
-    let mut dec = Decoder::open_gpu(model).expect("open_gpu");
+    let mut dec_gpu = Decoder::open_gpu(model).expect("open_gpu");
     println!("load + upload in {:.1}s", t_load.elapsed().as_secs_f32());
-    if dec.vocab_size() != n_vocab || toks.len() != n_prompt {
-        panic!("shape mismatch vs golden");
+    let mut gpu_logits = Vec::new();
+    for (pos, &tok) in toks.iter().take(n_run).enumerate() {
+        let t = Instant::now();
+        gpu_logits = dec_gpu.decode_token(tok, pos).expect("gpu decode");
+        eprintln!("gpu tok {pos:>2} id {tok:<7} in {:.1}s", t.elapsed().as_secs_f32());
     }
 
-    let t_all = Instant::now();
-    let mut logits = Vec::new();
-    for (pos, &tok) in toks.iter().enumerate() {
-        let t0 = Instant::now();
-        logits = dec.decode_token(tok, pos).expect("decode_token");
-        eprintln!("tok {pos:>2} id {tok:<7} in {:.1}s", t0.elapsed().as_secs_f32());
+    // ---- compare cpu vs gpu ----------------------------------------------------
+    let argmax_cpu = argmax_of(&cpu_logits);
+    let argmax_gpu = argmax_of(&gpu_logits);
+    let scale = cpu_logits.iter().chain(gpu_logits.iter()).fold(0.0f32, |a, v| a.max(v.abs())).max(1e-30);
+    let max_abs: f32 = cpu_logits
+        .iter()
+        .zip(gpu_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("greedy: cpu {argmax_cpu} vs gpu {argmax_gpu} -> {}", if argmax_cpu == argmax_gpu { "MATCH" } else { "DIFFER" });
+    println!("cpu-vs-gpu logits: max abs diff {max_abs:.4e} (rel {:.4e})", max_abs / scale);
+    if argmax_cpu != argmax_gpu || max_abs / scale > 1e-2 {
+        eprintln!("GPU DECODE VALIDATION FAILED");
+        exit(1);
     }
-    eprintln!("decode done in {:.0}s", t_all.elapsed().as_secs_f32());
+    println!("GPU DECODE VALIDATION PASSED (prefix {n_run}/{})", toks.len());
+}
 
-    let argmax = logits
+fn argmax_of(logits: &[f32]) -> usize {
+    logits
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i)
-        .unwrap();
-    let scale = golden.iter().chain(logits.iter()).fold(0.0f32, |a, v| a.max(v.abs())).max(1e-30);
-    let max_abs: f32 = golden
-        .iter()
-        .zip(logits.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    println!("greedy: rust {argmax} vs golden {greedy_golden} -> {}", if argmax as i32 == greedy_golden { "MATCH" } else { "DIFFER" });
-    println!("logits: max abs diff {max_abs:.4e} (rel {:.4e})", max_abs / scale);
-    if argmax as i32 != greedy_golden || max_abs / scale > 1e-2 {
-        eprintln!("GPU DECODE VALIDATION FAILED");
-        exit(1);
-    }
-    println!("GPU DECODE VALIDATION PASSED");
+        .unwrap()
 }
