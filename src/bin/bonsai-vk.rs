@@ -7,6 +7,8 @@
 
 #[path = "../gguf.rs"]
 mod gguf;
+#[path = "../gdn.rs"]
+mod gdn;
 #[path = "../kernels.rs"]
 mod kernels;
 #[path = "../rope.rs"]
@@ -261,6 +263,50 @@ fn check_rope(gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_gdn(gpu: &mut vk::Gpu) -> Result<(), String> {
+    use vk::{GDN_DI, GDN_DK, GDN_HV, GDN_INS_LEN, GDN_STATE_LEN};
+    let s = 128usize;
+    let small = |seed: u64, n: usize| -> Vec<f32> {
+        rand_floats(seed, n).iter().map(|v| v * 0.05).collect()
+    };
+    let q = small(0xAAAA, GDN_DK);
+    let k = small(0xBBBB, GDN_DK);
+    let v = small(0xCCCC, GDN_DI);
+    // decay gates in (-3, 0) so exp(gate) stays in (0, 1)
+    let gate: Vec<f32> = rand_floats(0xDDDD, GDN_HV).iter().map(|v| v * 1.5 - 0.75).collect();
+    let beta: Vec<f32> = rand_floats(0xEEEE, GDN_HV).iter().map(|v| v.abs() * 0.5 + 0.1).collect();
+    let state = small(0xFFFF, GDN_STATE_LEN);
+
+    let mut cpu_state = state.clone();
+    let mut cpu_attn = vec![0.0f32; GDN_DI];
+    gdn::gdn_step(&q, &k, &v, &gate, &beta, &mut cpu_state, &mut cpu_attn);
+
+    let mut ins = Vec::with_capacity(GDN_INS_LEN);
+    ins.extend_from_slice(&q);
+    ins.extend_from_slice(&k);
+    ins.extend_from_slice(&v);
+    ins.extend_from_slice(&gate);
+    ins.extend_from_slice(&beta);
+    let (gpu_attn, gpu_state) = gpu.gdn_step(&ins, &state)?;
+
+    let mut attn_max = 0.0f32;
+    for i in 0..GDN_DI {
+        attn_max = attn_max.max((gpu_attn[i] - cpu_attn[i]).abs());
+    }
+    let mut state_max = 0.0f32;
+    for i in 0..GDN_STATE_LEN {
+        state_max = state_max.max((gpu_state[i] - cpu_state[i]).abs());
+    }
+    println!(
+        "gdn_step: attn max abs {attn_max:.3e}, state max abs {state_max:.3e} ({} heads x {s})",
+        GDN_HV
+    );
+    if attn_max > 1e-4 || state_max > 1e-4 {
+        return Err(format!("gdn_step mismatch (attn {attn_max:.3e}, state {state_max:.3e})"));
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -274,7 +320,8 @@ fn main() {
     let normrows_mode = args[0] == "normrows";
     let softmax_mode = args[0] == "softmax";
     let rope_mode = args[0] == "rope";
-    let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode;
+    let gdn_mode = args[0] == "gdn";
+    let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode || gdn_mode;
     let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
@@ -337,6 +384,19 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("ROPE CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if gdn_mode {
+        match check_gdn(&mut gpu) {
+            Ok(()) => {
+                println!("GDN CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("GDN CHECK FAILED: {e}");
                 std::process::exit(1);
             }
         }

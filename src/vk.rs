@@ -41,6 +41,17 @@ pub const SOFTMAX_ROW_SPV: &[u8] =
 pub const ROPE_IMROPE_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/rope_imrope.spv"));
 
+/// SPIR-V for the gated-delta-net step (`shaders/gdn_step.comp`).
+pub const GDN_STEP_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_step.spv"));
+
+/// Fixed gdn shapes for qwen35 (must match the shader constants).
+pub const GDN_DK: usize = 2048; // H_K * S
+pub const GDN_DI: usize = 6144; // H_V * S
+pub const GDN_HV: usize = 48;
+pub const GDN_INS_LEN: usize = 2 * GDN_DK + GDN_DI + 2 * GDN_HV; // q,k,v,gate,beta
+pub const GDN_STATE_LEN: usize = GDN_HV * 128 * 128;
+
 /// Shader workgroup width; must match `layout(local_size_x = ...)` in the
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
@@ -931,6 +942,53 @@ impl Gpu {
             self.destroy_host_buffer(dummy);
             self.device.destroy_descriptor_pool(pool, None);
             Ok(out)
+        }
+    }
+
+    /// One gated-delta-net recurrent step for a single layer. `ins` is the
+    /// packed blob (q, k, v, gate, beta), `state` the H_V transposed matrices;
+    /// returns (attn out, updated state). Mirrors gdn::gdn_step.
+    pub fn gdn_step(
+        &mut self,
+        ins: &[f32],
+        state: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        if ins.len() != GDN_INS_LEN {
+            return Err(format!(
+                "gdn_step: ins len {} != {GDN_INS_LEN}",
+                ins.len()
+            ));
+        }
+        if state.len() != GDN_STATE_LEN {
+            return Err(format!(
+                "gdn_step: state len {} != {GDN_STATE_LEN}",
+                state.len()
+            ));
+        }
+        self.ensure_kernel("gdn_step", GDN_STEP_SPV)?;
+        unsafe {
+            let mut inb = self.create_host_buffer(ins.len() * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut sb = self.create_host_buffer(state.len() * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(GDN_DI * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            inb.data_mut().copy_from_slice(bytemuck_slice(ins));
+            sb.data_mut().copy_from_slice(bytemuck_slice(state));
+
+            let (pool, set) = self.make_set(inb.buffer, sb.buffer, ob.buffer)?;
+            self.run_registered("gdn_step", set, &[], 128, GDN_HV as u32)?;
+
+            let attn = ob.data()[..GDN_DI * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            let state_out = sb.data()[..state.len() * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(inb);
+            self.destroy_host_buffer(sb);
+            self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok((attn, state_out))
         }
     }
 

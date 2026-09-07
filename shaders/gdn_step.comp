@@ -1,0 +1,72 @@
+#version 450
+
+// Gated delta net recurrent step for one layer (mirrors gdn::gdn_step).
+// Constants are fixed for qwen35: S=128, H_K=16, H_V=48, dk=H_K*S=2048,
+// di=H_V*S=6144.
+//
+// Bindings:
+//   0 (ins, readonly): f32 blob laid out as q[dk], k[dk], v[di], gate[H_V],
+//     beta[H_V] (offsets below).
+//   1 (state, in/out): H_V transposed SxS matrices M[j][i]=S[i][j], i.e.
+//     [h][j][i], the same layout gdn.rs uses.
+//   2 (attn, out): H_V x S output, written per v-head.
+//
+// One workgroup of 128 lanes per v-head; lane j owns row j of the state
+// matrix, so all updates are lane-local and only the shared q/k vectors need
+// a barrier. Scalar math order matches the CPU reference.
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint S = 128u;
+const uint DK = 2048u;   // H_K * S
+const uint DI = 6144u;   // H_V * S
+const uint HV = 48u;
+const uint KBASE = DK;         // k starts after q
+const uint VBASE = 2u * DK;    // v starts after q + k
+const uint GATE_BASE = VBASE + DI;
+const uint BETA_BASE = GATE_BASE + HV;
+
+layout(set = 0, binding = 0, std430) readonly buffer Ins   { float data[]; } ins;
+layout(set = 0, binding = 1, std430) buffer       State  { float data[]; } st;
+layout(set = 0, binding = 2, std430) buffer       Attn   { float data[]; } attn;
+
+shared float kv_s[S];
+shared float qv_s[S];
+
+void main() {
+    uint h = gl_WorkGroupID.x;      // v-head
+    uint j = gl_LocalInvocationID.x; // state row
+
+    uint kh = h % 16u;              // H_K heads are reused round-robin
+    kv_s[j] = ins.data[KBASE + kh * S + j];
+    qv_s[j] = ins.data[kh * S + j];
+
+    float gate = ins.data[GATE_BASE + h];
+    float beta = ins.data[BETA_BASE + h];
+    float vv   = ins.data[VBASE + h * S + j];
+
+    float scale = 1.0f / sqrt(float(S));
+
+    barrier();
+
+    float eg = exp(gate);
+    uint rowbase = (h * S + j) * S;
+    float acc = 0.0f;
+    for (uint i = 0u; i < S; ++i) {
+        float sv = st.data[rowbase + i] * eg;
+        st.data[rowbase + i] = sv;
+        acc += sv * kv_s[i];
+    }
+
+    float delta = (vv - acc) * beta;
+
+    for (uint i = 0u; i < S; ++i) {
+        st.data[rowbase + i] += kv_s[i] * delta;
+    }
+
+    float acc2 = 0.0f;
+    for (uint i = 0u; i < S; ++i) {
+        acc2 += st.data[rowbase + i] * qv_s[i];
+    }
+    attn.data[h * S + j] = acc2 * scale;
+}
