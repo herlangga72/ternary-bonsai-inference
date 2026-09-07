@@ -1,12 +1,18 @@
 #version 450
-// PQ2_0 matvec v3 partial pass: one work item per 128-weight block writes
-// acc*scale into partials[rowlocal * nblocks + block] (no atomics; portable).
+// PQ2_0 matvec partial pass (v3): one work item per 128-weight block. The
+// block's 34 bytes are fetched as <=9 global uint loads into registers, then
+// every code byte is extracted from registers (no per-byte global traffic),
+// fixing the ~4x read amplification of earlier versions.
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer W { uint data[]; } w;
 layout(set = 0, binding = 1, std430) readonly buffer X { float data[]; } x;
 layout(set = 0, binding = 2, std430) buffer P { float data[]; } partials;
 layout(push_constant) uniform PC { uint ne0; uint base_row; } pc;
-uint u8_at(uint off) { return (w.data[off >> 2] >> ((off & 3u) << 3)) & 0xffu; }
+uint u8b(uint j, uint rem, uint wd[9]) {
+    uint idx = (j + rem) >> 2;
+    uint shift = ((j + rem) & 3u) << 3;
+    return (wd[idx] >> shift) & 0xffu;
+}
 float half_to_float(uint h) {
     uint sign = (h >> 15) & 1u; uint exp = (h >> 10) & 0x1fu; uint man = h & 0x3ffu;
     uint bits;
@@ -26,19 +32,31 @@ void main() {
     uint row = rowlocal + pc.base_row;
     uint rowbytes = nblocks * 34u;
     uint blk_start = row * rowbytes + block * 34u;
-    float scale = half_to_float(u8_at(blk_start) | (u8_at(blk_start + 1u) << 8));
+
+    uint sw = blk_start >> 2;
+    uint rem = blk_start & 3u; // byte offset inside first word
+    // 34 + rem <= 36 bytes -> words sw..sw+8
+    uint wd0 = w.data[sw];     uint wd1 = w.data[sw + 1u];
+    uint wd2 = w.data[sw + 2u]; uint wd3 = w.data[sw + 3u];
+    uint wd4 = w.data[sw + 4u]; uint wd5 = w.data[sw + 5u];
+    uint wd6 = w.data[sw + 6u]; uint wd7 = w.data[sw + 7u];
+    uint wd8 = w.data[sw + 8u];
+
+    uint wd[9];
+    wd[0] = wd0; wd[1] = wd1; wd[2] = wd2; wd[3] = wd3; wd[4] = wd4;
+    wd[5] = wd5; wd[6] = wd6; wd[7] = wd7; wd[8] = wd8;
+    float scale = half_to_float(u8b(0u, rem, wd) | (u8b(1u, rem, wd) << 8));
     uint colbase = block * 128u;
-    uint nbytes = min(128u, pc.ne0 - colbase) / 4u;
     float acc = 0.0f;
-    uint off = blk_start + 2u;
-    for (uint k = 0u; k < nbytes; ++k) {
-        uint cb = u8_at(off + k);
+    for (uint k = 0u; k < 32u; ++k) {
+        uint cb = u8b(2u + k, rem, wd);
         uint c0 = cb & 3u; uint c1 = (cb >> 2) & 3u;
         uint c2 = (cb >> 4) & 3u; uint c3 = (cb >> 6) & 3u;
-        acc += x.data[colbase + 4u * k + 0u] * float(int(c0) - 1);
-        acc += x.data[colbase + 4u * k + 1u] * float(int(c1) - 1);
-        acc += x.data[colbase + 4u * k + 2u] * float(int(c2) - 1);
-        acc += x.data[colbase + 4u * k + 3u] * float(int(c3) - 1);
+        uint col = colbase + 4u * k;
+        acc += x.data[col + 0u] * float(int(c0) - 1);
+        acc += x.data[col + 1u] * float(int(c1) - 1);
+        acc += x.data[col + 2u] * float(int(c2) - 1);
+        acc += x.data[col + 3u] * float(int(c3) - 1);
     }
     partials.data[rowlocal * nblocks + block] = acc * scale;
 }
