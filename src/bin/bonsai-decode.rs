@@ -53,6 +53,7 @@ fn main() {
     };
 
     let t_all = Instant::now();
+    let mut baseline: Option<f32> = None;
     for pos in 0..n_tokens {
         let tok = next();
         let t0 = Instant::now();
@@ -63,6 +64,12 @@ fn main() {
                 exit(1);
             }
         };
+        let el = t0.elapsed().as_secs_f32();
+        if let Some(b) = baseline {
+            kernels::pause_for_budget(el, b);
+        } else {
+            baseline = Some(el);
+        }
         assert_eq!(logits.len(), n_vocab);
         let mut argmax = 0usize;
         for (i, &v) in logits.iter().enumerate() {
@@ -71,9 +78,8 @@ fn main() {
             }
         }
         println!(
-            "pos {pos:>2}: tok {tok:<8} argmax {argmax:<8} (logit {:.3})  {:.2}s",
+            "pos {pos:>2}: tok {tok:<8} argmax {argmax:<8} (logit {:.3})  {el:.2}s",
             logits[argmax],
-            t0.elapsed().as_secs_f32()
         );
     }
     println!(

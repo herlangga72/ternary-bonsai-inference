@@ -14,6 +14,47 @@
 
 use crate::gguf::{half_to_f32, TensorInfo};
 
+// ---------------------------------------------------------------------------
+// Resource restraint (BONSAI_BW_PCT)
+//
+// Long validation runs saturate the machine's memory bandwidth. Setting the
+// environment variable BONSAI_BW_PCT (1..100, default 100) throttles the
+// engine to roughly that fraction of its normal bandwidth use:
+//   - the CPU matvec fan-out is capped to ~pct% of the available cores, and
+//   - decode loops that call `pause_for_budget` sleep so the average token
+//     pace runs at pct% of the unpaced rate.
+// ---------------------------------------------------------------------------
+
+/// Fraction (0..=1) of normal resources to use, from BONSAI_BW_PCT.
+pub fn bw_fraction() -> f32 {
+    let v = std::env::var("BONSAI_BW_PCT")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(100.0);
+    (v.clamp(1.0, 100.0)) / 100.0
+}
+
+/// Cap `avail` worker threads at ~bw_fraction() of the available cores.
+/// Always keeps at least one thread.
+pub fn scaled_threads(avail: usize) -> usize {
+    ((avail as f32 * bw_fraction()).round() as usize).clamp(1, avail.max(1))
+}
+
+/// Sleep so the caller's per-token pace uses only `bw_fraction()` of the
+/// unpaced budget. `elapsed_s` is the just-finished (paced or unpaced) token;
+/// `baseline_s` is the measured unpaced token duration.
+pub fn pause_for_budget(elapsed_s: f32, baseline_s: f32) {
+    let f = bw_fraction();
+    if f >= 1.0 || baseline_s <= 0.0 {
+        return;
+    }
+    let target = baseline_s / f;
+    if elapsed_s < target {
+        let extra = (target - elapsed_s) as u64;
+        std::thread::sleep(std::time::Duration::from_millis(extra * 1000));
+    }
+}
+
 /// RMSNorm: out_i = x_i * w_i * rsqrt(mean(x^2) + eps)
 pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
@@ -241,7 +282,8 @@ pub fn pq2_matvec_range(
     // Minimum rows per matvec before spawning threads (the tiny ssm_alpha /
     // ssm_beta / norm-side projections stay inline).
     const MIN_PARALLEL_ROWS: usize = 1024;
-    let n_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_cores = scaled_threads(avail);
     if n_rows < MIN_PARALLEL_ROWS || n_cores <= 1 {
         dot_rows_into(payload, ne0, base, 0..n_rows, x, &mut y[..n_rows]);
         return Ok(());

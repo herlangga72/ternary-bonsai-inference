@@ -86,6 +86,21 @@ Wiring dspark speculation into this Rust driver is not exposed as a single
 `llama.h` call; it lives in the fork's C++ acceptance loop, so it remains a
 follow-up rather than part of the basic inference path.
 
+## Resource restraint
+
+Long decode/validation runs saturate memory bandwidth (the model streams
+~7 GB per token), which can starve the rest of the machine. Set
+`BONSAI_BW_PCT` (1-100, default 100) to cap the engine at roughly that
+fraction of its normal bandwidth use: the CPU matvec fan-out is limited to
+~pct% of the cores and decode loops pace themselves to pct% of the unpaced
+token rate (the first token always runs unpaced to calibrate).
+
+```sh
+BONSAI_BW_PCT=75 ./target/release/bonsai-decode Ternary-Bonsai-27B-PQ2_0.gguf 4
+BONSAI_BW_PCT=50 ./target/release/bonsai-vkdecode Ternary-Bonsai-27B-PQ2_0.gguf \
+  golden/prompts/qa.txt golden/qa.logits.bin 4
+```
+
 ## Build
 
 The engine is pure Rust and builds standalone (no llama.cpp needed):

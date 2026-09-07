@@ -88,10 +88,17 @@ fn main() {
     let mut dec_gpu = Decoder::open_gpu(model).expect("open_gpu");
     println!("load + upload in {:.1}s", t_load.elapsed().as_secs_f32());
     let mut gpu_logits = Vec::new();
+    let mut baseline: Option<f32> = None;
     for (pos, &tok) in toks.iter().take(n_run).enumerate() {
         let t = Instant::now();
         gpu_logits = dec_gpu.decode_token(tok, pos).expect("gpu decode");
-        eprintln!("gpu tok {pos:>2} id {tok:<7} in {:.1}s", t.elapsed().as_secs_f32());
+        let el = t.elapsed().as_secs_f32();
+        if let Some(b) = baseline {
+            kernels::pause_for_budget(el, b);
+        } else {
+            baseline = Some(el);
+        }
+        eprintln!("gpu tok {pos:>2} id {tok:<7} in {el:.1}s");
     }
 
     // ---- compare cpu vs gpu ----------------------------------------------------

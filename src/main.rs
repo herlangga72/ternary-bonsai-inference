@@ -258,6 +258,7 @@ fn main() {
     let mut stdout = std::io::stdout();
     let t0 = Instant::now();
     let mut n_gen: u64 = 0;
+    let mut baseline: Option<f32> = None;
     let mut logits = match dec.head_logits(&last_h) {
         Ok(l) => l,
         Err(e) => {
@@ -280,6 +281,7 @@ fn main() {
         }
 
         let pos = toks.len() + n_gen as usize - 1;
+        let tk = Instant::now();
         let h = match dec.forward_hidden(id, pos) {
             Ok(h) => h,
             Err(e) => {
@@ -294,6 +296,12 @@ fn main() {
                 exit(1);
             }
         };
+        let el = tk.elapsed().as_secs_f32();
+        if let Some(b) = baseline {
+            kernels::pause_for_budget(el, b);
+        } else {
+            baseline = Some(el);
+        }
     }
 
     let el = t0.elapsed();
