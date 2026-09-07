@@ -1,0 +1,28 @@
+#version 450
+// Causal conv1d (kernel 4) + SiLU over the fused qkv channels (10240), with
+// the 3-tap history cache shifted per channel. One thread per channel.
+// Binding 0 = qkv (in: raw matvec row, out: convolved+silu), 1 = cache
+// (3 previous per channel, shifted in place), 2 = conv weight (4 per ch).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) buffer QKV { float data[]; } qkv;
+layout(set = 0, binding = 1, std430) buffer CC { float data[]; } cache;
+layout(set = 0, binding = 2, std430) readonly buffer CW { float data[]; } cw;
+layout(push_constant) uniform PC { uint channels; uint pad; } pc;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.channels) { return; }
+    uint b = c * 3u;
+    float x0 = cache.data[b + 0u];
+    float x1 = cache.data[b + 1u];
+    float x2 = cache.data[b + 2u];
+    float x3 = qkv.data[c];
+    float w0 = cw.data[c * 4u + 0u];
+    float w1 = cw.data[c * 4u + 1u];
+    float w2 = cw.data[c * 4u + 2u];
+    float w3 = cw.data[c * 4u + 3u];
+    float acc = x0 * w0 + x1 * w1 + x2 * w2 + x3 * w3;
+    cache.data[b + 0u] = x1;
+    cache.data[b + 1u] = x2;
+    cache.data[b + 2u] = x3;
+    qkv.data[c] = acc / (1.0f + exp(-acc)); // silu
+}

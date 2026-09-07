@@ -1,0 +1,32 @@
+#version 450
+// Prepare the gdn_step input blob from device buffers and compute the per-head
+// gates: ins = [q(dk), k(dk), v(di), beta(hv), gate(hv)].
+// q/k are l2-normalized rows; beta = sigmoid(beta_raw); alpha = softplus(
+// alpha_raw + dt_bias); gate = alpha * ssm_a.
+// Binding 0 = qkv conv out, 1 = smalls (beta_raw[hv], alpha_raw[hv], then a,
+// dt_bias), 2 = blob out. Constants fixed (see gdn_step.comp).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer QKV { float data[]; } qkv;
+layout(set = 0, binding = 1, std430) readonly buffer SM { float data[]; } sm;
+layout(set = 0, binding = 2, std430) buffer BL { float data[]; } blob;
+layout(push_constant) uniform PC { uint zero; uint pad; } pc;
+const uint DK = 2048u; const uint DI = 6144u; const uint HV = 48u;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    // copy q, k, v from qkv (2048 + 2048 + 6144)
+    if (i < 2u * DK + DI) {
+        blob.data[i] = qkv.data[i];
+    }
+    if (i < HV) {
+        float beta_raw = sm.data[i];
+        float alpha_raw = sm.data[HV + i];
+        float ssa = sm.data[2u * HV + i];
+        float dtb = sm.data[3u * HV + i];
+        float beta = 1.0f / (1.0f + exp(-beta_raw));
+        float x = alpha_raw + dtb;
+        float alpha = x > 20.0f ? x : log(1.0f + exp(x));
+        // gdn_step blob layout: gate then beta
+        blob.data[2u * DK + DI + i] = alpha * ssa;
+        blob.data[2u * DK + DI + HV + i] = beta;
+    }
+}
