@@ -98,6 +98,7 @@ pub struct Gpu {
     /// set layout + 8-byte push range, so any shader that fits can register).
     kernels: std::collections::HashMap<String, vk::Pipeline>,
     staging: Option<RawBuf>,
+    mv: Option<MvCache>,
     pub name: String,
     pub discrete: bool,
 }
@@ -108,6 +109,22 @@ pub struct DevBuf {
     pub buffer: vk::Buffer,
     pub memory: vk::DeviceMemory,
     pub len: usize,
+}
+
+/// Reusable per-matvec resources (G3): one x/y host pair, one descriptor set
+/// (re-pointed at the current weight buffer with vkUpdateDescriptorSets), one
+/// command buffer and one fence. Eliminates the per-call allocation + driver
+/// object churn that made single-shot matvecs ~100x slower than the kernel.
+struct MvCache {
+    xb: RawBuf,
+    yb: RawBuf,
+    wdummy: DevBuf,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
+    max_ne0: usize,
+    max_rows: usize,
 }
 
 fn err<T, E: std::fmt::Display>(r: Result<T, E>, what: &str) -> Result<T, String> {
@@ -197,7 +214,10 @@ impl Gpu {
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .queue_family_index(qfi)
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            .flags(
+                vk::CommandPoolCreateFlags::TRANSIENT
+                    | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+            );
         let command_pool = err(
             unsafe { device.create_command_pool(&pool_info, None) },
             "create_command_pool",
@@ -282,9 +302,69 @@ impl Gpu {
             desc_layout,
             kernels: std::collections::HashMap::new(),
             staging: None,
+            mv: None,
             name,
             discrete,
         })
+    }
+
+    /// Pre-allocate the reusable matvec cache. `max_ne0`/`max_rows` must cover
+    /// every matvec that will run through `matvec_on` (x and y are re-used and
+    /// never resized).
+    pub fn prep_matvec_cache(&mut self, max_ne0: usize, max_rows: usize) -> Result<(), String> {
+        if self.mv.is_some() {
+            return Ok(());
+        }
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
+        unsafe {
+            let xb = self.create_host_buffer(max_ne0.max(1) * 4, usage)?;
+            let yb = self.create_host_buffer(max_rows.max(1) * 4, usage)?;
+            let wdummy = self.create_dev_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+
+            let sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(3)];
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&sizes);
+            let pool = err(
+                self.device.create_descriptor_pool(&pool_info, None),
+                "prep_matvec_cache: pool",
+            )?;
+            let layouts = [self.desc_layout];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            let set = self
+                .device
+                .allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| format!("prep_matvec_cache: set: {e}"))?[0];
+
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cb = self
+                .device
+                .allocate_command_buffers(&cb_info)
+                .map_err(|e| format!("prep_matvec_cache: cb: {e}"))?[0];
+            let fence = err(
+                self.device.create_fence(&vk::FenceCreateInfo::default(), None),
+                "prep_matvec_cache: fence",
+            )?;
+            self.mv = Some(MvCache {
+                xb,
+                yb,
+                wdummy,
+                pool,
+                set,
+                cb,
+                fence,
+                max_ne0,
+                max_rows,
+            });
+        }
+        Ok(())
     }
 
     /// Index of a memory type that satisfies `required` flags (host-visible +
@@ -1099,7 +1179,12 @@ impl Gpu {
     }
 
     /// PQ2_0 matvec against an already-uploaded device buffer `w`
-    /// (rows `base_row + gid`). Host x in, host y out, one submit per call.
+    /// (rows `base_row + gid`). Host x in, host y out.
+    ///
+    /// When the persistent cache is prepared (`prep_matvec_cache`), the call
+    /// reuses its x/y buffers, descriptor set, command buffer and fence, so
+    /// only a memcpy + descriptor update + submit are per-call; otherwise it
+    /// falls back to allocating per call (slow, for ad-hoc use).
     pub fn matvec_on(
         &mut self,
         w: &DevBuf,
@@ -1109,11 +1194,128 @@ impl Gpu {
         x: &[f32],
     ) -> Result<Vec<f32>, String> {
         if x.len() != ne0 {
-            return Err(format!(
-                "matvec_on: x length {} != ne0 {ne0}",
-                x.len()
-            ));
+            return Err(format!("matvec_on: x length {} != ne0 {ne0}", x.len()));
         }
+        if let Some(c) = self.mv.as_mut() {
+            if ne0 <= c.max_ne0 && n_rows <= c.max_rows {
+                let device = &self.device;
+                let queue = self.queue;
+                let pipeline = self.pipeline;
+                let layout = self.pipeline_layout;
+                return Self::matvec_cached_impl(device, queue, pipeline, layout, w, ne0, base_row, n_rows, x, c);
+            }
+        }
+        self.matvec_oneshot(w, ne0, base_row, n_rows, x)
+    }
+
+    /// Cached path: reuse x/y/desc/cmd/fence, re-point descriptors at `w`.
+    fn matvec_cached_impl(
+        device: &Device,
+        queue: vk::Queue,
+        pipeline: vk::Pipeline,
+        layout: vk::PipelineLayout,
+        w: &DevBuf,
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        x: &[f32],
+        c: &mut MvCache,
+    ) -> Result<Vec<f32>, String> {
+        unsafe {
+            c.xb.data_mut()[..ne0 * 4].copy_from_slice(bytemuck_slice(x));
+            let infos = [
+                vk::DescriptorBufferInfo::default().buffer(w.buffer).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default()
+                    .buffer(c.xb.buffer)
+                    .range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default()
+                    .buffer(c.yb.buffer)
+                    .range(vk::WHOLE_SIZE),
+            ];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(c.set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[0..1]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(c.set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[1..2]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(c.set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[2..3]),
+            ];
+            device.update_descriptor_sets(&writes, &[]);
+
+            device
+                .reset_command_buffer(c.cb, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("matvec cached: reset cb: {e}"))?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            device
+                .begin_command_buffer(c.cb, &begin)
+                .map_err(|e| format!("matvec cached: begin: {e}"))?;
+            device
+                .cmd_bind_pipeline(c.cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_bind_descriptor_sets(
+                c.cb,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[c.set],
+                &[],
+            );
+            let pc = [ne0 as u32, base_row];
+            let pc_bytes = std::slice::from_raw_parts(
+                pc.as_ptr() as *const u8,
+                std::mem::size_of_val(&pc),
+            );
+            device.cmd_push_constants(
+                c.cb,
+                layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pc_bytes,
+            );
+            let groups = (n_rows as u32).div_ceil(LOCAL_X).max(1);
+            device.cmd_dispatch(c.cb, groups, 1, 1);
+            device
+                .end_command_buffer(c.cb)
+                .map_err(|e| format!("matvec cached: end: {e}"))?;
+
+            device
+                .reset_fences(&[c.fence])
+                .map_err(|e| format!("matvec cached: reset fence: {e}"))?;
+            let cbs = [c.cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            device
+                .queue_submit(queue, &[submit], c.fence)
+                .map_err(|e| format!("matvec cached: submit: {e}"))?;
+            device
+                .wait_for_fences(&[c.fence], true, u64::MAX)
+                .map_err(|e| format!("matvec cached: wait: {e}"))?;
+
+            Ok(c.yb.data()[..n_rows * 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect())
+        }
+    }
+
+    /// Fallback single-shot path (allocs per call; only used when the cache is
+    /// not prepared or the shapes outgrow it).
+    fn matvec_oneshot(
+        &mut self,
+        w: &DevBuf,
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        x: &[f32],
+    ) -> Result<Vec<f32>, String> {
         unsafe {
             let mut xb = self.create_host_buffer(ne0 * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
             let yb = self.create_host_buffer(n_rows * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
@@ -1319,6 +1521,19 @@ impl Drop for Gpu {
                 self.device.unmap_memory(s.memory);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
+            }
+            if let Some(c) = self.mv.take() {
+                self.device.destroy_fence(c.fence, None);
+                self.device.free_command_buffers(self.command_pool, &[c.cb]);
+                self.device.destroy_descriptor_pool(c.pool, None);
+                self.device.destroy_buffer(c.wdummy.buffer, None);
+                self.device.free_memory(c.wdummy.memory, None);
+                self.device.unmap_memory(c.xb.memory);
+                self.device.destroy_buffer(c.xb.buffer, None);
+                self.device.free_memory(c.xb.memory, None);
+                self.device.unmap_memory(c.yb.memory);
+                self.device.destroy_buffer(c.yb.buffer, None);
+                self.device.free_memory(c.yb.memory, None);
             }
             self.device.destroy_pipeline(self.pipeline, None);
             for (_, p) in self.kernels.drain() {

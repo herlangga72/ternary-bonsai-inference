@@ -241,6 +241,8 @@ impl Weights {
         // clone the index so the gguf borrow ends before we need &mut gpu
         let tensors = self.gguf.tensors.clone();
         let mut gpu = gpu;
+        let mut max_ne0 = 0usize;
+        let mut max_rows = 0usize;
         for t in &tensors {
             if t.ty != TYPE_PQ2_0 {
                 continue;
@@ -249,8 +251,13 @@ impl Weights {
             let buf = gpu.create_weight_buffer(len)?;
             let payload = self.gguf.payload_slice(t)?;
             gpu.upload(&buf, payload)?;
+            let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+            let rows = t.n_elem() as usize / ne0.max(1);
+            max_ne0 = max_ne0.max(ne0);
+            max_rows = max_rows.max(rows);
             dev.insert(t.name.clone(), buf);
         }
+        gpu.prep_matvec_cache(max_ne0, max_rows)?;
         eprintln!(
             "[gpu] uploaded {} PQ2_0 tensors to device-local memory",
             dev.len()
