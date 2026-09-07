@@ -1,0 +1,35 @@
+#version 450
+
+// Weighted-v output for one token: out[h][d] = sum_p prob[h][p] * v[p][kv][d].
+// One workgroup per q-head, 256 lanes (lane = dim d; hd must be 256).
+// Binding 0 = probabilities (scores after softmax, nheads*n_pos),
+// 1 = v cache for this layer ([pos][kv_head][hd]), 2 = out (nheads*hd).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer P { float data[]; } prob;
+layout(set = 0, binding = 1, std430) readonly buffer V { float data[]; } vc;
+layout(set = 0, binding = 2, std430) buffer Out { float data[]; } o;
+
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint kv_stride;
+    uint scale_bits;
+    uint pad;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint kvheads = pc.kv_stride / pc.hd;
+    uint kv = h / (pc.nheads / kvheads);
+    uint pbase = h * pc.n_pos;
+
+    float acc = 0.0f;
+    for (uint p = 0u; p < pc.n_pos; ++p) {
+        acc = fma(prob.data[pbase + p], vc.data[p * pc.kv_stride + kv * pc.hd + d], acc);
+    }
+    o.data[h * pc.hd + d] = acc;
+}

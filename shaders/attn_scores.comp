@@ -1,0 +1,46 @@
+#version 450
+
+// Attention scores for one token over its KV cache (one q-head per workgroup,
+// GQA grouping). Binding 0 = q heads (nheads*hd), 1 = k cache for this layer
+// (n_pos * kv_stride floats, [pos][kv_head][hd]), 2 = scores out
+// (nheads * n_pos). Push (shared by the attention trio):
+//   { nheads, n_pos, hd, kv_stride, scale_bits, pad }
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Q { float data[]; } q;
+layout(set = 0, binding = 1, std430) readonly buffer K { float data[]; } kc;
+layout(set = 0, binding = 2, std430) buffer Scores { float data[]; } scores;
+
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint kv_stride;
+    uint scale_bits;
+    uint pad;
+} pc;
+
+shared float qh[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (lid < pc.hd) {
+        qh[lid] = q.data[h * pc.hd + lid];
+    }
+    barrier();
+
+    uint kvheads = pc.kv_stride / pc.hd;
+    uint kv = h / (pc.nheads / kvheads); // GQA group
+    float scale = uintBitsToFloat(pc.scale_bits);
+
+    for (uint p = lid; p < pc.n_pos; p += 256u) {
+        uint kbase = p * pc.kv_stride + kv * pc.hd;
+        float acc = 0.0f;
+        for (uint i = 0u; i < pc.hd; ++i) {
+            acc = fma(qh[i], kc.data[kbase + i], acc);
+        }
+        scores.data[h * pc.n_pos + p] = acc * scale;
+    }
+}

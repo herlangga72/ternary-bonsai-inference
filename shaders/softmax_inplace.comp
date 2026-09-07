@@ -1,0 +1,55 @@
+#version 450
+
+// In-place masked softmax over nheads rows of length n_pos (one workgroup per
+// row). Reuses the softmax_row reduction but writes back into binding 0 and
+// derives the row base from gl_WorkGroupID.x. Same push layout as the other
+// attention kernels.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer X { float data[]; } x;
+
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint kv_stride;
+    uint scale_bits;
+    uint pad;
+} pc;
+
+shared float red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint base = row * pc.n_pos;
+    uint n = pc.n_pos;
+
+    float m = -3.402823466e+38f;
+    for (uint i = lid; i < n; i += 256u) {
+        m = max(m, x.data[base + i]);
+    }
+    red[lid] = m;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) { red[lid] = max(red[lid], red[lid + s]); }
+        barrier();
+    }
+    float mx = red[0];
+
+    float sum = 0.0f;
+    for (uint i = lid; i < n; i += 256u) {
+        sum += exp(x.data[base + i] - mx);
+    }
+    red[lid] = sum;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) { red[lid] += red[lid + s]; }
+        barrier();
+    }
+    float inv = 1.0f / red[0];
+    for (uint i = lid; i < n; i += 256u) {
+        x.data[base + i] = exp(x.data[base + i] - mx) * inv;
+    }
+}

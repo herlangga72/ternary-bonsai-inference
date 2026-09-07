@@ -307,6 +307,65 @@ fn check_gdn(gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_attn(gpu: &mut vk::Gpu) -> Result<(), String> {
+    let nheads = 24usize;
+    let kvheads = 4usize;
+    let hd = 256usize;
+    let n_pos = 37usize; // odd on purpose: exercises the +256 loop tail
+    let kv_stride = kvheads * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    let q: Vec<f32> = rand_floats(0x1010, nheads * hd);
+    let kcache: Vec<f32> = rand_floats(0x2020, n_pos * kv_stride);
+    let vcache: Vec<f32> = rand_floats(0x3030, n_pos * kv_stride);
+
+    // CPU reference (mirrors forward.rs step 4)
+    let mut expect = vec![0.0f32; nheads * hd];
+    for h in 0..nheads {
+        let kv = h / (nheads / kvheads);
+        let qh = &q[h * hd..(h + 1) * hd];
+        let mut scores = Vec::with_capacity(n_pos);
+        for p in 0..n_pos {
+            let kp = &kcache[p * kv_stride + kv * hd..p * kv_stride + (kv + 1) * hd];
+            let mut s = 0.0f32;
+            for i in 0..hd {
+                s += qh[i] * kp[i];
+            }
+            scores.push(s * scale);
+        }
+        let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = scores.iter().map(|s| (*s - mx).exp()).sum();
+        for d in 0..hd {
+            let mut acc = 0.0f32;
+            for p in 0..n_pos {
+                let pr = ((scores[p] - mx).exp()) / sum;
+                acc += pr * vcache[p * kv_stride + kv * hd + d];
+            }
+            expect[h * hd + d] = acc;
+        }
+    }
+
+    let got = gpu.attn_step(&q, &kcache, &vcache, n_pos, nheads, kvheads, hd)?;
+    let mut max_abs = 0.0f32;
+    let mut bad = 0usize;
+    for i in 0..expect.len() {
+        let d = (got[i] - expect[i]).abs();
+        if d > 1e-4 {
+            bad += 1;
+        }
+        max_abs = max_abs.max(d);
+    }
+    println!(
+        "attn_step ({} heads x {hd}, {kvheads} kv, {n_pos} pos): max abs {max_abs:.3e}, mismatched {bad}/{}",
+        nheads,
+        expect.len()
+    );
+    if bad != 0 {
+        return Err("attn_step mismatch".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -321,7 +380,8 @@ fn main() {
     let softmax_mode = args[0] == "softmax";
     let rope_mode = args[0] == "rope";
     let gdn_mode = args[0] == "gdn";
-    let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode || gdn_mode;
+    let attn_mode = args[0] == "attn";
+    let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode || gdn_mode || attn_mode;
     let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
@@ -397,6 +457,19 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("GDN CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if attn_mode {
+        match check_attn(&mut gpu) {
+            Ok(()) => {
+                println!("ATTN CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("ATTN CHECK FAILED: {e}");
                 std::process::exit(1);
             }
         }

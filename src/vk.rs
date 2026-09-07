@@ -45,6 +45,15 @@ pub const ROPE_IMROPE_SPV: &[u8] =
 pub const GDN_STEP_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/gdn_step.spv"));
 
+/// SPIR-V for the attention trio (`shaders/attn_scores.comp`,
+/// `softmax_inplace.comp`, `attn_out.comp`).
+pub const ATTN_SCORES_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_scores.spv"));
+pub const SOFTMAX_INPLACE_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_inplace.spv"));
+pub const ATTN_OUT_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_out.spv"));
+
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
 pub const GDN_DK: usize = 2048; // H_K * S
 pub const GDN_DI: usize = 6144; // H_V * S
@@ -989,6 +998,94 @@ impl Gpu {
             self.destroy_host_buffer(ob);
             self.device.destroy_descriptor_pool(pool, None);
             Ok((attn, state_out))
+        }
+    }
+
+    /// Full-attention inner product for one token over its per-layer KV
+    /// cache: scores -> masked softmax -> weighted-v (GQA). `q` is the token's
+    /// `nheads*hd` per-head vectors; `kcache`/`vcache` hold `n_pos` cached
+    /// tokens as [pos][kv_head][hd]. Returns the `nheads*hd` attention output
+    /// before the gate and output projection (mirrors forward.rs step 4).
+    pub fn attn_step(
+        &mut self,
+        q: &[f32],
+        kcache: &[f32],
+        vcache: &[f32],
+        n_pos: usize,
+        nheads: usize,
+        kvheads: usize,
+        hd: usize,
+    ) -> Result<Vec<f32>, String> {
+        let kv_stride = kvheads * hd;
+        if q.len() != nheads * hd
+            || kcache.len() != n_pos * kv_stride
+            || vcache.len() != n_pos * kv_stride
+            || hd > 256
+        {
+            return Err(format!(
+                "attn_step: q {} ({}x{}), k/v {} ({} pos x {kv_stride})",
+                q.len(),
+                nheads,
+                hd,
+                kcache.len(),
+                n_pos
+            ));
+        }
+        self.ensure_kernel("attn_scores", ATTN_SCORES_SPV)?;
+        self.ensure_kernel("softmax_inplace", SOFTMAX_INPLACE_SPV)?;
+        self.ensure_kernel("attn_out", ATTN_OUT_SPV)?;
+
+        let score_len = nheads * n_pos;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let pc = [
+            nheads as u32,
+            n_pos as u32,
+            hd as u32,
+            kv_stride as u32,
+            scale.to_bits(),
+            0,
+        ];
+        let pc_bytes =
+            unsafe { std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc)) };
+
+        unsafe {
+            let mut qb = self.create_host_buffer(q.len() * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut kb = self.create_host_buffer(kcache.len() * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut vb = self.create_host_buffer(vcache.len() * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut sb = self.create_host_buffer(score_len.max(1) * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(nheads * hd * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut dummy = self.create_host_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            qb.data_mut().copy_from_slice(bytemuck_slice(q));
+            kb.data_mut().copy_from_slice(bytemuck_slice(kcache));
+            vb.data_mut().copy_from_slice(bytemuck_slice(vcache));
+            dummy.data_mut().fill(0);
+
+            // 1) scores per (head, pos)
+            let (p1, set1) = self.make_set(qb.buffer, kb.buffer, sb.buffer)?;
+            self.run_registered("attn_scores", set1, pc_bytes, 256, nheads as u32)?;
+            self.device.destroy_descriptor_pool(p1, None);
+
+            // 2) softmax each head's score row in place
+            let (p2, set2) = self.make_set(sb.buffer, dummy.buffer, dummy.buffer)?;
+            self.run_registered("softmax_inplace", set2, pc_bytes, 256, nheads as u32)?;
+            self.device.destroy_descriptor_pool(p2, None);
+
+            // 3) weighted-v into out
+            let (p3, set3) = self.make_set(sb.buffer, vb.buffer, ob.buffer)?;
+            self.run_registered("attn_out", set3, pc_bytes, 256, nheads as u32)?;
+            self.device.destroy_descriptor_pool(p3, None);
+
+            let out = ob.data()[..nheads * hd * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(qb);
+            self.destroy_host_buffer(kb);
+            self.destroy_host_buffer(vb);
+            self.destroy_host_buffer(sb);
+            self.destroy_host_buffer(ob);
+            self.destroy_host_buffer(dummy);
+            Ok(out)
         }
     }
 
