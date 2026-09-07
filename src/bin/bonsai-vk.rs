@@ -132,25 +132,69 @@ fn check_rmsnorm(g: &mut GGUF, gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_elem(gpu: &mut vk::Gpu) -> Result<(), String> {
+    let n = 17408usize; // n_ff shape, exercises multi-workgroup dispatch
+    let a: Vec<f32> = rand_floats(0x1111, n).iter().map(|v| v * 4.0).collect(); // [-4,4]
+    let b: Vec<f32> = rand_floats(0x2222, n).iter().map(|v| v * 2.0).collect();
+    let mut worst_abs = 0.0f32;
+    let mut worst_rel = 0.0f32;
+    for mode in 0u32..=4u32 {
+        let expected: Vec<f32> = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| match mode {
+                0 => kernels::silu(x),
+                1 => kernels::sigmoid(x),
+                2 => kernels::softplus(x),
+                3 => kernels::silu(x) * y,
+                _ => kernels::sigmoid(x) * y,
+            })
+            .collect();
+        let got = gpu.elem(&a, Some(&b), mode)?;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for i in 0..n {
+            let d = (got[i] - expected[i]).abs();
+            max_abs = max_abs.max(d);
+            max_rel = max_rel.max(d / expected[i].abs().max(1e-30));
+        }
+        worst_abs = worst_abs.max(max_abs);
+        worst_rel = worst_rel.max(max_rel);
+        println!(
+            "elem mode {mode}: n {n}, max abs {max_abs:.3e}, max rel {max_rel:.3e}"
+        );
+    }
+    if worst_abs > 1e-5 {
+        return Err(format!("elem mismatch: worst abs {worst_abs:.3e}"));
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: bonsai-vk <model.gguf> [tensor_name]  |  bonsai-vk rmsnorm <model.gguf>");
+        eprintln!(
+            "usage: bonsai-vk <model.gguf> [tensor_name]\n   or: bonsai-vk rmsnorm <model.gguf>\n   or: bonsai-vk elem"
+        );
         std::process::exit(1);
     }
     let rms_mode = args[0] == "rmsnorm";
+    let elem_mode = args[0] == "elem";
     let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
         std::process::exit(1);
     }
-    let mut g = match GGUF::open(&model) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let mut g: Option<GGUF> = None;
+    if !elem_mode {
+        g = Some(match GGUF::open(&model) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        });
+    }
     let mut gpu = match vk::Gpu::open() {
         Ok(g) => g,
         Err(e) => {
@@ -164,8 +208,22 @@ fn main() {
         if gpu.discrete { "discrete" } else { "integrated" }
     );
 
+    if elem_mode {
+        match check_elem(&mut gpu) {
+            Ok(()) => {
+                println!("ELEM CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("ELEM CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if rms_mode {
-        match check_rmsnorm(&mut g, &mut gpu) {
+        let g = g.as_mut().unwrap();
+        match check_rmsnorm(g, &mut gpu) {
             Ok(()) => {
                 println!("RMSNORM CHECK PASSED");
                 return;
@@ -183,9 +241,10 @@ fn main() {
         DEFAULT_TENSORS.to_vec()
     };
 
+    let g = g.as_ref().unwrap();
     let mut failed = false;
     for name in names {
-        if let Err(e) = check_tensor(&g, &mut gpu, name) {
+        if let Err(e) = check_tensor(g, &mut gpu, name) {
             eprintln!("{name}: {e}");
             failed = true;
         }

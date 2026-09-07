@@ -25,6 +25,10 @@ pub const PQ2_MATVEC_SPV: &[u8] =
 pub const RMS_NORM_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
 
+/// SPIR-V for the fused elementwise shader (`shaders/elem.comp`).
+pub const ELEM_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/elem.spv"));
+
 /// Shader workgroup width; must match `layout(local_size_x = ...)` in the
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
@@ -728,6 +732,49 @@ impl Gpu {
                 .collect::<Vec<f32>>();
             self.destroy_host_buffer(xb);
             self.destroy_host_buffer(wb);
+            self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok(out)
+        }
+    }
+
+    /// Fused elementwise op over `a` (and optional `b`), modes as documented
+    /// in shaders/elem.comp. Mirrors kernels.rs activation helpers.
+    pub fn elem(&mut self, a: &[f32], b: Option<&[f32]>, mode: u32) -> Result<Vec<f32>, String> {
+        let n = a.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if let Some(bb) = b {
+            if bb.len() != n {
+                return Err(format!("elem: a len {n}, b len {}", bb.len()));
+            }
+        }
+        self.ensure_kernel("elem", ELEM_SPV)?;
+        unsafe {
+            let mut ab = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut bb = self.create_host_buffer(n.max(1) * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            ab.data_mut().copy_from_slice(bytemuck_slice(a));
+            if let Some(bbval) = b {
+                bb.data_mut().copy_from_slice(bytemuck_slice(bbval));
+            } else {
+                bb.data_mut().fill(0);
+            }
+
+            let (pool, set) = self.make_set(ab.buffer, bb.buffer, ob.buffer)?;
+            let pc = [n as u32, mode];
+            let pc_bytes =
+                std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc));
+            let groups = (n as u32).div_ceil(256).max(1);
+            self.run_registered("elem", set, pc_bytes, 256, groups)?;
+
+            let out = ob.data()[..n * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(ab);
+            self.destroy_host_buffer(bb);
             self.destroy_host_buffer(ob);
             self.device.destroy_descriptor_pool(pool, None);
             Ok(out)
