@@ -369,6 +369,56 @@ fn check_attn(gpu: &mut vk::Gpu) -> Result<(), String> {
     Ok(())
 }
 
+fn check_rec(g: &GGUF, gpu: &mut vk::Gpu, name: &str) -> Result<(), String> {
+    let info = g
+        .tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or("tensor not found")?
+        .clone();
+    let ne0 = info.dims[0] as usize;
+    let rows = kernels::n_rows(&info) as usize;
+    let payload = g.payload_slice(&info)?;
+    let x = rand_floats(0x1357, ne0);
+
+
+    let w = gpu.create_weight_buffer(payload.len())?;
+    gpu.upload(&w, payload)?;
+    let xd = gpu.create_weight_buffer(ne0 * 4)?;
+    gpu.upload(&xd, unsafe {
+        std::slice::from_raw_parts(x.as_ptr() as *const u8, ne0 * 4)
+    })?;
+    let yd = gpu.create_weight_buffer(rows * 4)?;
+    let nblocks = ne0.div_ceil(128);
+    let partials = gpu.create_weight_buffer(rows * nblocks * 4)?;
+
+    gpu.rec_begin()?;
+    gpu.rec_matvec(&w, &xd, &yd, 0, &partials, ne0 as u32, 0, rows as u32)?;
+    gpu.rec_end_submit()?;
+
+    let bytes = gpu.read_dev(&yd, rows * 4)?;
+    let ygpu: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut ycpu = vec![0.0f32; rows];
+    kernels::pq2_matvec_range(payload, ne0, 0, rows, &x, &mut ycpu)?;
+    let mut max_abs = 0.0f32;
+    for i in 0..rows {
+        max_abs = max_abs.max((ygpu[i] - ycpu[i]).abs());
+    }
+    println!("rec_matvec {name}: {rows}x{ne0}: max abs {max_abs:.3e}");
+    gpu.destroy_dev_buffer(w);
+    gpu.destroy_dev_buffer(xd);
+    gpu.destroy_dev_buffer(yd);
+    gpu.destroy_dev_buffer(partials);
+    if max_abs > 1e-4 {
+        return Err("rec_matvec mismatch".into());
+    }
+    Ok(())
+}
+
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -384,8 +434,9 @@ fn main() {
     let rope_mode = args[0] == "rope";
     let gdn_mode = args[0] == "gdn";
     let attn_mode = args[0] == "attn";
+    let rec_mode = args[0] == "rec";
     let no_model = elem_mode || normrows_mode || softmax_mode || rope_mode || gdn_mode || attn_mode;
-    let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
+    let model = if rms_mode || rec_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
     if model.is_empty() {
         eprintln!("missing model path");
         std::process::exit(1);
@@ -475,6 +526,17 @@ fn main() {
                 eprintln!("ATTN CHECK FAILED: {e}");
                 std::process::exit(1);
             }
+        }
+    }
+
+    if rec_mode {
+        let tname = args.get(2).cloned().ok_or_else(|| {
+            eprintln!("usage: bonsai-vk rec <model> <tensor>");
+            std::process::exit(1);
+        }).unwrap();
+        match check_rec(g.as_ref().unwrap(), &mut gpu, &tname) {
+            Ok(()) => { println!("REC CHECK PASSED"); return; }
+            Err(e) => { eprintln!("REC CHECK FAILED: {e}"); std::process::exit(1); }
         }
     }
 

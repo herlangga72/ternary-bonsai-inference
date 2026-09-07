@@ -115,6 +115,12 @@ pub struct Gpu {
     kernels: std::collections::HashMap<String, vk::Pipeline>,
     staging: Option<RawBuf>,
     mv: Option<MvCache>,
+    // per-token recording state (full device decode)
+    rec_pool: Option<vk::DescriptorPool>,
+    rec_cb: Option<vk::CommandBuffer>,
+    rec_fence: Option<vk::Fence>,
+    rec_dummy: Option<DevBuf>,
+    rec_open: bool,
     pub name: String,
     pub discrete: bool,
 }
@@ -319,6 +325,11 @@ impl Gpu {
             kernels: std::collections::HashMap::new(),
             staging: None,
             mv: None,
+            rec_pool: None,
+            rec_cb: None,
+            rec_fence: None,
+            rec_dummy: None,
+            rec_open: false,
             name,
             discrete,
         })
@@ -1708,11 +1719,269 @@ impl Gpu {
             Ok(out)
         }
     }
+    // ---- Per-token command recording (full device decode) -------------------
+
+    /// Start recording one token: reset the descriptor pool + command buffer.
+    pub fn rec_begin(&mut self) -> Result<(), String> {
+        if self.rec_pool.is_none() {
+            let sizes = [vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(8192 * 3)];
+            let pool_info = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(8192)
+                .pool_sizes(&sizes);
+            let pool = err(
+                unsafe { self.device.create_descriptor_pool(&pool_info, None) },
+                "rec_begin: pool",
+            )?;
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cb = unsafe { self.device.allocate_command_buffers(&cb_info) }
+                .map_err(|e| format!("rec_begin: cb: {e}"))?[0];
+            let fence = err(
+                unsafe { self.device.create_fence(&vk::FenceCreateInfo::default(), None) },
+                "rec_begin: fence",
+            )?;
+            let dummy = unsafe { self.create_dev_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+            self.rec_pool = Some(pool);
+            self.rec_cb = Some(cb);
+            self.rec_fence = Some(fence);
+            self.rec_dummy = Some(dummy);
+        }
+        unsafe {
+            self.device
+                .reset_descriptor_pool(self.rec_pool.unwrap(), vk::DescriptorPoolResetFlags::empty())
+                .map_err(|e| format!("rec_begin: reset pool: {e}"))?;
+            self.device
+                .reset_command_buffer(self.rec_cb.unwrap(), vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("rec_begin: reset cb: {e}"))?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(self.rec_cb.unwrap(), &begin)
+                .map_err(|e| format!("rec_begin: begin: {e}"))?;
+        }
+        self.rec_open = true;
+        Ok(())
+    }
+
+    /// Allocate one descriptor set from the per-token pool and point it at the
+    /// three buffers (bindings 0,1,2).
+    fn rec_set(&mut self, a: &DevBuf, b: &DevBuf, c: &DevBuf) -> Result<vk::DescriptorSet, String> {
+        let pool = self.rec_pool.ok_or("rec_set: pool not created")?;
+        unsafe {
+            let layouts = [self.desc_layout];
+            let alloc_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts);
+            let sets = self
+                .device
+                .allocate_descriptor_sets(&alloc_info)
+                .map_err(|e| format!("rec_set: alloc: {e}"))?;
+            let set = sets[0];
+            let infos = [
+                vk::DescriptorBufferInfo::default().buffer(a.buffer).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(b.buffer).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(c.buffer).range(vk::WHOLE_SIZE),
+            ];
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[0..1]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(1)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[1..2]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[2..3]),
+            ];
+            self.device.update_descriptor_sets(&writes, &[]);
+            Ok(set)
+        }
+    }
+
+    /// Record one kernel dispatch over buffers (a,b,c) with a memory barrier
+    /// afterwards. Kernels must be registered via `ensure_kernel`.
+    pub fn rec_dispatch(
+        &mut self,
+        kernel: &str,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        pc: &[u8],
+        groups: u32,
+    ) -> Result<(), String> {
+        if !self.rec_open {
+            return Err("rec_dispatch outside rec_begin/rec_end".into());
+        }
+        let &pipeline = self
+            .kernels
+            .get(kernel)
+            .ok_or_else(|| format!("kernel '{kernel}' not registered"))?;
+        let set = self.rec_set(a, b, c)?;
+        unsafe {
+            let cb = self.rec_cb.unwrap();
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pc,
+            );
+            self.device.cmd_dispatch(cb, groups.max(1), 1, 1);
+            // full compute->compute memory barrier over the touched buffers
+            let mem: Vec<vk::BufferMemoryBarrier> = [a, b, c]
+                .iter()
+                .map(|d| {
+                    vk::BufferMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(d.buffer)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE)
+                })
+                .collect();
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &mem,
+                &[],
+            );
+        }
+        Ok(())
+    }
+
+    /// Record the two-pass PQ2_0 matvec into the current token's command
+    /// buffer: pq2_partial into `partials`, then pq2_rowsum writing rows
+    /// `ybase..ybase+rows` of `y`.
+    pub fn rec_matvec(
+        &mut self,
+        w: &DevBuf,
+        x: &DevBuf,
+        y: &DevBuf,
+        ybase: u32,
+        partials: &DevBuf,
+        ne0: u32,
+        base_row: u32,
+        rows: u32,
+    ) -> Result<(), String> {
+        self.ensure_kernel("pq2_partial", PQ2_PARTIAL_SPV)?;
+        self.ensure_kernel("pq2_rowsum", PQ2_ROWSUM_SPV)?;
+        let nblocks = ne0.div_ceil(128);
+        let total = (rows as u64 * nblocks as u64).max(1);
+        let groups = (total as u32).div_ceil(256).max(1);
+        let pc_p = [ne0, base_row];
+        let pc_pb = unsafe {
+            std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+        };
+        self.rec_dispatch("pq2_partial", w, x, partials, pc_pb, groups)?;
+        let pc_r = [nblocks, ybase];
+        let pc_rb = unsafe {
+            std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
+        };
+        // rowsum only uses bindings 0 (partials) and 2 (y); bind y twice
+        self.rec_dispatch("pq2_rowsum", partials, y, y, pc_rb, rows.max(1))
+    }
+
+    /// End the token's command buffer, submit once and wait.
+    pub fn rec_end_submit(&mut self) -> Result<(), String> {
+        if !self.rec_open {
+            return Ok(());
+        }
+        unsafe {
+            let cb = self.rec_cb.unwrap();
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("rec_end: {e}"))?;
+            let fence = self.rec_fence.unwrap();
+            self.device
+                .reset_fences(&[fence])
+                .map_err(|e| format!("rec_end: reset fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("rec_end: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("rec_end: wait: {e}"))?;
+        }
+        self.rec_open = false;
+        Ok(())
+    }
+
+    /// Copy `len` bytes from a device buffer back to the host (small reads:
+    /// final hidden vector, logits later).
+    pub fn read_dev(&mut self, dev: &DevBuf, len: usize) -> Result<Vec<u8>, String> {
+        if len > dev.len {
+            return Err(format!("read_dev: {len} > device {}", dev.len));
+        }
+        self.ensure_staging_size(len)?;
+        unsafe {
+            let staging = self.staging.as_ref().unwrap().buffer;
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cb = self
+                .device
+                .allocate_command_buffers(&cb_info)
+                .map_err(|e| format!("read_dev: cb: {e}"))?[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device.begin_command_buffer(cb, &begin).map_err(|e| format!("read_dev: begin: {e}"))?;
+            let region = vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(len as vk::DeviceSize);
+            self.device.cmd_copy_buffer(cb, dev.buffer, staging, &[region]);
+            self.device.end_command_buffer(cb).map_err(|e| format!("read_dev: end: {e}"))?;
+            let fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("read_dev: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device.queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("read_dev: submit: {e}"))?;
+            self.device.wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("read_dev: wait: {e}"))?;
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            let ptr = self.staging.as_ref().unwrap().ptr;
+            Ok(std::slice::from_raw_parts(ptr, len).to_vec())
+        }
+    }
 }
 
 fn bytemuck_slice(x: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, x.len() * 4) }
 }
+
+
 
 impl Drop for Gpu {
     fn drop(&mut self) {
@@ -1722,6 +1991,19 @@ impl Drop for Gpu {
                 self.device.unmap_memory(s.memory);
                 self.device.destroy_buffer(s.buffer, None);
                 self.device.free_memory(s.memory, None);
+            }
+            if let Some(pool) = self.rec_pool.take() {
+                self.device.destroy_descriptor_pool(pool, None);
+            }
+            if let Some(cb) = self.rec_cb.take() {
+                self.device.free_command_buffers(self.command_pool, &[cb]);
+            }
+            if let Some(fence) = self.rec_fence.take() {
+                self.device.destroy_fence(fence, None);
+            }
+            if let Some(d) = self.rec_dummy.take() {
+                self.device.destroy_buffer(d.buffer, None);
+                self.device.free_memory(d.memory, None);
             }
             if let Some(c) = self.mv.take() {
                 self.device.destroy_fence(c.fence, None);

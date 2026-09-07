@@ -3,7 +3,7 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) readonly buffer P { float data[]; } partials;
 layout(set = 0, binding = 2, std430) buffer Y { float data[]; } y;
-layout(push_constant) uniform PC { uint nblocks; uint pad; } pc;
+layout(push_constant) uniform PC { uint nblocks; uint base; } pc;
 shared float red[256];
 void main() {
     uint row = gl_WorkGroupID.x;
@@ -17,5 +17,5 @@ void main() {
         if (lid < s) { red[lid] += red[lid + s]; }
         barrier();
     }
-    if (lid == 0u) { y.data[row] = red[0]; }
+    if (lid == 0u) { y.data[pc.base + row] = red[0]; }
 }
