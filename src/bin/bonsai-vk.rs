@@ -95,14 +95,56 @@ fn check_tensor(g: &GGUF, gpu: &mut vk::Gpu, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn check_rmsnorm(g: &mut GGUF, gpu: &mut vk::Gpu) -> Result<(), String> {
+    let info = g
+        .tensors
+        .iter()
+        .find(|t| t.name == "blk.0.attn_norm.weight")
+        .ok_or("blk.0.attn_norm.weight not found")?
+        .clone();
+    let w = g.read_tensor(&info)?;
+    let n = w.len();
+    let x = rand_floats(0xDEAD_BEEF, n);
+    let eps = 1e-6f32;
+
+    let ycpu = kernels::rms_norm(&x, &w, eps);
+    let ygpu = gpu.rms_norm(&x, &w, eps)?;
+
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut bad = 0usize;
+    for i in 0..n {
+        let d = (ygpu[i] - ycpu[i]).abs();
+        let rel = d / ycpu[i].abs().max(1e-30);
+        if rel > 1e-4 && d > 1e-4 {
+            bad += 1;
+            if bad <= 5 {
+                eprintln!("  [{i}] gpu {:.6} cpu {:.6} abs {d:.2e}", ygpu[i], ycpu[i]);
+            }
+        }
+        max_abs = max_abs.max(d);
+        max_rel = max_rel.max(rel);
+    }
+    println!("rms_norm: n {n}, max abs diff {max_abs:.3e}, max rel diff {max_rel:.3e}, mismatched {bad}/{n}");
+    if bad != 0 {
+        return Err("rms_norm mismatch".into());
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: bonsai-vk <model.gguf> [tensor_name]");
+        eprintln!("usage: bonsai-vk <model.gguf> [tensor_name]  |  bonsai-vk rmsnorm <model.gguf>");
         std::process::exit(1);
     }
-    let model = &args[0];
-    let g = match GGUF::open(model) {
+    let rms_mode = args[0] == "rmsnorm";
+    let model = if rms_mode { args.get(1).cloned().unwrap_or_default() } else { args[0].clone() };
+    if model.is_empty() {
+        eprintln!("missing model path");
+        std::process::exit(1);
+    }
+    let mut g = match GGUF::open(&model) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("error: {e}");
@@ -121,6 +163,19 @@ fn main() {
         gpu.name,
         if gpu.discrete { "discrete" } else { "integrated" }
     );
+
+    if rms_mode {
+        match check_rmsnorm(&mut g, &mut gpu) {
+            Ok(()) => {
+                println!("RMSNORM CHECK PASSED");
+                return;
+            }
+            Err(e) => {
+                eprintln!("RMSNORM CHECK FAILED: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let names: Vec<&str> = if args.len() > 1 {
         vec![args[1].as_str()]

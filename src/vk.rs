@@ -21,6 +21,10 @@ use std::ffi::CStr;
 pub const PQ2_MATVEC_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pq2_matvec.spv"));
 
+/// SPIR-V for the RMSNorm shader (`shaders/rms_norm.comp`).
+pub const RMS_NORM_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
+
 /// Shader workgroup width; must match `layout(local_size_x = ...)` in the
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
@@ -54,6 +58,9 @@ pub struct Gpu {
     pipeline: vk::Pipeline,
     pipeline_layout: vk::PipelineLayout,
     desc_layout: vk::DescriptorSetLayout,
+    /// Extra compute pipelines on the shared layout (all use the same 3-SSBO
+    /// set layout + 8-byte push range, so any shader that fits can register).
+    kernels: std::collections::HashMap<String, vk::Pipeline>,
     staging: Option<RawBuf>,
     pub name: String,
     pub discrete: bool,
@@ -234,6 +241,7 @@ impl Gpu {
             pipeline,
             pipeline_layout,
             desc_layout,
+            kernels: std::collections::HashMap::new(),
             staging: None,
             name,
             discrete,
@@ -587,6 +595,145 @@ impl Gpu {
         }
     }
 
+    // ---- G2a: generic kernels on the shared layout ---------------------------
+
+    /// Build (once) a compute pipeline from SPIR-V bytes on the shared layout.
+    /// Kernels must use at most bindings 0..3 of the descriptor set and an
+    /// 8-byte push constant block.
+    pub fn ensure_kernel(&mut self, name: &str, spv: &[u8]) -> Result<(), String> {
+        if self.kernels.contains_key(name) {
+            return Ok(());
+        }
+        let words: Vec<u32> = spv
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        unsafe {
+            let module_info = vk::ShaderModuleCreateInfo::default().code(&words);
+            let module = err(
+                self.device.create_shader_module(&module_info, None),
+                "ensure_kernel: module",
+            )?;
+            let main_name = std::ffi::CString::new("main").unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(&main_name);
+            let pipe_info = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(self.pipeline_layout);
+            let pipes = self
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[pipe_info], None)
+                .map_err(|(_, e)| format!("ensure_kernel({name}): {e}"))?;
+            self.device.destroy_shader_module(module, None);
+            self.kernels.insert(name.to_string(), pipes[0]);
+        }
+        Ok(())
+    }
+
+    /// Submit a one-shot dispatch of a registered kernel and wait. `set` must
+    /// already describe the kernel's buffers.
+    fn run_registered(
+        &self,
+        name: &str,
+        set: vk::DescriptorSet,
+        pc: &[u8],
+        local: u32,
+        groups_x: u32,
+    ) -> Result<(), String> {
+        let &pipeline = self
+            .kernels
+            .get(name)
+            .ok_or_else(|| format!("kernel '{name}' not registered"))?;
+        unsafe {
+            let cb_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let cb = self
+                .device
+                .allocate_command_buffers(&cb_info)
+                .map_err(|e| format!("run_registered: alloc: {e}"))?[0];
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cb, &begin)
+                .map_err(|e| format!("run_registered: begin: {e}"))?;
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pc,
+            );
+            self.device.cmd_dispatch(cb, groups_x.max(1), 1, 1);
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("run_registered: end: {e}"))?;
+
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("run_registered: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("run_registered: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("run_registered: wait: {e}"))?;
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            Ok(())
+        }
+    }
+
+    /// RMSNorm over one vector: o = rms_norm(x, w). Mirrors kernels::rms_norm
+    /// (single workgroup of 256, reduction in shared memory). x and w must be
+    /// the same length; the norm weight `w` is typically small (n_embd).
+    pub fn rms_norm(&mut self, x: &[f32], w: &[f32], eps: f32) -> Result<Vec<f32>, String> {
+        let n = x.len();
+        if n == 0 || w.len() != n {
+            return Err(format!("rms_norm: x len {n}, w len {}", w.len()));
+        }
+        self.ensure_kernel("rms_norm", RMS_NORM_SPV)?;
+        unsafe {
+            let mut xb = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let mut wb = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            let ob = self.create_host_buffer(n * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            xb.data_mut().copy_from_slice(bytemuck_slice(x));
+            wb.data_mut().copy_from_slice(bytemuck_slice(w));
+
+            let (pool, set) = self.make_set(xb.buffer, wb.buffer, ob.buffer)?;
+            let pc = [n as u32, eps.to_bits()];
+            let pc_bytes =
+                std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc));
+            self.run_registered("rms_norm", set, pc_bytes, 256, 1)?;
+
+            let out = ob.data()[..n * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(xb);
+            self.destroy_host_buffer(wb);
+            self.destroy_host_buffer(ob);
+            self.device.destroy_descriptor_pool(pool, None);
+            Ok(out)
+        }
+    }
+
     /// Run the PQ2_0 matvec over `n_rows` of a payload (row `base_row` +
     /// global id) and return the `n_rows` output floats.
     ///
@@ -744,6 +891,9 @@ impl Drop for Gpu {
                 self.device.free_memory(s.memory, None);
             }
             self.device.destroy_pipeline(self.pipeline, None);
+            for (_, p) in self.kernels.drain() {
+                self.device.destroy_pipeline(p, None);
+            }
             self.device.destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_descriptor_set_layout(self.desc_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);

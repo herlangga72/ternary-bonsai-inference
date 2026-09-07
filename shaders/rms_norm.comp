@@ -1,0 +1,49 @@
+#version 450
+
+// RMSNorm over one contiguous vector: o[i] = x[i] * w[i] * rsqrt(mean(x^2)+eps).
+// Mirrors kernels::rms_norm. Single workgroup of 256 lanes loops the vector
+// (n <= 17k in this model, so 68 iterations max at stride 256).
+// Bindings: 0 = x, 1 = w, 2 = o. Push: { uint n; float eps; } (8 bytes).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InX   { float data[]; } x;
+layout(set = 0, binding = 1, std430) readonly buffer InW   { float data[]; } w;
+layout(set = 0, binding = 2, std430) buffer       Out    { float data[]; } o;
+
+layout(push_constant) uniform PC {
+    uint n;
+    float eps;
+} pc;
+
+shared float sums[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint n = pc.n;
+    uint i = lid;
+    float ss = 0.0f;
+    while (i < n) {
+        float v = x.data[i];
+        ss = fma(v, v, ss);
+        i += 256u;
+    }
+    sums[lid] = ss;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            sums[lid] += sums[lid + s];
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        sums[0] = 1.0f / sqrt(sums[0] / float(n) + pc.eps);
+    }
+    barrier();
+    float scale = sums[0];
+    i = lid;
+    while (i < n) {
+        o.data[i] = x.data[i] * scale * w.data[i];
+        i += 256u;
+    }
+}
