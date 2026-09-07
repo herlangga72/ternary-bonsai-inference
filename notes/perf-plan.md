@@ -102,15 +102,16 @@ Note: G0 was first implemented and validated on the ROCm OpenCL path
 math, CPU reference checks, and shape coverage. OpenCL stays in tree as a
 fallback, not the main line.
 
-G2 status (2026-09-07): matvec (device-local, G1) and every per-layer kernel
-the decode needs are validated on RADV via `bonsai-vk` self-check modes:
-rms_norm (max rel 8.4e-7), fused elementwise silu/sigmoid/softplus + gate
-multiplies (max abs < 1e-6), row-wise RMS/L2 norms (5e-7 / 1.5e-8), masked
-softmax_row (4.7e-10), IMROPE rope (3.9e-6), and the gated-delta-net step
-(attn 9.3e-10, state 1.5e-8). Remaining G2: the full-attention layer kernel
-(q.k scores over the device KV cache + weighted v) and the single-command-
-buffer decode orchestrator (per-token submit) validated by golden qa (id
-8160), then bandwidth tuning on the RX 7600 (G3).
+G2c status (2026-09-07): the full-attention core (scores -> in-place softmax
+-> weighted-v) is validated (8.9e-8) and the Decoder now has an optional
+Vulkan matvec accelerator (Weights::enable_gpu / Decoder::open_gpu): every
+PQ2_0 tensor is uploaded to device-local VRAM once and matvecs route to the
+GPU. `bonsai-vkdecode` compares CPU vs GPU decode on a real prompt prefix:
+4 qa tokens on gfx902/RADV give greedy MATCH (369) and max abs logit diff
+2.6e-5 (rel 1.6e-6). Correctness milestone met. Per-token time on the iGPU is
+launch-overhead-bound (~85-95 s) because every matvec is a separate submit;
+that is what G3 targets (one in-order command buffer per token, persistent
+descriptor/buffer reuse, bandwidth-tuned PQ2_0 kernel).
 
 G0-G2 are designed to be validated on the current iGPU for *correctness*
 (golden greedy id 8160 must match), knowing gfx902 throughput is irrelevant;
