@@ -142,3 +142,22 @@ row decode buffers, SIMD dot via `std::arch`, fuse layers, speculative dspark.
   `data_start + info.offset` (see `gguf::GGUF::tensor_data_offset`); the
   reader used to skip `data_start`, silently decoding garbage for every
   tensor. Fixed 2026-09-06; synthetic writers must store relative offsets too.
+
+## GDev: single-submit device decode (2026-09-08 ~00:00)
+
+Beyond the M1..M7 migration and CPU AVX2 path (~1.5 s/token), the repo now has a
+complete single-command-buffer-per-token GPU engine (`src/gdev.rs`, binaries
+`bonsai-gdev` / `bonsai-gdecode` / `bonsai-grun`):
+
+- Every PQ2_0 matvec uses the two-pass v3 kernel (register-word block fetch);
+  every small op (rms, row norms, conv1d+silu, l2 in double, gdn prep+step,
+  rope, attention, gates, residual adds) is a recorded dispatch with compute
+  barriers. One submit per token (fixes iGPU downclocking).
+- APUs use host-visible RAM buffers (`create_model_weight_buffer`) because the
+  gfx902 device-local heap (~6.4 GB) is smaller than the model.
+- Validated: qa + code golden prompts both greedy 8160 MATCH through GDev
+  (logit rel 4.4e-3 / 3.2e-3); 10-token prefixes greedy-identical to CPU at
+  every position. ~1.4-1.6 s/token on the iGPU = DRAM parity with the AVX2
+  CPU path (both read ~7 GB/token from the same memory). Host record cost is
+  ~2 ms; GPU executes ~1.3-1.4 s/token.
+- Next: tune on the RX 7600 (288 GB/s dedicated VRAM) - same kernels/recorder.
