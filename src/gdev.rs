@@ -475,6 +475,8 @@ impl GDev {
     /// Record + run one full token. `embed` is the token embedding (host).
     pub fn forward_token(&mut self, pos: usize, embed: &[f32]) -> Result<Vec<f32>, String> {
         debug_assert_eq!(embed.len(), N_EMBD);
+        let timing = std::env::var("GDEV_TIME").map(|v| v == "1").unwrap_or(false);
+        let t_phase = std::time::Instant::now();
         // reset kv caches when pos==0 (fresh sequence)
         if pos == 0 {
             let kz = vec![0u8; N_CTX * KV_STRIDE * 4];
@@ -499,8 +501,16 @@ impl GDev {
         }
         let (wout, _, _) = self.tw("output_norm.weight")?;
         rec_rms(&mut self.gpu, &self.cur, &wout, &self.hidden, N_EMBD)?;
+        if timing {
+            eprintln!("[gdev] record: {:.1}ms", t_phase.elapsed().as_secs_f64() * 1e3);
+        }
+        let t_sub = std::time::Instant::now();
         self.gpu.rec_end_submit()?;
         let bytes = self.gpu.read_dev(&self.hidden, N_EMBD * 4)?;
+        if timing {
+            eprintln!("[gdev] submit+read: {:.1}ms", t_sub.elapsed().as_secs_f64() * 1e3);
+            eprintln!("[gdev] total: {:.1}ms", t_phase.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
