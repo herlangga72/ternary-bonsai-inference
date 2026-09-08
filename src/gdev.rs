@@ -259,6 +259,11 @@ impl GDev {
             } else {
                 kcache.push(None);
                 vcache.push(None);
+            }
+            if fa {
+                conv_cache.push(None);
+                state.push(None);
+            } else {
                 let c = make(&mut gpu, 3 * GDN_CH)?;
                 let s = make(&mut gpu, GDN_STATE_ELEMS)?;
                 gpu.upload(&c, &conv_bytes)?;
