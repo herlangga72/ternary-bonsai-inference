@@ -1,4 +1,4 @@
-# Night build results (2026-09-08, ~00:20)
+# Night build results (2026-09-08, ~00:37)
 
 User goal: run Ternary-Bonsai-27B faster with CPU+GPU heterogeneous execution
 and weights resident in memory, implementing until 07:00.
@@ -21,15 +21,21 @@ and weights resident in memory, implementing until 07:00.
 4. Diagnostics: `bonsai-lat` (single-shot submits downclock the iGPU to
    0.3-0.5 GHz - the reason for the one-buffer design), GDEV_TIME phase timers,
    `scripts/verify_gpu.sh`.
+5. Cache footprint cut to only the layers that use each cache (KV on 16
+   full-attn, conv/state on 48 recurrent); runtime context length
+   (BONSAI_CTX, default 2048); `BONSAI_VRAM=1` forces device-local weights
+   (now fits after the cache cut; proven: same 1.5 s/token and qa golden
+   PASSES on device-local). 200-token generation streamed coherent structured
+   reasoning at 1.59 s/token. Full test suite: 20/20 pass.
 
 ## Speed today (this machine)
 
 - CPU decode: ~1.5 s/token
 - GPU single-submit decode: ~1.4-1.6 s/token (DRAM parity: both engines read
   ~7 GB/token from the same memory at ~5 GB/s effective)
-- iGPU is at the shared-bus ceiling; further real speedup requires the RX 7600
-  (288 GB/s dedicated VRAM), which this exact engine targets (~0.03-0.05
-  s/token projected).
+- iGPU is at the shared-bus ceiling (~5 GB/s effective for the v3 kernel);
+  further real speedup requires the RX 7600 (288 GB/s dedicated VRAM), which
+  this exact engine targets (~0.03-0.05 s/token projected).
 
 ## Open items for after this session
 
