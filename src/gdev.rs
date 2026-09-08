@@ -139,7 +139,7 @@ pub struct GDev {
 
     qkv: DevBuf,
     z: DevBuf,
-    smalls: DevBuf,
+    smalls: Vec<DevBuf>,
     blob: DevBuf,
     attn_out: DevBuf,
     normed: DevBuf,
@@ -173,7 +173,7 @@ fn make(gpu: &mut vk::Gpu, n: usize) -> Result<DevBuf, String> {
 impl GDev {
     pub fn open(model: &str) -> Result<GDev, String> {
         let mut gpu = vk::Gpu::open()?;
-        let gg = GGUF::open(model).map_err(|e| format!("gguf: {e}"))?;
+        let mut gg = GGUF::open(model).map_err(|e| format!("gguf: {e}"))?;
         let cfg = Qwen35::from_gguf(&gg)?;
         if cfg.n_embd != N_EMBD
             || cfg.n_ff != N_FF
@@ -214,7 +214,6 @@ impl GDev {
         let partials = make(&mut gpu, N_FF * (N_EMBD / 128))?;
         let qkv = make(&mut gpu, GDN_CH)?;
         let z = make(&mut gpu, GDN_DI)?;
-        let smalls = make(&mut gpu, 4 * GDN_HV)?;
         let blob = make(&mut gpu, 2 * GDN_DK + GDN_DI + 2 * GDN_HV)?;
         let attn_out = make(&mut gpu, GDN_DI)?;
         let normed = make(&mut gpu, GDN_DI)?;
@@ -251,6 +250,32 @@ impl GDev {
             vcache.push(v);
             conv_cache.push(c);
             state.push(s);
+        }
+
+        // per-layer smalls: [beta(48) alpha(48) ssa(48) dt(48)] staged once at
+        // load for recurrent layers (ssa/dt constant; beta/alpha are matvec
+        // outputs written per token)
+        let mut smalls = Vec::new();
+        for il in 0..cfg.n_layer {
+            let sm = make(&mut gpu, 4 * GDN_HV)?;
+            gpu.upload(&sm, &vec![0u8; 4 * GDN_HV * 4])?;
+            if cfg.is_recurrent(il) {
+                let mut v = vec![0.0f32; 4 * GDN_HV];
+                let key = format!("blk.{il}.ssm_a");
+                if let Some(t) = gg.tensors.iter().find(|t| t.name == key).cloned() {
+                    let x = gg.read_tensor(&t)?;
+                    let n = x.len().min(GDN_HV);
+                    v[2 * GDN_HV..2 * GDN_HV + n].copy_from_slice(&x[..n]);
+                }
+                let key = format!("blk.{il}.ssm_dt.bias");
+                if let Some(t) = gg.tensors.iter().find(|t| t.name == key).cloned() {
+                    let x = gg.read_tensor(&t)?;
+                    let n = x.len().min(GDN_HV);
+                    v[3 * GDN_HV..3 * GDN_HV + n].copy_from_slice(&x[..n]);
+                }
+                gpu.upload(&sm, f32_bytes(&v))?;
+            }
+            smalls.push(sm);
         }
 
         Ok(GDev {
@@ -293,27 +318,6 @@ impl GDev {
             .get(name)
             .ok_or_else(|| format!("gdev: tensor {name} missing"))?;
         Ok((t.buf, t.ne0, t.rows))
-    }
-
-    fn read_w(&mut self, name: &str) -> Result<Vec<f32>, String> {
-        let (buf, _ne0, _rows) = self.tw(name)?;
-        let n = buf.len / 4; // f32 payload
-        let bytes = self.gpu.read_dev(&buf, n * 4)?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
-    }
-
-    fn stage_smalls(&mut self, il: usize) -> Result<(), String> {
-        let ssa = self.read_w(&format!("blk.{il}.ssm_a"))?;
-        let dtb = self.read_w(&format!("blk.{il}.ssm_dt.bias"))?;
-        let n = GDN_HV.min(ssa.len()).min(dtb.len());
-        let mut sm = vec![0.0f32; 4 * GDN_HV];
-        sm[2 * GDN_HV..2 * GDN_HV + n].copy_from_slice(&ssa[..n]);
-        sm[3 * GDN_HV..3 * GDN_HV + n].copy_from_slice(&dtb[..n]);
-        self.gpu.upload(&self.smalls, f32_bytes(&sm))?;
-        Ok(())
     }
 
     fn rec_attn_layer(&mut self, il: usize, pos: usize) -> Result<(), String> {
@@ -414,8 +418,8 @@ impl GDev {
         for (suf, dst, ybase) in [
             ("attn_qkv.weight", &self.qkv, 0usize),
             ("attn_gate.weight", &self.z, 0),
-            ("ssm_beta.weight", &self.smalls, 0),
-            ("ssm_alpha.weight", &self.smalls, GDN_HV),
+            ("ssm_beta.weight", &self.smalls[il], 0),
+            ("ssm_alpha.weight", &self.smalls[il], GDN_HV),
         ] {
             let (w, ne0, rows) = self.tw(&format!("blk.{il}.{suf}"))?;
             rec_mat(&mut self.gpu, partials, &w, ne0, rows, xnorm, dst, ybase)?;
@@ -436,7 +440,7 @@ impl GDev {
         self.gpu.rec_dispatch(
             "gdn_prep",
             &self.qkv,
-            &self.smalls,
+            &self.smalls[il],
             &self.blob,
             pc_u32(&[0, 0]),
             GDN_CH.div_ceil(256) as u32,
@@ -489,8 +493,6 @@ impl GDev {
             if self.cfg.is_full_attention(il) {
                 self.rec_attn_layer(il, pos)?;
             } else {
-                // stage per-layer constant smalls (ssm_a/dt.bias) first
-                self.stage_smalls(il)?;
                 self.rec_gdn_layer(il)?;
             }
             self.rec_ffn(il)?;
