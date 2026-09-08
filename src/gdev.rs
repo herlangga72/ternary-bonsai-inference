@@ -33,8 +33,16 @@ const GDN_CH: usize = 2 * GDN_DK + GDN_DI; // 10240
 const STATE_SIZE: usize = 128;
 const GDN_STATE_ELEMS: usize = GDN_HV * STATE_SIZE * STATE_SIZE;
 const KV_STRIDE: usize = N_KV * HEAD_D;
-const N_CTX: usize = 2048;
+const N_CTX_DEFAULT: usize = 2048;
 const EPS: f32 = 1e-6;
+
+fn n_ctx_env() -> usize {
+    std::env::var("BONSAI_CTX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 16 && n <= 16384)
+        .unwrap_or(N_CTX_DEFAULT)
+}
 
 fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
@@ -129,6 +137,7 @@ struct TensorW {
 pub struct GDev {
     pub gpu: vk::Gpu,
     pub cfg: Qwen35,
+    pub n_ctx: usize,
     tens: HashMap<String, TensorW>,
 
     cur: DevBuf,
@@ -175,6 +184,7 @@ impl GDev {
         let mut gpu = vk::Gpu::open()?;
         let mut gg = GGUF::open(model).map_err(|e| format!("gguf: {e}"))?;
         let cfg = Qwen35::from_gguf(&gg)?;
+        let n_ctx = n_ctx_env();
         if cfg.n_embd != N_EMBD
             || cfg.n_ff != N_FF
             || cfg.n_head != N_HEAD
@@ -224,7 +234,7 @@ impl GDev {
         let kraw = make(&mut gpu, N_KV * HEAD_D)?;
         let kn = make(&mut gpu, N_KV * HEAD_D)?;
         let vraw = make(&mut gpu, N_KV * HEAD_D)?;
-        let scores = make(&mut gpu, N_HEAD * N_CTX)?;
+        let scores = make(&mut gpu, N_HEAD * n_ctx)?;
         let attn_h = make(&mut gpu, N_HEAD * HEAD_D)?;
         let fg = make(&mut gpu, N_FF)?;
         let fu = make(&mut gpu, N_FF)?;
@@ -234,14 +244,14 @@ impl GDev {
         let mut vcache = Vec::new();
         let mut conv_cache = Vec::new();
         let mut state = Vec::new();
-        let kv_bytes = vec![0u8; N_CTX * KV_STRIDE * 4];
+        let kv_bytes = vec![0u8; n_ctx * KV_STRIDE * 4];
         let conv_bytes = vec![0u8; 3 * GDN_CH * 4];
         let state_bytes = vec![0u8; GDN_STATE_ELEMS * 4];
         for il in 0..cfg.n_layer {
             let fa = cfg.is_full_attention(il);
             if fa {
-                let k = make(&mut gpu, N_CTX * KV_STRIDE)?;
-                let v = make(&mut gpu, N_CTX * KV_STRIDE)?;
+                let k = make(&mut gpu, n_ctx * KV_STRIDE)?;
+                let v = make(&mut gpu, n_ctx * KV_STRIDE)?;
                 gpu.upload(&k, &kv_bytes)?;
                 gpu.upload(&v, &kv_bytes)?;
                 kcache.push(Some(k));
@@ -287,6 +297,7 @@ impl GDev {
         Ok(GDev {
             gpu,
             cfg,
+            n_ctx,
             tens,
             cur,
             xnorm,
@@ -481,11 +492,17 @@ impl GDev {
     /// Record + run one full token. `embed` is the token embedding (host).
     pub fn forward_token(&mut self, pos: usize, embed: &[f32]) -> Result<Vec<f32>, String> {
         debug_assert_eq!(embed.len(), N_EMBD);
+        if pos >= self.n_ctx {
+            return Err(format!(
+                "gdev: position {pos} exceeds context {}/{} (raise BONSAI_CTX)",
+                self.n_ctx, self.n_ctx
+            ));
+        }
         let timing = std::env::var("GDEV_TIME").map(|v| v == "1").unwrap_or(false);
         let t_phase = std::time::Instant::now();
         // reset kv caches when pos==0 (fresh sequence)
         if pos == 0 {
-            let kz = vec![0u8; N_CTX * KV_STRIDE * 4];
+            let kz = vec![0u8; self.n_ctx * KV_STRIDE * 4];
             let sz = vec![0u8; GDN_STATE_ELEMS * 4];
             let cz = vec![0u8; 3 * GDN_CH * 4];
             for il in 0..self.cfg.n_layer {
