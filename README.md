@@ -95,6 +95,8 @@ recorded dispatch. The LM head, sampling and embedding lookups stay on the
 CPU. On the gfx902 iGPU this runs at ~1.4-1.6 s/token (DRAM-parity with the
 AVX2 CPU path) and matches the golden prompt: greedy 8160, logit rel 4.4e-3.
 The same engine is what targets the RX 7600 (288 GB/s) for the big speedup.
+On APUs weights default to host-visible RAM (device-local heap < model); set
+`BONSAI_VRAM=1` to force device-local (fits after per-layer cache reduction).
 
 ```sh
 ./target/release/bonsai-grun Ternary-Bonsai-27B-PQ2_0.gguf "What is the capital of France?" 24

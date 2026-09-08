@@ -173,10 +173,19 @@ pub struct GDev {
     state: Vec<Option<DevBuf>>,
 }
 
+fn alloc_bytes(gpu: &mut vk::Gpu, bytes: usize) -> Result<DevBuf, String> {
+    // BONSAI_VRAM=1 forces device-local even on APUs (experiment); otherwise
+    // device-local on discrete GPUs, host-visible RAM on APUs.
+    let force_vram = std::env::var("BONSAI_VRAM").map(|v| v == "1").unwrap_or(false);
+    if force_vram || gpu.discrete {
+        gpu.create_dev_buffer(bytes, vk::storage_usage())
+    } else {
+        gpu.create_host_dev_buffer(bytes, vk::storage_usage())
+    }
+}
+
 fn make(gpu: &mut vk::Gpu, n: usize) -> Result<DevBuf, String> {
-    // device-local on discrete GPUs; host-visible (RAM) on APUs so the whole
-    // model + caches fit. n is in floats; buffers are sized in bytes.
-    gpu.create_model_weight_buffer(n.max(1) * 4)
+    alloc_bytes(gpu, n.max(1) * 4)
 }
 
 impl GDev {
@@ -209,7 +218,7 @@ impl GDev {
                 continue;
             }
             let nbytes = gg.tensor_nbytes(t) as usize;
-            let buf = gpu.create_model_weight_buffer(nbytes)?;
+            let buf = alloc_bytes(&mut gpu, nbytes)?;
             let payload = gg.payload_slice(t)?;
             gpu.upload(&buf, payload)?;
             let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
