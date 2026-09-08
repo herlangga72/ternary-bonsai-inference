@@ -58,6 +58,7 @@ fn main() {
     let mut dev = gdev::GDev::open(&model).expect("gdev open");
 
     let mut worst_rel = 0.0f32;
+    let mut diffs = 0usize;
     for (pos, &tok) in toks.iter().enumerate() {
         let embed = embed_of(&g, tok);
         let t0 = Instant::now();
@@ -94,10 +95,13 @@ fn main() {
             if a_cpu == a_gpu { "MATCH" } else { "DIFFER" },
             ldiff / lmax
         );
+        if a_cpu != a_gpu {
+            diffs += 1;
+        }
     }
-    println!("worst hidden rel: {worst_rel:.2e}");
-    if worst_rel > 5e-2 {
-        eprintln!("GDEV MISMATCH (hidden rel {worst_rel:.2e})");
+    println!("worst hidden rel: {worst_rel:.2e}, argmax diffs: {diffs}/{}", toks.len());
+    if diffs != 0 {
+        eprintln!("GDEV MISMATCH (argmax diverged on {diffs} prefix)");
         std::process::exit(1);
     }
     println!("GDEV OK");
