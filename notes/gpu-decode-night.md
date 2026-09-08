@@ -28,5 +28,12 @@ Slice checklist (each: write shader, register, validate vs CPU, commit):
 6. Validate bonsai-vkdecode golden (greedy 8160) on iGPU; measure s/token.
 7. Tune partials/LDS/occupancy; then the same build targets the RX 7600.
 
+Status 2026-09-08 ~00:00: slices 1-4 + orchestrator + full-token validation
+complete. Single-command-buffer device decode (GDev) matches the CPU decoder:
+qa golden greedy 8160 MATCH, logit rel 4.4e-3, ~1.4-1.6 s/token on the iGPU
+(bus/parity bound). Interactive bonsai-grun streams text. The identical
+engine is the RX 7600 path; remaining: micro overhead reduction, optional
+CPU+GPU row-split hetero on this box, and 7600 tuning.
+
 Existing validated kernels reused: rms_norm, norm_rows, elem, rope_imrope,
 softmax_inplace, attn_scores, attn_out, gdn_step, pq2 partial+rowsum.

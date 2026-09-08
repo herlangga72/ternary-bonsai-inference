@@ -86,6 +86,21 @@ Wiring dspark speculation into this Rust driver is not exposed as a single
 `llama.h` call; it lives in the fork's C++ acceptance loop, so it remains a
 follow-up rather than part of the basic inference path.
 
+## GPU (single-submit) decode
+
+`bonsai-grun` / `bonsai-gdecode` run the full forward pass on the GPU as one
+recorded command buffer per token (`gdev.rs`): every PQ2_0 matvec uses the
+two-pass v3 kernel and every small op (rms, rope, gdn, attention, gates) is a
+recorded dispatch. The LM head, sampling and embedding lookups stay on the
+CPU. On the gfx902 iGPU this runs at ~1.4-1.6 s/token (DRAM-parity with the
+AVX2 CPU path) and matches the golden prompt: greedy 8160, logit rel 4.4e-3.
+The same engine is what targets the RX 7600 (288 GB/s) for the big speedup.
+
+```sh
+./target/release/bonsai-grun Ternary-Bonsai-27B-PQ2_0.gguf "What is the capital of France?" 24
+./target/release/bonsai-gdecode Ternary-Bonsai-27B-PQ2_0.gguf golden/prompts/qa.txt golden/qa.logits.bin
+```
+
 ## Resource restraint
 
 Long decode/validation runs saturate memory bandwidth (the model streams

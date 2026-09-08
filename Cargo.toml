@@ -18,6 +18,10 @@ path = "src/bin/bonsai-logits.rs"
 required-features = ["llama-backend"]
 
 [[bin]]
+name = "bonsai-grun"
+path = "src/bin/bonsai-grun.rs"
+
+[[bin]]
 name = "bonsai-tokcmp"
 path = "src/bin/bonsai-tokcmp.rs"
 required-features = ["llama-backend"]
