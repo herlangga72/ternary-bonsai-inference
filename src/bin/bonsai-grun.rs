@@ -96,6 +96,7 @@ fn main() {
     let mut logits = dec.head_logits(&hidden).expect("head");
     let mut stdout = std::io::stdout();
     let t_gen = Instant::now();
+    let mut baseline: Option<f32> = None;
     let mut n = 0usize;
     let mut pos = toks.len();
     loop {
@@ -109,8 +110,15 @@ fn main() {
         let _ = stdout.flush();
         n += 1;
         let emb = dec.w.row_f32("token_embd.weight", id as u64).expect("embed");
+        let t0 = Instant::now();
         hidden = dev.forward_token(pos, &emb).expect("decode");
         logits = dec.head_logits(&hidden).expect("head");
+        let el = t0.elapsed().as_secs_f32();
+        if let Some(b) = baseline {
+            kernels::pause_for_budget(el, b);
+        } else {
+            baseline = Some(el);
+        }
         pos += 1;
     }
     let el = t_gen.elapsed().as_secs_f32();
