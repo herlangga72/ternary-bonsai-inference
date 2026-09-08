@@ -158,10 +158,10 @@ pub struct GDev {
     fu: DevBuf,
     h1: DevBuf,
 
-    kcache: Vec<DevBuf>,
-    vcache: Vec<DevBuf>,
-    conv_cache: Vec<DevBuf>,
-    state: Vec<DevBuf>,
+    kcache: Vec<Option<DevBuf>>,
+    vcache: Vec<Option<DevBuf>>,
+    conv_cache: Vec<Option<DevBuf>>,
+    state: Vec<Option<DevBuf>>,
 }
 
 fn make(gpu: &mut vk::Gpu, n: usize) -> Result<DevBuf, String> {
@@ -237,19 +237,25 @@ impl GDev {
         let kv_bytes = vec![0u8; N_CTX * KV_STRIDE * 4];
         let conv_bytes = vec![0u8; 3 * GDN_CH * 4];
         let state_bytes = vec![0u8; GDN_STATE_ELEMS * 4];
-        for _ in 0..cfg.n_layer {
-            let k = make(&mut gpu, N_CTX * KV_STRIDE)?;
-            let v = make(&mut gpu, N_CTX * KV_STRIDE)?;
-            gpu.upload(&k, &kv_bytes)?;
-            gpu.upload(&v, &kv_bytes)?;
-            let c = make(&mut gpu, 3 * GDN_CH)?;
-            let s = make(&mut gpu, GDN_STATE_ELEMS)?;
-            gpu.upload(&c, &conv_bytes)?;
-            gpu.upload(&s, &state_bytes)?;
-            kcache.push(k);
-            vcache.push(v);
-            conv_cache.push(c);
-            state.push(s);
+        for il in 0..cfg.n_layer {
+            let fa = cfg.is_full_attention(il);
+            if fa {
+                let k = make(&mut gpu, N_CTX * KV_STRIDE)?;
+                let v = make(&mut gpu, N_CTX * KV_STRIDE)?;
+                gpu.upload(&k, &kv_bytes)?;
+                gpu.upload(&v, &kv_bytes)?;
+                kcache.push(Some(k));
+                vcache.push(Some(v));
+            } else {
+                kcache.push(None);
+                vcache.push(None);
+                let c = make(&mut gpu, 3 * GDN_CH)?;
+                let s = make(&mut gpu, GDN_STATE_ELEMS)?;
+                gpu.upload(&c, &conv_bytes)?;
+                gpu.upload(&s, &state_bytes)?;
+                conv_cache.push(Some(c));
+                state.push(Some(s));
+            }
         }
 
         // per-layer smalls: [beta(48) alpha(48) ssa(48) dt(48)] staged once at
@@ -369,16 +375,16 @@ impl GDev {
         self.gpu.rec_dispatch(
             "kv_store",
             &self.kn,
-            &self.kcache[il],
-            &self.kcache[il],
+            self.kcache[il].as_ref().unwrap(),
+            self.kcache[il].as_ref().unwrap(),
             pc_u32(&pc_kv),
             KV_STRIDE.div_ceil(256) as u32,
         )?;
         self.gpu.rec_dispatch(
             "kv_store",
             &self.vraw,
-            &self.vcache[il],
-            &self.vcache[il],
+            self.vcache[il].as_ref().unwrap(),
+            self.vcache[il].as_ref().unwrap(),
             pc_u32(&pc_kv),
             KV_STRIDE.div_ceil(256) as u32,
         )?;
@@ -393,11 +399,11 @@ impl GDev {
             0,
         ];
         self.gpu.ensure_kernel("attn_scores", vk::ATTN_SCORES_SPV)?;
-        self.gpu.rec_dispatch("attn_scores", &self.qn, &self.kcache[il], &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
+        self.gpu.rec_dispatch("attn_scores", &self.qn, self.kcache[il].as_ref().unwrap(), &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
         self.gpu.ensure_kernel("softmax_inplace", vk::SOFTMAX_INPLACE_SPV)?;
         self.gpu.rec_dispatch("softmax_inplace", &self.scores, &self.scores, &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
         self.gpu.ensure_kernel("attn_out", vk::ATTN_OUT_SPV)?;
-        self.gpu.rec_dispatch("attn_out", &self.scores, &self.vcache[il], &self.attn_h, pc_u32(&pc_att), N_HEAD as u32)?;
+        self.gpu.rec_dispatch("attn_out", &self.scores, self.vcache[il].as_ref().unwrap(), &self.attn_h, pc_u32(&pc_att), N_HEAD as u32)?;
 
         // out = wo @ (sigmoid(gate) . attn_h); reuse qfull as the gated buffer
         rec_elem(&mut self.gpu, &self.gate, &self.attn_h, &self.qfull, N_HEAD * HEAD_D, 4)?;
@@ -429,7 +435,7 @@ impl GDev {
         self.gpu.rec_dispatch(
             "conv1d_silu",
             &self.qkv,
-            &self.conv_cache[il],
+            self.conv_cache[il].as_ref().unwrap(),
             &cw,
             pc_u32(&[GDN_CH as u32, 0]),
             GDN_CH.div_ceil(256) as u32,
@@ -446,7 +452,7 @@ impl GDev {
             GDN_CH.div_ceil(256) as u32,
         )?;
         self.gpu.ensure_kernel("gdn_step", vk::GDN_STEP_SPV)?;
-        self.gpu.rec_dispatch("gdn_step", &self.blob, &self.state[il], &self.attn_out, &[], GDN_HV as u32)?;
+        self.gpu.rec_dispatch("gdn_step", &self.blob, self.state[il].as_ref().unwrap(), &self.attn_out, &[], GDN_HV as u32)?;
         let (wsn, _, _) = self.tw(&format!("blk.{il}.ssm_norm.weight"))?;
         rec_norm_rows(&mut self.gpu, &self.attn_out, &wsn, &self.normed, GDN_DI, STATE_SIZE, 0)?;
         rec_elem(&mut self.gpu, &self.z, &self.normed, &self.h1, GDN_DI, 3)?;
@@ -483,10 +489,10 @@ impl GDev {
             let sz = vec![0u8; GDN_STATE_ELEMS * 4];
             let cz = vec![0u8; 3 * GDN_CH * 4];
             for il in 0..self.cfg.n_layer {
-                self.gpu.upload(&self.kcache[il], &kz)?;
-                self.gpu.upload(&self.vcache[il], &kz)?;
-                self.gpu.upload(&self.conv_cache[il], &cz)?;
-                self.gpu.upload(&self.state[il], &sz)?;
+                if let Some(k) = &self.kcache[il] { self.gpu.upload(k, &kz)?; }
+                if let Some(v) = &self.vcache[il] { self.gpu.upload(v, &kz)?; }
+                if let Some(c) = &self.conv_cache[il] { self.gpu.upload(c, &cz)?; }
+                if let Some(s) = &self.state[il] { self.gpu.upload(s, &sz)?; }
             }
         }
         self.gpu.upload(&self.cur, f32_bytes(embed))?;
