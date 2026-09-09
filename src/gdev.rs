@@ -576,17 +576,18 @@ impl GDev {
     }
 
     // ------------------------------------------------------------------
-    // P3 - batched full-attention prefill over an N-token batch.
+    // P3+P4 - batched prefill over an N-token batch (all 64 layers).
     //
     // Processes the N prompt positions layer-by-layer (layer-major), which is
     // numerically equivalent to the sequential token loop: each position's
     // running activation is kept in an N-wide `[token][n_embd]` tile and every
-    // layer's full-attention projections + the FFN run through the P2
-    // N-column GEMM (weight stream read once), while the recurrent (GDN)
-    // layers - whose state is sequential across positions - run their existing
-    // per-token path (P4 batches them). The post-prefill KV / conv / state
-    // buffers are exactly what the token loop leaves behind, so `forward_token`
-    // can append at pos = N.
+    // layer's projections (full-attention + FFN + recurrent-GDN) run through
+    // the P2 N-column GEMM (weight stream read once). The recurrent (GDN)
+    // layers' causal conv + gated-delta-net state recurrence stays sequential
+    // across positions (P4), which only touches the small resident conv
+    // weights and the ~3 MB/layer state, never the weight stream. The
+    // post-prefill KV / conv / state buffers are exactly what the token loop
+    // leaves behind, so `forward_token` can append at pos = N.
     // ------------------------------------------------------------------
     fn reset_sequence(&mut self) -> Result<(), String> {
         let kz = vec![0u8; self.n_ctx * KV_STRIDE * 4];
@@ -752,18 +753,108 @@ impl GDev {
         )
     }
 
-    /// Recurrent (GDN) layer over all N positions: run the existing per-token
-    /// path sequentially (state recurrence across positions is P4's batching
-    /// target), feeding each position's tile row through `rec_gdn_layer`.
+    /// Batched recurrent (GDN) layer over all N positions (P4).
+    ///
+    /// The heavy work is batched across the N columns so the (once-streamed)
+    /// weight blocks are read a single time:
+    ///   1. attn_qkv / attn_gate / ssm_beta / ssm_alpha projections over the
+    ///      whole N-wide rms-normed tile through the P2 N-column GEMM;
+    ///   2. per position, the causal conv1d + q/k l2 + `gdn_step` state
+    ///      recurrence + gated output norm (inherently sequential across
+    ///      positions, and cheap - they touch only the small resident conv
+    ///      weights and the ~3 MB/layer state, not the weight stream);
+    ///   3. a single batched ssm_out GEMM over the N gated-norm outputs.
+    ///
+    /// The final conv_cache and GDN state equal exactly what the per-token
+    /// `rec_gdn_layer` path leaves behind, because each position's conv/l2/
+    /// gdn_step/gated-norm use the same kernels on the same per-position data
+    /// (the batched projection result is bit-identical to the per-token
+    /// matvec), in the same position order. Decode can therefore append at
+    /// pos = N.
     fn record_bgdn(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+        let xnorm = &bb.xnorm;
+        let partials = &bb.partials;
+
+        // rms attn_norm for each position into the xnorm tile, reproducing the
+        // exact single-stream rec_rms (rms_norm kernel) so the batched
+        // projection input equals the token-loop input row-for-row.
+        let (wn, _, _) = self.tw(&format!("blk.{il}.attn_norm.weight"))?;
         for p in 0..n {
-            // tile row p -> cur (dense single buffer rec_gdn_layer consumes)
             rec_bcopy(&mut self.gpu, &bb.xb, &self.cur, p * N_EMBD, 0, N_EMBD)?;
-            self.rec_gdn_layer(il)?;
-            // cur (residual added in place) -> tile row p
-            rec_bcopy(&mut self.gpu, &self.cur, &bb.xb, 0, p * N_EMBD, N_EMBD)?;
+            rec_rms(&mut self.gpu, &self.cur, &wn, &self.xnorm, N_EMBD)?;
+            rec_bcopy(&mut self.gpu, &self.xnorm, &bb.xnorm, 0, p * N_EMBD, N_EMBD)?;
         }
-        Ok(())
+
+        // ---- batched projections over the N columns -------------------------
+        for (suf, dst) in [
+            ("attn_qkv.weight", &bb.gqkv),
+            ("attn_gate.weight", &bb.gz),
+            ("ssm_beta.weight", &bb.gbeta),
+            ("ssm_alpha.weight", &bb.galpha),
+        ] {
+            let (w, ne0, rows) = self.tw(&format!("blk.{il}.{suf}"))?;
+            self.gpu.rec_matvec_batch(
+                &w, xnorm, dst, partials, ne0 as u32, 0, rows as u32, n as u32,
+            )?;
+        }
+
+        let (cw, _, _) = self.tw(&format!("blk.{il}.ssm_conv1d.weight"))?;
+        let (wsn, _, _) = self.tw(&format!("blk.{il}.ssm_norm.weight"))?;
+
+        // ---- sequential per-position conv + recurrence (cheap, exact) -------
+        for p in 0..n {
+            // bring this position's projection rows into the dense buffers the
+            // per-position kernels consume.
+            rec_bcopy(&mut self.gpu, &bb.gqkv, &self.qkv, p * GDN_CH, 0, GDN_CH)?;
+            rec_bcopy(&mut self.gpu, &bb.gz, &self.z, p * GDN_DI, 0, GDN_DI)?;
+            rec_bcopy(&mut self.gpu, &bb.gbeta, &self.smalls[il], p * GDN_HV, 0, GDN_HV)?;
+            rec_bcopy(&mut self.gpu, &bb.galpha, &self.smalls[il], p * GDN_HV, GDN_HV, GDN_HV)?;
+
+            // conv1d + silu (in place on qkv), shifting the conv cache
+            self.gpu.ensure_kernel("conv1d_silu", vk::CONV1D_SILU_SPV)?;
+            self.gpu.rec_dispatch(
+                "conv1d_silu",
+                &self.qkv,
+                self.conv_cache[il].as_ref().unwrap(),
+                &cw,
+                pc_u32(&[GDN_CH as u32, 0]),
+                GDN_CH.div_ceil(256) as u32,
+            )?;
+            rec_l2(&mut self.gpu, &self.qkv, 0, GDN_DK / STATE_SIZE)?;
+            rec_l2(&mut self.gpu, &self.qkv, GDN_DK, GDN_DK / STATE_SIZE)?;
+            self.gpu.ensure_kernel("gdn_prep", vk::GDN_PREP_SPV)?;
+            self.gpu.rec_dispatch(
+                "gdn_prep",
+                &self.qkv,
+                &self.smalls[il],
+                &self.blob,
+                pc_u32(&[0, 0]),
+                GDN_CH.div_ceil(256) as u32,
+            )?;
+            self.gpu.ensure_kernel("gdn_step", vk::GDN_STEP_SPV)?;
+            self.gpu.rec_dispatch("gdn_step", &self.blob, self.state[il].as_ref().unwrap(), &self.attn_out, &[], GDN_HV as u32)?;
+            rec_norm_rows(&mut self.gpu, &self.attn_out, &wsn, &self.normed, GDN_DI, STATE_SIZE, 0)?;
+            // gated output = rms_norm(attn_out) * silu(z) -> self.h1
+            rec_elem(&mut self.gpu, &self.z, &self.normed, &self.h1, GDN_DI, 3)?;
+            // store this position's gated output into the N-wide h1 tile
+            rec_bcopy(&mut self.gpu, &self.h1, &bb.gh1, 0, p * GDN_DI, GDN_DI)?;
+        }
+
+        // ---- ssm_out batched over the N gated-output columns -> branch tile --
+        let (wso, ne0, rows) = self.tw(&format!("blk.{il}.ssm_out.weight"))?;
+        self.gpu.rec_matvec_batch(
+            &wso, &bb.gh1, &bb.branch, partials, ne0 as u32, 0, rows as u32, n as u32,
+        )?;
+        // residual: xb += branch (flat over the tile)
+        self.gpu.ensure_kernel("add_residual", vk::ADD_RESIDUAL_SPV)?;
+        self.gpu.rec_dispatch(
+            "add_residual",
+            &bb.xb,
+            &bb.branch,
+            &bb.xb,
+            pc_u32(&[(N_EMBD * n) as u32]),
+            (N_EMBD * n).div_ceil(256) as u32,
+        )
     }
 
     /// Run one layer of the batched prefill (attention + FFN) inside a single
@@ -781,11 +872,13 @@ impl GDev {
 
     /// Batched prefill of `n` prompt embeddings (each `N_EMBD` floats, one per
     /// prompt position in order). Returns the output-normalized hidden tile
-    /// (`n * N_EMBD` floats, `[token][n_embd]`). Recurrent layers run their
-    /// existing per-token path; full-attention projections, attention, KV
-    /// stores and all FFN GEMMs run across the N columns. KV / conv / state
-    /// caches are left exactly as the sequential token loop leaves them, so
-    /// `forward_token(pos = n, ...)` can append the first generated token.
+    /// (`n * N_EMBD` floats, `[token][n_embd]`). All 64 layers run over the N
+    /// columns: full-attention projections, attention, KV stores, all FFN
+    /// GEMMs, and (P4) the recurrent GDN projections + ssm_out run across the
+    /// N columns, with only the GDN causal conv + state recurrence sequential
+    /// per position. KV / conv / state caches are left exactly as the
+    /// sequential token loop leaves them, so `forward_token(pos = n, ...)` can
+    /// append the first generated token.
     pub fn prefill_batch(&mut self, embeds: &[f32], n: usize) -> Result<Vec<f32>, String> {
         if n < 1 {
             return Err("prefill_batch: empty batch".into());
@@ -816,9 +909,16 @@ impl GDev {
         let fg = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
         let fu = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
         let h1 = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
+        // N-wide GDN tiles (P4): per-position projections and gated output.
+        let gqkv = alloc_bytes(&mut self.gpu, n * GDN_CH * 4)?;
+        let gz = alloc_bytes(&mut self.gpu, n * GDN_DI * 4)?;
+        let gbeta = alloc_bytes(&mut self.gpu, n * GDN_HV * 4)?;
+        let galpha = alloc_bytes(&mut self.gpu, n * GDN_HV * 4)?;
+        let gh1 = alloc_bytes(&mut self.gpu, n * GDN_DI * 4)?;
         let partials = alloc_bytes(&mut self.gpu, N_FF * (N_EMBD / 128) * n * 4)?;
         let bb = P3Buf {
-            xb, xnorm, branch, qfull, kraw, vraw, gated, fg, fu, h1, partials,
+            xb, xnorm, branch, qfull, kraw, vraw, gated, fg, fu, h1,
+            gqkv, gz, gbeta, galpha, gh1, partials,
         };
 
         // upload the embedding tile
@@ -850,6 +950,11 @@ impl GDev {
         self.gpu.destroy_dev_buffer(bb.fg);
         self.gpu.destroy_dev_buffer(bb.fu);
         self.gpu.destroy_dev_buffer(bb.h1);
+        self.gpu.destroy_dev_buffer(bb.gqkv);
+        self.gpu.destroy_dev_buffer(bb.gz);
+        self.gpu.destroy_dev_buffer(bb.gbeta);
+        self.gpu.destroy_dev_buffer(bb.galpha);
+        self.gpu.destroy_dev_buffer(bb.gh1);
         self.gpu.destroy_dev_buffer(bb.partials);
         if timing {
             eprintln!("[gdev] prefill_batch n={n}: {:.1}ms", t_phase.elapsed().as_secs_f64() * 1e3);
@@ -872,6 +977,34 @@ impl GDev {
         };
         Ok((tof(&kb), tof(&vb)))
     }
+
+    /// Snapshot layer `il`'s GDN state (H_V transposed S x S matrices,
+    /// `GDN_HV * STATE_SIZE * STATE_SIZE` floats) back to the host, if it is a
+    /// recurrent layer (`None` for full-attention layers).
+    pub fn dump_state(&mut self, il: usize) -> Option<Vec<f32>> {
+        let s = self.state.get(il)?.as_ref()?;
+        let bytes = self.gpu.read_dev(s, s.len).ok()?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    }
+
+    /// Snapshot layer `il`'s conv cache (3 * GDN_CH floats, the last 3
+    /// pre-conv inputs per channel) back to the host, if it is a recurrent
+    /// layer (`None` for full-attention layers).
+    pub fn dump_conv(&mut self, il: usize) -> Option<Vec<f32>> {
+        let c = self.conv_cache.get(il)?.as_ref()?;
+        let bytes = self.gpu.read_dev(c, c.len).ok()?;
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|x| f32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+                .collect(),
+        )
+    }
 }
 
 /// N-wide device tiles + partials for the batched (P3) prefill.
@@ -886,5 +1019,10 @@ struct P3Buf {
     fg: DevBuf,     // [token][n_ff]
     fu: DevBuf,     // [token][n_ff]
     h1: DevBuf,     // [token][n_ff]
+    gqkv: DevBuf,   // GDN attn_qkv projection [token][gdn_ch]  (P4)
+    gz: DevBuf,     // GDN attn_gate projection [token][gdn_di] (P4)
+    gbeta: DevBuf,  // GDN ssm_beta projection [token][gdn_hv]  (P4)
+    galpha: DevBuf, // GDN ssm_alpha projection [token][gdn_hv] (P4)
+    gh1: DevBuf,    // GDN gated output pre-ssm_out [token][gdn_di] (P4)
     partials: DevBuf,
 }
