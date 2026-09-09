@@ -8,6 +8,7 @@ mod gguf;
 mod vk;
 mod gdn;
 mod kernels;
+mod prefill;
 mod rope;
 mod sampler;
 mod tokenizer;
