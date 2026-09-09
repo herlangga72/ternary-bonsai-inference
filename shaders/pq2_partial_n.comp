@@ -1,0 +1,89 @@
+#version 450
+// PQ2_0 matvec partial pass, N-column GEMM (P2 of notes/prefill-plan.md).
+//
+// Generalizes the single-vector `pq2_partial.comp` so that one work item,
+// which owns one 128-weight block of one weight row, computes N partial dot
+// products (one per activation column). The 34-byte block is fetched from
+// global memory once into registers (the wd[9] word loads below) and reused
+// across the N activation columns, so the weight stream is read once instead
+// of once per column: the whole point of batching prefill. The per-column
+// decode of code bytes happens against the register-resident words, never
+// against global memory, so the weight block is truly touched once.
+//
+// The activation tile is row-major `[column][feature]` (`x.data[t*ne0 + f]`,
+// token t = column t, matching prefill::Tile). Accumulation order is exactly
+// the single-vector kernel's: for each of the 32 code bytes add its 4 ternary
+// terms in feature order col, col+1, col+2, col+3, then scale once at the end.
+// For N=1 the produced partial is therefore bit-identical to the old kernel.
+//
+// Partials buffer layout: `partials[((row_local * nblocks) + block) * N + t]`
+// sized `n_rows * nblocks * N`. `pq2_rowsum_n.comp` reduces these per
+// (row, column).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer W { uint data[]; } w;
+layout(set = 0, binding = 1, std430) readonly buffer X { float data[]; } x;
+layout(set = 0, binding = 2, std430) buffer P { float data[]; } partials;
+layout(push_constant) uniform PC {
+    uint ne0;
+    uint base_row;
+    uint N;
+    uint nrows;
+} pc;
+uint u8b(uint j, uint rem, uint wd[9]) {
+    uint idx = (j + rem) >> 2;
+    uint shift = ((j + rem) & 3u) << 3;
+    return (wd[idx] >> shift) & 0xffu;
+}
+float half_to_float(uint h) {
+    uint sign = (h >> 15) & 1u; uint exp = (h >> 10) & 0x1fu; uint man = h & 0x3ffu;
+    uint bits;
+    if (exp == 0u) { if (man == 0u) { bits = sign << 31; } else {
+        int e = 127 - 15 + 1; uint m = man;
+        while ((m & 0x400u) == 0u) { m <<= 1; e -= 1; } m &= 0x3ffu;
+        bits = (sign << 31) | (uint(e) << 23) | (m << 13); } }
+    else if (exp == 0x1fu) { bits = (sign << 31) | 0x7f800000u | (man << 13); }
+    else { bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (man << 13); }
+    return uintBitsToFloat(bits);
+}
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint nblocks = (pc.ne0 + 127u) / 128u;
+    uint rowlocal = gid / nblocks;
+    uint block = gid % nblocks;
+    if (rowlocal >= pc.nrows) { return; }
+    uint row = rowlocal + pc.base_row;
+    uint rowbytes = nblocks * 34u;
+    uint blk_start = row * rowbytes + block * 34u;
+
+    uint sw = blk_start >> 2;
+    uint rem = blk_start & 3u; // byte offset inside first word
+    // 34 + rem <= 36 bytes -> words sw..sw+8
+    uint wd0 = w.data[sw];     uint wd1 = w.data[sw + 1u];
+    uint wd2 = w.data[sw + 2u]; uint wd3 = w.data[sw + 3u];
+    uint wd4 = w.data[sw + 4u]; uint wd5 = w.data[sw + 5u];
+    uint wd6 = w.data[sw + 6u]; uint wd7 = w.data[sw + 7u];
+    uint wd8 = w.data[sw + 8u];
+
+    uint wd[9];
+    wd[0] = wd0; wd[1] = wd1; wd[2] = wd2; wd[3] = wd3; wd[4] = wd4;
+    wd[5] = wd5; wd[6] = wd6; wd[7] = wd7; wd[8] = wd8;
+    float scale = half_to_float(u8b(0u, rem, wd) | (u8b(1u, rem, wd) << 8));
+    uint colbase = block * 128u;
+    uint pbase = (rowlocal * nblocks + block) * pc.N;
+
+    for (uint t = 0u; t < pc.N; ++t) {
+        uint xb = t * pc.ne0;
+        float acc = 0.0f;
+        for (uint k = 0u; k < 32u; ++k) {
+            uint cb = u8b(2u + k, rem, wd);
+            uint c0 = cb & 3u; uint c1 = (cb >> 2) & 3u;
+            uint c2 = (cb >> 4) & 3u; uint c3 = (cb >> 6) & 3u;
+            uint col = colbase + 4u * k;
+            acc += x.data[xb + col + 0u] * float(int(c0) - 1);
+            acc += x.data[xb + col + 1u] * float(int(c1) - 1);
+            acc += x.data[xb + col + 2u] * float(int(c2) - 1);
+            acc += x.data[xb + col + 3u] * float(int(c3) - 1);
+        }
+        partials.data[pbase + t] = acc * scale;
+    }
+}

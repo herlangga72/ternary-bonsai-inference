@@ -1,0 +1,38 @@
+#version 450
+// PQ2_0 matvec v3 reduce pass, N-column GEMM (P2 of notes/prefill-plan.md).
+//
+// One workgroup per weight row reduces the per-128-block partials for all N
+// activation columns. For each column t it performs exactly the reduction the
+// single-vector `pq2_rowsum.comp` does (per-lane strided accumulate over the
+// nblocks partials, then a 256-thread tree reduction in shared memory), so for
+// N=1 the produced y value is bit-identical to the old rowsum kernel.
+//
+// Partials layout (from pq2_partial_n.comp):
+//   partials[((row * nblocks) + block) * N + t]
+// Output y is the activation tile row-major `[column][row]` layout:
+//   y.data[t * n_rows + row]
+// matching prefill::Tile ([token][feature]) for the weight-row output.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer P { float data[]; } partials;
+layout(set = 0, binding = 2, std430) buffer Y { float data[]; } y;
+layout(push_constant) uniform PC { uint nblocks; uint N; uint nrows; } pc;
+shared float red[256];
+void main() {
+    uint row = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint rbase = row * pc.nblocks * pc.N;
+
+    for (uint t = 0u; t < pc.N; ++t) {
+        float acc = 0.0f;
+        for (uint i = lid; i < pc.nblocks; i += 256u) {
+            acc += partials.data[rbase + i * pc.N + t];
+        }
+        red[lid] = acc;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (lid < s) { red[lid] += red[lid + s]; }
+            barrier();
+        }
+        if (lid == 0u) { y.data[t * pc.nrows + row] = red[0]; }
+    }
+}

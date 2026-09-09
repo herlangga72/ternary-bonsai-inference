@@ -61,6 +61,15 @@ pub const PQ2_PARTIAL_SPV: &[u8] =
 pub const PQ2_ROWSUM_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum.spv"));
 
+/// SPIR-V for the N-column (batched) two-pass PQ2_0 GEMM
+/// (`shaders/pq2_partial_n.comp`, `shaders/pq2_rowsum_n.comp`), P2 of
+/// notes/prefill-plan.md. One weight block is read once and reused across N
+/// activation columns; N=1 is bit-identical to the single-vector pair above.
+pub const PQ2_PARTIAL_N_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_partial_n.spv"));
+pub const PQ2_ROWSUM_N_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum_n.spv"));
+
 /// SPIR-V for device arena ops (slice 1 of the full decode):
 /// residual add, fused q|gate split, KV append.
 pub const ADD_RESIDUAL_SPV: &[u8] =
@@ -990,6 +999,202 @@ impl Gpu {
             self.destroy_dev_buffer(w);
             self.destroy_dev_buffer(partials);
             Ok((dt, out))
+        }
+    }
+
+    /// Run the **N-column two-pass PQ2_0 GEMM** (P2 of notes/prefill-plan.md) as
+    /// a one-shot: `Y = W[base_row..base_row+n_rows] @ X` where the activation
+    /// tile `X` is N columns wide. `payload` is the tensor's contiguous weight
+    /// bytes (rows back to back, `row_bytes = ne0.div_ceil(128) * 34` each).
+    ///
+    /// Layouts (matching `prefill::Tile`):
+    /// * `x`: row-major `[column][feature]`, length `N * ne0` (`x[t*ne0 + f]`
+    ///   is column t, feature f).
+    /// * returns `y`: row-major `[column][row]`, length `N * n_rows`
+    ///   (`y[t*n_rows + r]` = dot of weight row `base_row + r` with column t).
+    ///
+    /// Each work item streams one 128-weight block of one row **once** and
+    /// computes N partial dot products from it (see `pq2_partial_n.comp`), then
+    /// `pq2_rowsum_n.comp` reduces one workgroup per row over all N columns. For
+    /// `N == 1` the result is bit-identical to the single-vector two-pass path
+    /// (`pq2_partial`/`pq2_rowsum`, e.g. `matvec_bench_atom`).
+    pub fn matvec_batch_n(
+        &mut self,
+        payload: &[u8],
+        ne0: usize,
+        base_row: u32,
+        n_rows: usize,
+        n_cols: usize,
+        x: &[f32],
+    ) -> Result<Vec<f32>, String> {
+        assert_eq!(x.len(), n_cols.saturating_mul(ne0));
+        assert!(n_cols >= 1);
+        self.ensure_kernel("pq2_partial_n", PQ2_PARTIAL_N_SPV)?;
+        self.ensure_kernel("pq2_rowsum_n", PQ2_ROWSUM_N_SPV)?;
+        let pipeline_p = *self
+            .kernels
+            .get("pq2_partial_n")
+            .ok_or("pq2_partial_n not registered")?;
+        let pipeline_r = *self
+            .kernels
+            .get("pq2_rowsum_n")
+            .ok_or("pq2_rowsum_n not registered")?;
+        let nblocks = ne0.div_ceil(128);
+        let n_partials = n_rows.saturating_mul(nblocks).max(1);
+        let groups_p = (n_partials as u32).div_ceil(256).max(1);
+        let groups_r = n_rows.max(1) as u32;
+
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let w = self.create_dev_buffer(payload.len(), usage)?;
+        self.upload(&w, payload)?;
+        let partial_len = n_partials.saturating_mul(n_cols).max(1) * 4;
+        let partials =
+            self.create_dev_buffer(partial_len, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        let x_len = n_cols.saturating_mul(ne0).max(1);
+        let mut x_host =
+            unsafe { self.create_host_buffer(x_len * 4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        let mut y_host = unsafe {
+            self.create_host_buffer(
+                n_cols.saturating_mul(n_rows).max(1) * 4,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )
+        }?;
+        let mut dummy =
+            unsafe { self.create_host_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER) }?;
+        unsafe {
+            x_host.data_mut().copy_from_slice(bytemuck_slice(x));
+            dummy.data_mut().fill(0);
+        }
+        let (pool_p, set_p) =
+            unsafe { self.make_set(w.buffer, x_host.buffer, partials.buffer) }?;
+        let (pool_r, set_r) =
+            unsafe { self.make_set(partials.buffer, dummy.buffer, y_host.buffer) }?;
+
+        let cb_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cb = unsafe { self.device.allocate_command_buffers(&cb_info) }
+            .map_err(|e| format!("matvec_batch_n: alloc: {e}"))?[0];
+
+        let pc_p = [ne0 as u32, base_row, n_cols as u32, n_rows as u32];
+        let pc_pb = unsafe {
+            std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+        };
+        let pc_r = [nblocks as u32, n_cols as u32, n_rows as u32];
+        let pc_rb = unsafe {
+            std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
+        };
+        let barrier_bufs = [
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(partials.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+            vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(y_host.buffer)
+                .offset(0)
+                .size(vk::WHOLE_SIZE),
+        ];
+
+        unsafe {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(cb, &begin)
+                .map_err(|e| format!("matvec_batch_n: begin: {e}"))?;
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline_p);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set_p],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pc_pb,
+            );
+            self.device.cmd_dispatch(cb, groups_p, 1, 1);
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier_bufs,
+                &[],
+            );
+            self.device
+                .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, pipeline_r);
+            self.device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[set_r],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                cb,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                pc_rb,
+            );
+            self.device.cmd_dispatch(cb, groups_r, 1, 1);
+            self.device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier_bufs,
+                &[],
+            );
+            self.device
+                .end_command_buffer(cb)
+                .map_err(|e| format!("matvec_batch_n: end: {e}"))?;
+            let fence = self
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| format!("matvec_batch_n: fence: {e}"))?;
+            let cbs = [cb];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            self.device
+                .queue_submit(self.queue, &[submit], fence)
+                .map_err(|e| format!("matvec_batch_n: submit: {e}"))?;
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| format!("matvec_batch_n: wait: {e}"))?;
+
+            self.device.destroy_fence(fence, None);
+            self.device.free_command_buffers(self.command_pool, &[cb]);
+            self.device.destroy_descriptor_pool(pool_p, None);
+            self.device.destroy_descriptor_pool(pool_r, None);
+
+            let out = y_host.data()[..n_cols.saturating_mul(n_rows).max(1) * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>();
+            self.destroy_host_buffer(x_host);
+            self.destroy_host_buffer(y_host);
+            self.destroy_host_buffer(dummy);
+            self.destroy_dev_buffer(w);
+            self.destroy_dev_buffer(partials);
+            Ok(out)
         }
     }
 
@@ -1962,6 +2167,46 @@ impl Gpu {
         };
         // rowsum only uses bindings 0 (partials) and 2 (y); bind y twice
         self.rec_dispatch("pq2_rowsum", partials, y, y, pc_rb, rows.max(1))
+    }
+
+    /// Record the **N-column two-pass PQ2_0 GEMM** (P2 of notes/prefill-plan.md)
+    /// into the current command buffer, mirroring `rec_matvec` but over `n_cols`
+    /// activation columns. `x` is a device tile `[column][feature]` (length
+    /// `n_cols * ne0`); `y` is the `[column][row]` output tile (length
+    /// `n_cols * rows`). `partials` must be sized `rows * (ne0/128) * n_cols`.
+    ///
+    /// This is the batched building block a future N-wide forward (P3+) records
+    /// per matvec; it is gated behind the batch path and never used by the
+    /// single-token decode path (`rec_matvec`), which stays untouched and exact.
+    /// For `n_cols == 1` it equals `rec_matvec` bit-for-bit (same kernels' N=1
+    /// output), so a caller can share one code path and pick N at record time.
+    pub fn rec_matvec_batch(
+        &mut self,
+        w: &DevBuf,
+        x: &DevBuf,
+        y: &DevBuf,
+        partials: &DevBuf,
+        ne0: u32,
+        base_row: u32,
+        rows: u32,
+        n_cols: u32,
+    ) -> Result<(), String> {
+        assert!(n_cols >= 1);
+        self.ensure_kernel("pq2_partial_n", PQ2_PARTIAL_N_SPV)?;
+        self.ensure_kernel("pq2_rowsum_n", PQ2_ROWSUM_N_SPV)?;
+        let nblocks = ne0.div_ceil(128);
+        let total = (rows as u64 * nblocks as u64 * n_cols as u64).max(1);
+        let groups = (total as u32).div_ceil(256).max(1);
+        let pc_p = [ne0, base_row, n_cols, rows];
+        let pc_pb = unsafe {
+            std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+        };
+        self.rec_dispatch("pq2_partial_n", w, x, partials, pc_pb, groups)?;
+        let pc_r = [nblocks, n_cols, rows];
+        let pc_rb = unsafe {
+            std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
+        };
+        self.rec_dispatch("pq2_rowsum_n", partials, y, y, pc_rb, rows.max(1))
     }
 
     /// End the token's command buffer, submit once and wait.
