@@ -89,8 +89,11 @@ fn main() {
     let t0 = Instant::now();
     let mut hidden = Vec::new();
 
-    // ---- prompt prefill: batched (P3-P5) by default, token loop fallback ----
-    let (batch_enabled, window) = gdev::batch_cfg();
+    // ---- prompt prefill: batched on discrete GPUs by default (P3-P5), token
+    // loop fallback. On a shared-bus APU the batched path is not faster than
+    // the token loop, so the default there is the token loop unless BONSAI_BATCH
+    // names an explicit window. ----
+    let (batch_enabled, window) = gdev::batch_cfg(dev.gpu.discrete);
     let use_batch = batch_enabled && toks.len() >= 2;
     if use_batch {
         // gather all N prompt embeddings into one tile, then run the batched

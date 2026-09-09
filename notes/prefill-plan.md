@@ -222,6 +222,13 @@ Time-to-first-token (prefill time), real model, RADV gfx902 APU:
 
 *token-loop time extrapolated at the measured ~1.25 s/token for this box.
 
+Because batching is not faster on this shared-bus APU, `bonsai-grun`'s default
+is now **device-aware** (`batch_cfg(discrete)`): on an APU the default is the
+token loop; batching is the default only on a discrete (dedicated-VRAM) GPU and
+is always available explicitly via `BONSAI_BATCH=<window>` (e.g. `=64`). On this
+gfx902: default took the token loop (21 tok / 26.0 s); `BONSAI_BATCH=64` took
+the batched path (21 tok / 34.8 s).
+
 **Conclusion: on the gfx902 this APU, batched prefill is correctness-equivalent
 but does not reduce time-to-first-token** - it is roughly equal at small N and
 ~1.6x slower at N=146. Reason (consistent with `notes/gpu-numbers.md`): the

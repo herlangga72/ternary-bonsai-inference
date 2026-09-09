@@ -50,22 +50,31 @@ fn n_ctx_env() -> usize {
 /// prompts are then split into several windows (P5).
 const DEFAULT_BATCH_WINDOW: usize = 64;
 
-/// Resolve the batched-prefill configuration from `BONSAI_BATCH`:
+/// Resolve the batched-prefill configuration from `BONSAI_BATCH`, given whether
+/// the compute device is a discrete (dedicated-VRAM) GPU.
+///
+/// Batching reads each weight block once across N prompt columns; it only pays
+/// off where decode is weight-bandwidth bound, i.e. on a discrete high-bandwidth
+/// GPU (e.g. the RX 7600). On a shared-bus APU prefill is small-op / launch
+/// bound, so the batched path is measured no faster than the sequential token
+/// loop (see `notes/prefill-plan.md` P6) and the default is the token loop.
+///
 /// * `"0"` or `"1"`  -> disabled (keep the sequential per-token loop);
-/// * unset or `"auto"` -> enabled with [`DEFAULT_BATCH_WINDOW`];
-/// * integer `>= 2`    -> enabled with that window width;
+/// * unset or `"auto"` -> enabled with [`DEFAULT_BATCH_WINDOW`] only on a
+///   discrete GPU, else disabled;
+/// * integer `>= 2`    -> enabled with that window width (explicit override);
 /// * anything else     -> disabled (fall back safely).
 ///
 /// Returns `(enabled, window_width)`.
-pub fn batch_cfg() -> (bool, usize) {
+pub fn batch_cfg(discrete: bool) -> (bool, usize) {
     match std::env::var("BONSAI_BATCH").ok().map(|v| v.trim().to_string()) {
         Some(v) if v == "0" || v == "1" => (false, 0),
-        Some(v) if v == "auto" => (true, DEFAULT_BATCH_WINDOW),
+        Some(v) if v == "auto" => (discrete, DEFAULT_BATCH_WINDOW),
         Some(v) => match v.parse::<usize>() {
             Ok(n) if n >= 2 => (true, n),
             _ => (false, 0), // junk or < 2 -> fall back safely
         },
-        None => (true, DEFAULT_BATCH_WINDOW), // default: replace the prompt loop
+        None => (discrete, DEFAULT_BATCH_WINDOW), // default follows the device
     }
 }
 
