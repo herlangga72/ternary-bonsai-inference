@@ -114,6 +114,27 @@ fn rec_add(gpu: &mut vk::Gpu, cur: &DevBuf, branch: &DevBuf) -> Result<(), Strin
     )
 }
 
+/// Record a device-to-device block copy (dst[dbase+i] = src[sbase+i]).
+fn rec_bcopy(
+    gpu: &mut vk::Gpu,
+    src: &DevBuf,
+    dst: &DevBuf,
+    sbase: usize,
+    dbase: usize,
+    len: usize,
+) -> Result<(), String> {
+    gpu.ensure_kernel("tile_copy", vk::TILE_COPY_SPV)?;
+    let pc = [len as u32, sbase as u32, dbase as u32];
+    gpu.rec_dispatch(
+        "tile_copy",
+        src,
+        src,
+        dst,
+        pc_u32(&pc),
+        (len as u32).div_ceil(256).max(1),
+    )
+}
+
 fn rec_elem(
     gpu: &mut vk::Gpu,
     a: &DevBuf,
@@ -553,4 +574,317 @@ impl GDev {
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     }
+
+    // ------------------------------------------------------------------
+    // P3 - batched full-attention prefill over an N-token batch.
+    //
+    // Processes the N prompt positions layer-by-layer (layer-major), which is
+    // numerically equivalent to the sequential token loop: each position's
+    // running activation is kept in an N-wide `[token][n_embd]` tile and every
+    // layer's full-attention projections + the FFN run through the P2
+    // N-column GEMM (weight stream read once), while the recurrent (GDN)
+    // layers - whose state is sequential across positions - run their existing
+    // per-token path (P4 batches them). The post-prefill KV / conv / state
+    // buffers are exactly what the token loop leaves behind, so `forward_token`
+    // can append at pos = N.
+    // ------------------------------------------------------------------
+    fn reset_sequence(&mut self) -> Result<(), String> {
+        let kz = vec![0u8; self.n_ctx * KV_STRIDE * 4];
+        let sz = vec![0u8; GDN_STATE_ELEMS * 4];
+        let cz = vec![0u8; 3 * GDN_CH * 4];
+        for il in 0..self.cfg.n_layer {
+            if let Some(k) = &self.kcache[il] { self.gpu.upload(k, &kz)?; }
+            if let Some(v) = &self.vcache[il] { self.gpu.upload(v, &kz)?; }
+            if let Some(c) = &self.conv_cache[il] { self.gpu.upload(c, &cz)?; }
+            if let Some(s) = &self.state[il] { self.gpu.upload(s, &sz)?; }
+        }
+        Ok(())
+    }
+
+    /// Batched full-attention layer for all N positions (P3).
+    fn record_battn(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+        let cur = &bb.xb;
+        let xnorm = &bb.xnorm;
+        let partials = &bb.partials;
+
+        // attn_norm over the whole tile -> xnorm tile [token][n_embd]
+        let (wn, _, _) = self.tw(&format!("blk.{il}.attn_norm.weight"))?;
+        rec_norm_rows(&mut self.gpu, cur, &wn, xnorm, n * N_EMBD, N_EMBD, 0)?;
+
+        // wq/wk/wv over the N columns.
+        for (suf, dst) in [
+            ("attn_q.weight", &bb.qfull),
+            ("attn_k.weight", &bb.kraw),
+            ("attn_v.weight", &bb.vraw),
+        ] {
+            let (w, ne0, rows) = self.tw(&format!("blk.{il}.{suf}"))?;
+            self.gpu.rec_matvec_batch(
+                &w, xnorm, dst, partials, ne0 as u32, 0, rows as u32, n as u32,
+            )?;
+        }
+        let (wq, _, _) = self.tw(&format!("blk.{il}.attn_q_norm.weight"))?;
+        let (wk, _, _) = self.tw(&format!("blk.{il}.attn_k_norm.weight"))?;
+
+        // Per-position small ops (split, head norm, rope, KV store, causal
+        // attention, gate). These reuse the exact single-stream kernels so each
+        // position is bit-identical to the token-loop path.
+        for p in 0..n {
+            // bring this position's projection rows into the dense buffers
+            rec_bcopy(&mut self.gpu, &bb.qfull, &self.qfull, p * 2 * N_HEAD * HEAD_D, 0, 2 * N_HEAD * HEAD_D)?;
+            rec_bcopy(&mut self.gpu, &bb.kraw, &self.kraw, p * N_KV * HEAD_D, 0, N_KV * HEAD_D)?;
+            rec_bcopy(&mut self.gpu, &bb.vraw, &self.vraw, p * N_KV * HEAD_D, 0, N_KV * HEAD_D)?;
+
+            self.gpu.ensure_kernel("split_qgate", vk::SPLIT_QGATE_SPV)?;
+            self.gpu.rec_dispatch(
+                "split_qgate",
+                &self.qfull,
+                &self.q,
+                &self.gate,
+                pc_u32(&[HEAD_D as u32, 0]),
+                (N_HEAD * HEAD_D / 256) as u32,
+            )?;
+            rec_norm_rows(&mut self.gpu, &self.q, &wq, &self.qn, N_HEAD * HEAD_D, HEAD_D, 0)?;
+            rec_norm_rows(&mut self.gpu, &self.kraw, &wk, &self.kn, N_KV * HEAD_D, HEAD_D, 0)?;
+            self.gpu.ensure_kernel("rope_imrope", vk::ROPE_IMROPE_SPV)?;
+            let pc_rope = [
+                HEAD_D as u32,
+                N_ROT as u32,
+                p as u32,
+                FREQ_BASE.to_bits(),
+                SECTIONS[0],
+                SECTIONS[1],
+                SECTIONS[2],
+                SECTIONS[3],
+            ];
+            self.gpu.rec_dispatch("rope_imrope", &self.qn, &self.qn, &self.qn, pc_u32(&pc_rope), N_HEAD as u32)?;
+            self.gpu.rec_dispatch("rope_imrope", &self.kn, &self.kn, &self.kn, pc_u32(&pc_rope), N_KV as u32)?;
+
+            self.gpu.ensure_kernel("kv_store", vk::KV_STORE_SPV)?;
+            let pc_kv = [p as u32, KV_STRIDE as u32];
+            self.gpu.rec_dispatch(
+                "kv_store",
+                &self.kn,
+                self.kcache[il].as_ref().unwrap(),
+                self.kcache[il].as_ref().unwrap(),
+                pc_u32(&pc_kv),
+                KV_STRIDE.div_ceil(256) as u32,
+            )?;
+            self.gpu.rec_dispatch(
+                "kv_store",
+                &self.vraw,
+                self.vcache[il].as_ref().unwrap(),
+                self.vcache[il].as_ref().unwrap(),
+                pc_u32(&pc_kv),
+                KV_STRIDE.div_ceil(256) as u32,
+            )?;
+
+            let n_pos = p + 1;
+            let pc_att = [
+                N_HEAD as u32,
+                n_pos as u32,
+                HEAD_D as u32,
+                KV_STRIDE as u32,
+                (1.0 / (HEAD_D as f32).sqrt()).to_bits(),
+                0,
+            ];
+            self.gpu.ensure_kernel("attn_scores", vk::ATTN_SCORES_SPV)?;
+            self.gpu.rec_dispatch("attn_scores", &self.qn, self.kcache[il].as_ref().unwrap(), &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
+            self.gpu.ensure_kernel("softmax_inplace", vk::SOFTMAX_INPLACE_SPV)?;
+            self.gpu.rec_dispatch("softmax_inplace", &self.scores, &self.scores, &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
+            self.gpu.ensure_kernel("attn_out", vk::ATTN_OUT_SPV)?;
+            self.gpu.rec_dispatch("attn_out", &self.scores, self.vcache[il].as_ref().unwrap(), &self.attn_h, pc_u32(&pc_att), N_HEAD as u32)?;
+
+            // gated out = sigmoid(gate) * attn_h -> qfull[0..nhead*hd]
+            rec_elem(&mut self.gpu, &self.gate, &self.attn_h, &self.qfull, N_HEAD * HEAD_D, 4)?;
+            rec_bcopy(&mut self.gpu, &self.qfull, &bb.gated, 0, p * N_HEAD * HEAD_D, N_HEAD * HEAD_D)?;
+        }
+
+        // wo over the N columns -> branch tile
+        let (wout, ne0, rows) = self.tw(&format!("blk.{il}.attn_output.weight"))?;
+        self.gpu.rec_matvec_batch(
+            &wout, &bb.gated, &bb.branch, partials, ne0 as u32, 0, rows as u32, n as u32,
+        )?;
+        // residual: xb += branch (flat over the tile)
+        self.gpu.ensure_kernel("add_residual", vk::ADD_RESIDUAL_SPV)?;
+        self.gpu.rec_dispatch(
+            "add_residual",
+            &bb.xb,
+            &bb.branch,
+            &bb.xb,
+            pc_u32(&[N_EMBD as u32 * n as u32]),
+            (N_EMBD * n).div_ceil(256) as u32,
+        )
+    }
+
+    /// Batched FFN for all N positions (P3).
+    fn record_bffn(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+        let xnorm = &bb.xnorm;
+        let partials = &bb.partials;
+        let (wp, _, _) = self.tw(&format!("blk.{il}.post_attention_norm.weight"))?;
+        rec_norm_rows(&mut self.gpu, &bb.xb, &wp, xnorm, n * N_EMBD, N_EMBD, 0)?;
+        for (suf, dst) in [("ffn_gate.weight", &bb.fg), ("ffn_up.weight", &bb.fu)] {
+            let (w, ne0, rows) = self.tw(&format!("blk.{il}.{suf}"))?;
+            self.gpu.rec_matvec_batch(
+                &w, xnorm, dst, partials, ne0 as u32, 0, rows as u32, n as u32,
+            )?;
+        }
+        self.gpu.ensure_kernel("elem", vk::ELEM_SPV)?;
+        self.gpu.rec_dispatch(
+            "elem",
+            &bb.fg,
+            &bb.fu,
+            &bb.h1,
+            pc_u32(&[(N_FF * n) as u32, 3]),
+            (N_FF * n).div_ceil(256) as u32,
+        )?;
+        let (wd, ne0, rows) = self.tw(&format!("blk.{il}.ffn_down.weight"))?;
+        self.gpu.rec_matvec_batch(
+            &wd, &bb.h1, &bb.branch, partials, ne0 as u32, 0, rows as u32, n as u32,
+        )?;
+        self.gpu.ensure_kernel("add_residual", vk::ADD_RESIDUAL_SPV)?;
+        self.gpu.rec_dispatch(
+            "add_residual",
+            &bb.xb,
+            &bb.branch,
+            &bb.xb,
+            pc_u32(&[(N_EMBD * n) as u32]),
+            (N_EMBD * n).div_ceil(256) as u32,
+        )
+    }
+
+    /// Recurrent (GDN) layer over all N positions: run the existing per-token
+    /// path sequentially (state recurrence across positions is P4's batching
+    /// target), feeding each position's tile row through `rec_gdn_layer`.
+    fn record_bgdn(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+        for p in 0..n {
+            // tile row p -> cur (dense single buffer rec_gdn_layer consumes)
+            rec_bcopy(&mut self.gpu, &bb.xb, &self.cur, p * N_EMBD, 0, N_EMBD)?;
+            self.rec_gdn_layer(il)?;
+            // cur (residual added in place) -> tile row p
+            rec_bcopy(&mut self.gpu, &self.cur, &bb.xb, 0, p * N_EMBD, N_EMBD)?;
+        }
+        Ok(())
+    }
+
+    /// Run one layer of the batched prefill (attention + FFN) inside a single
+    /// recorded command buffer, updating the N-wide tile in `bb`.
+    fn pre_layer(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+        self.gpu.rec_begin()?;
+        if self.cfg.is_full_attention(il) {
+            self.record_battn(il, n, bb)?;
+        } else {
+            self.record_bgdn(il, n, bb)?;
+        }
+        self.record_bffn(il, n, bb)?;
+        self.gpu.rec_end_submit()
+    }
+
+    /// Batched prefill of `n` prompt embeddings (each `N_EMBD` floats, one per
+    /// prompt position in order). Returns the output-normalized hidden tile
+    /// (`n * N_EMBD` floats, `[token][n_embd]`). Recurrent layers run their
+    /// existing per-token path; full-attention projections, attention, KV
+    /// stores and all FFN GEMMs run across the N columns. KV / conv / state
+    /// caches are left exactly as the sequential token loop leaves them, so
+    /// `forward_token(pos = n, ...)` can append the first generated token.
+    pub fn prefill_batch(&mut self, embeds: &[f32], n: usize) -> Result<Vec<f32>, String> {
+        if n < 1 {
+            return Err("prefill_batch: empty batch".into());
+        }
+        if n > self.n_ctx {
+            return Err(format!(
+                "prefill_batch: batch {n} exceeds context {}/{} (raise BONSAI_CTX)",
+                self.n_ctx, self.n_ctx
+            ));
+        }
+        let need = n * N_EMBD;
+        if embeds.len() != need {
+            return Err(format!("prefill_batch: expected {need} embeddings, got {}", embeds.len()));
+        }
+        let timing = std::env::var("GDEV_TIME").map(|v| v == "1").unwrap_or(false);
+        let t_phase = std::time::Instant::now();
+        self.reset_sequence()?;
+
+        // N-wide activation tiles + a partials buffer sized for the largest
+        // matvec (N_FF * (N_EMBD/128) partials per column).
+        let xb = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
+        let xnorm = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
+        let branch = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
+        let qfull = alloc_bytes(&mut self.gpu, n * 2 * N_HEAD * HEAD_D * 4)?;
+        let kraw = alloc_bytes(&mut self.gpu, n * N_KV * HEAD_D * 4)?;
+        let vraw = alloc_bytes(&mut self.gpu, n * N_KV * HEAD_D * 4)?;
+        let gated = alloc_bytes(&mut self.gpu, n * N_HEAD * HEAD_D * 4)?;
+        let fg = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
+        let fu = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
+        let h1 = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
+        let partials = alloc_bytes(&mut self.gpu, N_FF * (N_EMBD / 128) * n * 4)?;
+        let bb = P3Buf {
+            xb, xnorm, branch, qfull, kraw, vraw, gated, fg, fu, h1, partials,
+        };
+
+        // upload the embedding tile
+        self.gpu.upload(&bb.xb, f32_bytes(embeds))?;
+
+        let r = (|| -> Result<Vec<f32>, String> {
+            for il in 0..self.cfg.n_layer {
+                self.pre_layer(il, n, &bb)?;
+            }
+            // output norm over the whole tile -> hidden rows, then read back.
+            let (wout, _, _) = self.tw("output_norm.weight")?;
+            self.gpu.rec_begin()?;
+            rec_norm_rows(&mut self.gpu, &bb.xb, &wout, &bb.xnorm, n * N_EMBD, N_EMBD, 0)?;
+            self.gpu.rec_end_submit()?;
+            let bytes = self.gpu.read_dev(&bb.xnorm, n * N_EMBD * 4)?;
+            Ok(bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        })();
+
+        self.gpu.destroy_dev_buffer(bb.xb);
+        self.gpu.destroy_dev_buffer(bb.xnorm);
+        self.gpu.destroy_dev_buffer(bb.branch);
+        self.gpu.destroy_dev_buffer(bb.qfull);
+        self.gpu.destroy_dev_buffer(bb.kraw);
+        self.gpu.destroy_dev_buffer(bb.vraw);
+        self.gpu.destroy_dev_buffer(bb.gated);
+        self.gpu.destroy_dev_buffer(bb.fg);
+        self.gpu.destroy_dev_buffer(bb.fu);
+        self.gpu.destroy_dev_buffer(bb.h1);
+        self.gpu.destroy_dev_buffer(bb.partials);
+        if timing {
+            eprintln!("[gdev] prefill_batch n={n}: {:.1}ms", t_phase.elapsed().as_secs_f64() * 1e3);
+        }
+        r
+    }
+
+    /// Snapshot layer `il`'s KV caches for positions `0..n_pos`
+    /// (k then v, `n_pos * KV_STRIDE` floats each) back to the host.
+    pub fn dump_kv(&mut self, il: usize, n_pos: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let k = self.kcache.get(il).and_then(|o| o.as_ref()).ok_or("no kv")?;
+        let v = self.vcache[il].as_ref().unwrap();
+        let want = (n_pos * KV_STRIDE).min(k.len / 4) * 4;
+        let kb = self.gpu.read_dev(k, want)?;
+        let vb = self.gpu.read_dev(v, want)?;
+        let tof = |b: &[u8]| {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>()
+        };
+        Ok((tof(&kb), tof(&vb)))
+    }
+}
+
+/// N-wide device tiles + partials for the batched (P3) prefill.
+struct P3Buf {
+    xb: DevBuf,     // running activation [token][n_embd]
+    xnorm: DevBuf,  // rms scratch [token][n_embd]
+    branch: DevBuf, // layer output [token][n_embd]
+    qfull: DevBuf,  // [token][2*nhead*hd]
+    kraw: DevBuf,   // [token][n_kv*hd]
+    vraw: DevBuf,   // [token][n_kv*hd]
+    gated: DevBuf,  // [token][nhead*hd]
+    fg: DevBuf,     // [token][n_ff]
+    fu: DevBuf,     // [token][n_ff]
+    h1: DevBuf,     // [token][n_ff]
+    partials: DevBuf,
 }

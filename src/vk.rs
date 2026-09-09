@@ -79,6 +79,11 @@ pub const SPLIT_QGATE_SPV: &[u8] =
 pub const KV_STORE_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/kv_store.spv"));
 
+/// SPIR-V for a device-to-device row copy used by the batched (P3) prefill
+/// driver (`shaders/tile_copy.comp`): dst[dbase+i] = src[sbase+i].
+pub const TILE_COPY_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/tile_copy.spv"));
+
 /// SPIR-V for recurrent-layer kernels (conv1d+silu, l2 in place, gdn prep).
 pub const CONV1D_SILU_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/conv1d_silu.spv"));

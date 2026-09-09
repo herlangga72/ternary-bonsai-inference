@@ -1,0 +1,16 @@
+#version 450
+// Device-to-device block copy used by the batched (P3) prefill driver to move
+// one row of an N-wide activation tile between a tile buffer and the dense
+// per-token buffers that the existing single-stream kernels consume.
+//
+// Bindings: 0 = src, 1 = unused (aliased to src), 2 = dst.
+// Push: { len, src_base, dst_base } (element offsets into the two buffers).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer S { float data[]; } s;
+layout(set = 0, binding = 2, std430) buffer D { float data[]; } d;
+layout(push_constant) uniform PC { uint len; uint sbase; uint dbase; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.len) { return; }
+    d.data[pc.dbase + i] = s.data[pc.sbase + i];
+}
