@@ -21,3 +21,18 @@ Interpretation:
 - Remaining iGPU levers (measured small): descriptor-set churn, per-op
   barriers, small-op dispatch overhead. Hetero CPU+GPU row-splitting would
   only help until the shared bus saturates; not worth the complexity here.
+
+## Batched prefill (P1-P5) - measured 2026-09-09, gfx902
+
+Correct batched-prefill engine landed (commits 3ff0bec..1a34188): projections and
+FFN read each weight block once per layer per window over N columns (N-column
+two-pass PQ2 GEMM), all 64 layers batched, windowed prefill replaces the token
+loop in bonsai-grun; greedy continuation identical to the token loop (K=8).
+
+Time-to-first-token (prefill) on this APU is NOT reduced - batched is ~equal at
+N=11/17 and ~1.6x slower at N=146 (299 s vs ~183 s token loop). This box decodes
+at ~5 GB/s of an 18 GB/s shared bus: it is small-op/launch bound, not
+weight-bandwidth bound, so removing weight re-reads does not cut the dominant
+per-position sequential attention/GDN cost. The weight-read-once win needs the
+RX 7600 (288 GB/s dedicated VRAM) where decode is bandwidth-bound; unvalidated
+here.

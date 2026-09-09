@@ -197,10 +197,54 @@ Conventions to preserve:
 - **Small prompts** may not repay batching (fixed cost); the fallback keeps
   them on the token loop.
 
-## Exit criteria
+## Implementation status (2026-09-09) - committed on master
 
-Batched prefill replaces the token loop in `bonsai-grun`/`bonsai-run`: a
-~150-token prompt reaches its first generated token in roughly a single
-full-model pass on the target device (windowed), golden qa/code still greedy
-8160, and generation after prefill is greedy-identical to the current engine.
+| phase | commit | what landed | verified on gfx902 |
+| --- | --- | --- | --- |
+| P1 | `3ff0bec` | `src/prefill.rs` N-wide Tile + `batch_embed`, `bonsai-batch` CPU reference; gated | embed gather + ref hidden bit-exact |
+| P2 | `3a69d8b` | `pq2_partial_n`/`pq2_rowsum_n` N-column two-pass GEMM (`rec_matvec_batch`), `bonsai-batchgemm` | N=1 bit-identical to old matvec; N=8 <= 3.3e-7 rel vs CPU |
+| P3 | `5ee8e58` | `GDev::prefill_batch` batched full-attention layers + FFN over N; `bonsai-bprefill` | KV/hidden <= ~5e-4 rel, 0 > 1e-3; greedy equal |
+| P4 | `2249a1d` | batched GDN projections/conv over N, sequential per-position recurrence (all 64 layers batched) | state/conv <= ~5e-4 rel; greedy equal |
+| P5 | `1a34188` | `prefill_batch_windowed` + `batch_cfg`, replaces per-token prompt loop in `bonsai-grun`; `bonsai-gprefill` end-to-end | greedy continuation equal token loop K=8, qa 248068 / code 7734 |
+
+`cargo build --release` and `cargo test --release` are green at every step; the
+single-stream decode path used for generation is untouched throughout.
+
+## P6 measured result (2026-09-09, gfx902 iGPU) - batched is NOT faster here
+
+Time-to-first-token (prefill time), real model, RADV gfx902 APU:
+
+| prompt (tokens) | token loop | batched | ratio |
+| --- | --- | --- | --- |
+| qa (11) | 13.8 s | 14.4 s | 1.04x |
+| code (17) | 21.1 s | 24.0 s | 1.14x |
+| long (146) | ~183 s* | 299.3 s | ~1.6x |
+
+*token-loop time extrapolated at the measured ~1.25 s/token for this box.
+
+**Conclusion: on the gfx902 this APU, batched prefill is correctness-equivalent
+but does not reduce time-to-first-token** - it is roughly equal at small N and
+~1.6x slower at N=146. Reason (consistent with `notes/gpu-numbers.md`): the
+iGPU decodes at only ~5 GB/s of an 18 GB/s shared bus, i.e. it is small-op /
+launch bound, NOT weight-bandwidth bound. Batching only removes the per-token
+weight re-read; the per-position causal-attention and GDN recurrent work still
+run sequentially per position and dominate on this hardware, and the windowed
+batch adds tile-copy + per-layer-submit overhead on top.
+
+The weight-read-once optimization is designed to pay off where decode is
+weight-bandwidth bound - the discrete RX 7600 (288 GB/s dedicated VRAM, decode
+~0.03-0.05 s/token is ~7.1 GB/288 GB/s bandwidth-limited). That GPU is not
+installed here, so the projected speedup is **unvalidated on this box**.
+Remaining work to claim the speedup: install the RX 7600 and measure; if the
+sequential per-position GDN/attention cost still dominates there, batch the
+causal attention over N (real prefill GEMM) and add a chunked parallel scan for
+the GDN recurrence.
+
+## Exit criteria (revised)
+
+- [x] Batched prefill replaces the token loop in `bonsai-grun`; golden qa/code
+  greedy-first-token equal; generation after prefill greedy-identical to the
+  token loop (K=8) on gfx902.
+- [ ] A ~150-token prompt reaches its first generated token in roughly a single
+  full-model pass **on the RX 7600** (not measurable on this shared-bus iGPU).
 Numbers recorded in this doc and `notes/gpu-numbers.md`.
