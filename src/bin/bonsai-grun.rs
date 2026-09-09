@@ -22,6 +22,8 @@ mod vk;
 mod forward;
 #[path = "../gdev.rs"]
 mod gdev;
+#[path = "../prefill.rs"]
+mod prefill;
 
 use std::io::{Read, Write};
 use std::process::exit;
@@ -86,12 +88,39 @@ fn main() {
 
     let t0 = Instant::now();
     let mut hidden = Vec::new();
-    for (pos, &tok) in toks.iter().enumerate() {
-        let emb = dec.w.row_f32("token_embd.weight", tok as u64).expect("embed");
-        hidden = dev.forward_token(pos, &emb).expect("prefill");
+
+    // ---- prompt prefill: batched (P3-P5) by default, token loop fallback ----
+    let (batch_enabled, window) = gdev::batch_cfg();
+    let use_batch = batch_enabled && toks.len() >= 2;
+    if use_batch {
+        // gather all N prompt embeddings into one tile, then run the batched
+        // 64-layer prefill (windowed if the prompt exceeds `window`) in a
+        // single call. Returns the output-norm hidden of the final window; its
+        // last row is position N-1.
+        let tile = prefill::batch_embed(&mut dec.w, &toks).expect("batch embed");
+        let n_feat = tile.n_feat();
+        let n_tok = toks.len();
+        let hidden_tile = dev
+            .prefill_batch_windowed(tile.as_slice(), n_tok, window)
+            .expect("batched prefill");
+        let last = hidden_tile.len() / n_feat;
+        hidden = hidden_tile[(last - 1) * n_feat..last * n_feat].to_vec();
+        println!(
+            "prefill done in {:.1}s via BATCHED prefill ({} tokens, window {window})",
+            t0.elapsed().as_secs_f32(),
+            n_tok
+        );
+    } else {
+        for (pos, &tok) in toks.iter().enumerate() {
+            let emb = dec.w.row_f32("token_embd.weight", tok as u64).expect("embed");
+            hidden = dev.forward_token(pos, &emb).expect("prefill");
+        }
+        let prefill = t0.elapsed().as_secs_f32();
+        println!(
+            "prefill done in {prefill:.1}s via token loop ({:.2} s/tok)",
+            prefill / toks.len() as f32
+        );
     }
-    let prefill = t0.elapsed().as_secs_f32();
-    println!("prefill done in {prefill:.1}s ({:.2} s/tok)", prefill / toks.len() as f32);
 
     let mut logits = dec.head_logits(&hidden).expect("head");
     let mut stdout = std::io::stdout();

@@ -44,6 +44,38 @@ fn n_ctx_env() -> usize {
         .unwrap_or(N_CTX_DEFAULT)
 }
 
+/// Default prefill window width (prompt columns processed per batched window)
+/// when batching is enabled but `BONSAI_BATCH` does not name a width. Kept
+/// modest so the per-window activation/partial buffers stay small; very long
+/// prompts are then split into several windows (P5).
+const DEFAULT_BATCH_WINDOW: usize = 64;
+
+/// Resolve the batched-prefill configuration from `BONSAI_BATCH`:
+/// * `"0"` or `"1"`  -> disabled (keep the sequential per-token loop);
+/// * unset or `"auto"` -> enabled with [`DEFAULT_BATCH_WINDOW`];
+/// * integer `>= 2`    -> enabled with that window width;
+/// * anything else     -> disabled (fall back safely).
+///
+/// Returns `(enabled, window_width)`.
+pub fn batch_cfg() -> (bool, usize) {
+    match std::env::var("BONSAI_BATCH").ok().map(|v| v.trim().to_string()) {
+        Some(v) if v == "0" || v == "1" => (false, 0),
+        Some(v) if v == "auto" => (true, DEFAULT_BATCH_WINDOW),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n >= 2 => (true, n),
+            _ => (false, 0), // junk or < 2 -> fall back safely
+        },
+        None => (true, DEFAULT_BATCH_WINDOW), // default: replace the prompt loop
+    }
+}
+
+/// Whether the batched-prefill path should be used for a prompt of `n` tokens
+/// (batch on and the batch is usable: more than one position). `window` is the
+/// resolved column width from [`batch_cfg`].
+pub fn prefill_batch_usable(n: usize, enabled: bool, _window: usize) -> bool {
+    enabled && n >= 2
+}
+
 fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
@@ -602,8 +634,18 @@ impl GDev {
         Ok(())
     }
 
-    /// Batched full-attention layer for all N positions (P3).
-    fn record_battn(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+    /// Batched full-attention layer for all N positions (P3). Positions are the
+    /// window-local range `[pos_base, pos_base + n)` (absolute sequence
+    /// positions, appended to any KV/conv/state already present below `pos_base`
+    /// from earlier windows). With `pos_base == 0` this is exactly the 
+    /// single-batch behaviour of P3.
+    fn record_battn(
+        &mut self,
+        il: usize,
+        n: usize,
+        pos_base: usize,
+        bb: &P3Buf,
+    ) -> Result<(), String> {
         let cur = &bb.xb;
         let xnorm = &bb.xnorm;
         let partials = &bb.partials;
@@ -630,6 +672,7 @@ impl GDev {
         // attention, gate). These reuse the exact single-stream kernels so each
         // position is bit-identical to the token-loop path.
         for p in 0..n {
+            let pos = pos_base + p; // absolute sequence position
             // bring this position's projection rows into the dense buffers
             rec_bcopy(&mut self.gpu, &bb.qfull, &self.qfull, p * 2 * N_HEAD * HEAD_D, 0, 2 * N_HEAD * HEAD_D)?;
             rec_bcopy(&mut self.gpu, &bb.kraw, &self.kraw, p * N_KV * HEAD_D, 0, N_KV * HEAD_D)?;
@@ -650,7 +693,7 @@ impl GDev {
             let pc_rope = [
                 HEAD_D as u32,
                 N_ROT as u32,
-                p as u32,
+                pos as u32,
                 FREQ_BASE.to_bits(),
                 SECTIONS[0],
                 SECTIONS[1],
@@ -661,7 +704,7 @@ impl GDev {
             self.gpu.rec_dispatch("rope_imrope", &self.kn, &self.kn, &self.kn, pc_u32(&pc_rope), N_KV as u32)?;
 
             self.gpu.ensure_kernel("kv_store", vk::KV_STORE_SPV)?;
-            let pc_kv = [p as u32, KV_STRIDE as u32];
+            let pc_kv = [pos as u32, KV_STRIDE as u32];
             self.gpu.rec_dispatch(
                 "kv_store",
                 &self.kn,
@@ -679,7 +722,7 @@ impl GDev {
                 KV_STRIDE.div_ceil(256) as u32,
             )?;
 
-            let n_pos = p + 1;
+            let n_pos = pos + 1;
             let pc_att = [
                 N_HEAD as u32,
                 n_pos as u32,
@@ -858,16 +901,84 @@ impl GDev {
     }
 
     /// Run one layer of the batched prefill (attention + FFN) inside a single
-    /// recorded command buffer, updating the N-wide tile in `bb`.
-    fn pre_layer(&mut self, il: usize, n: usize, bb: &P3Buf) -> Result<(), String> {
+    /// recorded command buffer, updating the N-wide tile in `bb`. The `n`
+    /// positions are the absolute range `[pos_base, pos_base + n)`.
+    fn pre_layer(&mut self, il: usize, n: usize, pos_base: usize, bb: &P3Buf) -> Result<(), String> {
         self.gpu.rec_begin()?;
         if self.cfg.is_full_attention(il) {
-            self.record_battn(il, n, bb)?;
+            self.record_battn(il, n, pos_base, bb)?;
         } else {
             self.record_bgdn(il, n, bb)?;
         }
         self.record_bffn(il, n, bb)?;
         self.gpu.rec_end_submit()
+    }
+
+    /// Allocate the N-wide device tiles + partials used by one batched prefill
+    /// pass (sized for up to `w` columns). The partials buffer is sized for the
+    /// largest matvec (`N_FF * (N_EMBD/128)` partials per column).
+    fn alloc_bb(gpu: &mut vk::Gpu, w: usize) -> Result<P3Buf, String> {
+        let xb = alloc_bytes(gpu, w * N_EMBD * 4)?;
+        let xnorm = alloc_bytes(gpu, w * N_EMBD * 4)?;
+        let branch = alloc_bytes(gpu, w * N_EMBD * 4)?;
+        let qfull = alloc_bytes(gpu, w * 2 * N_HEAD * HEAD_D * 4)?;
+        let kraw = alloc_bytes(gpu, w * N_KV * HEAD_D * 4)?;
+        let vraw = alloc_bytes(gpu, w * N_KV * HEAD_D * 4)?;
+        let gated = alloc_bytes(gpu, w * N_HEAD * HEAD_D * 4)?;
+        let fg = alloc_bytes(gpu, w * N_FF * 4)?;
+        let fu = alloc_bytes(gpu, w * N_FF * 4)?;
+        let h1 = alloc_bytes(gpu, w * N_FF * 4)?;
+        let gqkv = alloc_bytes(gpu, w * GDN_CH * 4)?;
+        let gz = alloc_bytes(gpu, w * GDN_DI * 4)?;
+        let gbeta = alloc_bytes(gpu, w * GDN_HV * 4)?;
+        let galpha = alloc_bytes(gpu, w * GDN_HV * 4)?;
+        let gh1 = alloc_bytes(gpu, w * GDN_DI * 4)?;
+        let partials = alloc_bytes(gpu, N_FF * (N_EMBD / 128) * w * 4)?;
+        Ok(P3Buf {
+            xb, xnorm, branch, qfull, kraw, vraw, gated, fg, fu, h1,
+            gqkv, gz, gbeta, galpha, gh1, partials,
+        })
+    }
+
+    fn destroy_bb(gpu: &mut vk::Gpu, bb: P3Buf) {
+        gpu.destroy_dev_buffer(bb.xb);
+        gpu.destroy_dev_buffer(bb.xnorm);
+        gpu.destroy_dev_buffer(bb.branch);
+        gpu.destroy_dev_buffer(bb.qfull);
+        gpu.destroy_dev_buffer(bb.kraw);
+        gpu.destroy_dev_buffer(bb.vraw);
+        gpu.destroy_dev_buffer(bb.gated);
+        gpu.destroy_dev_buffer(bb.fg);
+        gpu.destroy_dev_buffer(bb.fu);
+        gpu.destroy_dev_buffer(bb.h1);
+        gpu.destroy_dev_buffer(bb.gqkv);
+        gpu.destroy_dev_buffer(bb.gz);
+        gpu.destroy_dev_buffer(bb.gbeta);
+        gpu.destroy_dev_buffer(bb.galpha);
+        gpu.destroy_dev_buffer(bb.gh1);
+        gpu.destroy_dev_buffer(bb.partials);
+    }
+
+    /// Run the batched 64-layer forward over `n` embeddings starting at the
+    /// absolute position `pos_base`, updating the N-wide tile in `bb` (which is
+    /// sized for >= n columns). The KV / conv / GDN-state caches are appended
+    /// at positions `[pos_base, pos_base+n)` and must already hold the state
+    /// for positions `< pos_base` (from `reset_sequence()` at the first window
+    /// and earlier windows). Callers perform the reset and the output-norm read
+    /// so that windowed prefill can append window after window.
+    fn run_batch_at(
+        &mut self,
+        embeds: &[f32],
+        n: usize,
+        pos_base: usize,
+        bb: &P3Buf,
+    ) -> Result<(), String> {
+        // upload the embedding tile (first n rows of the window slice)
+        self.gpu.upload(&bb.xb, f32_bytes(embeds))?;
+        for il in 0..self.cfg.n_layer {
+            self.pre_layer(il, n, pos_base, bb)?;
+        }
+        Ok(())
     }
 
     /// Batched prefill of `n` prompt embeddings (each `N_EMBD` floats, one per
@@ -879,85 +990,88 @@ impl GDev {
     /// per position. KV / conv / state caches are left exactly as the
     /// sequential token loop leaves them, so `forward_token(pos = n, ...)` can
     /// append the first generated token.
+    ///
+    /// This is a single full-size window (`window == n`); see
+    /// [`Self::prefill_batch_windowed`] for splitting very long prompts.
     pub fn prefill_batch(&mut self, embeds: &[f32], n: usize) -> Result<Vec<f32>, String> {
+        self.prefill_batch_windowed(embeds, n, n)
+    }
+
+    /// Batched prefill of `n` prompt embeddings processed in **sequential
+    /// windows of at most `window` columns** (P5). The full 64-layer pass runs
+    /// over each window's positions in order (`reset_sequence()` once, then
+    /// window 0 over positions `[0, w)`, window 1 over `[w, 2w)`, ...), so the
+    /// KV / conv / GDN-state caches are appended window after window and decode
+    /// can append at `pos = n`. Weight tensors stay resident across windows, so
+    /// weight traffic is ~one pass per window regardless of N. Numerically each
+    /// position is identical to a single full-size batch (per-column GEMM) and
+    /// to the sequential token loop within the golden tolerance.
+    ///
+    /// Returns the output-normalized hidden tile of the **last** window
+    /// (`len_last * N_EMBD` floats, `[token][n_embd]`); its final row is
+    /// position `n - 1`, whose logits sample the first generated token. When
+    /// `window >= n` this equals the full `n`-row tile of
+    /// [`Self::prefill_batch`].
+    pub fn prefill_batch_windowed(
+        &mut self,
+        embeds: &[f32],
+        n: usize,
+        window: usize,
+    ) -> Result<Vec<f32>, String> {
         if n < 1 {
-            return Err("prefill_batch: empty batch".into());
+            return Err("prefill_batch_windowed: empty batch".into());
         }
         if n > self.n_ctx {
             return Err(format!(
-                "prefill_batch: batch {n} exceeds context {}/{} (raise BONSAI_CTX)",
+                "prefill_batch_windowed: batch {n} exceeds context {}/{} (raise BONSAI_CTX)",
                 self.n_ctx, self.n_ctx
             ));
         }
         let need = n * N_EMBD;
         if embeds.len() != need {
-            return Err(format!("prefill_batch: expected {need} embeddings, got {}", embeds.len()));
+            return Err(format!(
+                "prefill_batch_windowed: expected {need} embeddings, got {}",
+                embeds.len()
+            ));
         }
         let timing = std::env::var("GDEV_TIME").map(|v| v == "1").unwrap_or(false);
         let t_phase = std::time::Instant::now();
+
+        let w = window.clamp(1, n); // window width, bounded to the batch
+        let nwin = n.div_ceil(w);
+
         self.reset_sequence()?;
-
-        // N-wide activation tiles + a partials buffer sized for the largest
-        // matvec (N_FF * (N_EMBD/128) partials per column).
-        let xb = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
-        let xnorm = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
-        let branch = alloc_bytes(&mut self.gpu, n * N_EMBD * 4)?;
-        let qfull = alloc_bytes(&mut self.gpu, n * 2 * N_HEAD * HEAD_D * 4)?;
-        let kraw = alloc_bytes(&mut self.gpu, n * N_KV * HEAD_D * 4)?;
-        let vraw = alloc_bytes(&mut self.gpu, n * N_KV * HEAD_D * 4)?;
-        let gated = alloc_bytes(&mut self.gpu, n * N_HEAD * HEAD_D * 4)?;
-        let fg = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
-        let fu = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
-        let h1 = alloc_bytes(&mut self.gpu, n * N_FF * 4)?;
-        // N-wide GDN tiles (P4): per-position projections and gated output.
-        let gqkv = alloc_bytes(&mut self.gpu, n * GDN_CH * 4)?;
-        let gz = alloc_bytes(&mut self.gpu, n * GDN_DI * 4)?;
-        let gbeta = alloc_bytes(&mut self.gpu, n * GDN_HV * 4)?;
-        let galpha = alloc_bytes(&mut self.gpu, n * GDN_HV * 4)?;
-        let gh1 = alloc_bytes(&mut self.gpu, n * GDN_DI * 4)?;
-        let partials = alloc_bytes(&mut self.gpu, N_FF * (N_EMBD / 128) * n * 4)?;
-        let bb = P3Buf {
-            xb, xnorm, branch, qfull, kraw, vraw, gated, fg, fu, h1,
-            gqkv, gz, gbeta, galpha, gh1, partials,
-        };
-
-        // upload the embedding tile
-        self.gpu.upload(&bb.xb, f32_bytes(embeds))?;
+        let bb = Self::alloc_bb(&mut self.gpu, w)?;
 
         let r = (|| -> Result<Vec<f32>, String> {
-            for il in 0..self.cfg.n_layer {
-                self.pre_layer(il, n, &bb)?;
+            let mut last_hidden = Vec::new();
+            for wi in 0..nwin {
+                let w0 = wi * w;
+                let w1 = (w0 + w).min(n);
+                let len = w1 - w0;
+                // slice this window's embeddings out of the contiguous tile
+                let win_emb = &embeds[w0 * N_EMBD..w1 * N_EMBD];
+                self.run_batch_at(win_emb, len, w0, &bb)?;
+                // output norm over the window tile (positions w0..w1)
+                let (wout, _, _) = self.tw("output_norm.weight")?;
+                self.gpu.rec_begin()?;
+                rec_norm_rows(&mut self.gpu, &bb.xb, &wout, &bb.xnorm, len * N_EMBD, N_EMBD, 0)?;
+                self.gpu.rec_end_submit()?;
+                last_hidden = self.gpu.read_dev(&bb.xnorm, len * N_EMBD * 4)?;
             }
-            // output norm over the whole tile -> hidden rows, then read back.
-            let (wout, _, _) = self.tw("output_norm.weight")?;
-            self.gpu.rec_begin()?;
-            rec_norm_rows(&mut self.gpu, &bb.xb, &wout, &bb.xnorm, n * N_EMBD, N_EMBD, 0)?;
-            self.gpu.rec_end_submit()?;
-            let bytes = self.gpu.read_dev(&bb.xnorm, n * N_EMBD * 4)?;
-            Ok(bytes
+            Ok(last_hidden
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         })();
 
-        self.gpu.destroy_dev_buffer(bb.xb);
-        self.gpu.destroy_dev_buffer(bb.xnorm);
-        self.gpu.destroy_dev_buffer(bb.branch);
-        self.gpu.destroy_dev_buffer(bb.qfull);
-        self.gpu.destroy_dev_buffer(bb.kraw);
-        self.gpu.destroy_dev_buffer(bb.vraw);
-        self.gpu.destroy_dev_buffer(bb.gated);
-        self.gpu.destroy_dev_buffer(bb.fg);
-        self.gpu.destroy_dev_buffer(bb.fu);
-        self.gpu.destroy_dev_buffer(bb.h1);
-        self.gpu.destroy_dev_buffer(bb.gqkv);
-        self.gpu.destroy_dev_buffer(bb.gz);
-        self.gpu.destroy_dev_buffer(bb.gbeta);
-        self.gpu.destroy_dev_buffer(bb.galpha);
-        self.gpu.destroy_dev_buffer(bb.gh1);
-        self.gpu.destroy_dev_buffer(bb.partials);
+        Self::destroy_bb(&mut self.gpu, bb);
         if timing {
-            eprintln!("[gdev] prefill_batch n={n}: {:.1}ms", t_phase.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[gdev] prefill_batch_windowed n={n} window={w} ({} windows): {:.1}ms",
+                nwin,
+                t_phase.elapsed().as_secs_f64() * 1e3
+            );
         }
         r
     }
