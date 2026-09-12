@@ -61,6 +61,13 @@ pub const PQ2_PARTIAL_SPV: &[u8] =
 pub const PQ2_ROWSUM_SPV: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum.spv"));
 
+/// SPIR-V for the **fused single-pass** PQ2_0 matvec
+/// (`shaders/pq2_matvec_fused.comp`): one workgroup per row, shared-memory
+/// reduction, no `partials` round trip. Replaces the two-pass pair for the
+/// single-token decode path.
+pub const PQ2_MATVEC_FUSED_SPV: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_matvec_fused.spv"));
+
 /// SPIR-V for the N-column (batched) two-pass PQ2_0 GEMM
 /// (`shaders/pq2_partial_n.comp`, `shaders/pq2_rowsum_n.comp`), P2 of
 /// notes/prefill-plan.md. One weight block is read once and reused across N
@@ -96,6 +103,19 @@ pub const GDN_PREP_SPV: &[u8] =
 /// module (weights and scratch alike).
 pub fn storage_usage() -> vk::BufferUsageFlags {
     vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+}
+
+/// Global switch for the PQ2_0 matvec implementation used by the recorded
+/// single-token decode path. Default = fused single-pass (`pq2_matvec_fused`);
+/// `BONSAI_MATVEC=2pass` restores the older two-pass (partials + rowsum) path.
+fn matvec_legacy() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        matches!(
+            std::env::var("BONSAI_MATVEC").as_deref(),
+            Ok("2pass") | Ok("twopass") | Ok("legacy")
+        )
+    })
 }
 
 /// Fixed gdn shapes for qwen35 (must match the shader constants).
@@ -2142,9 +2162,16 @@ impl Gpu {
         Ok(())
     }
 
-    /// Record the two-pass PQ2_0 matvec into the current token's command
-    /// buffer: pq2_partial into `partials`, then pq2_rowsum writing rows
-    /// `ybase..ybase+rows` of `y`.
+    /// Record the PQ2_0 matvec into the current token's command buffer,
+    /// writing rows `ybase..ybase+rows` of `y`.
+    ///
+    /// Default is the **fused single-pass** kernel (`pq2_matvec_fused`): one
+    /// workgroup per row, reduced in shared memory, no `partials` round trip.
+    /// That removes ~24% of the bytes moved per token (the two-pass writes and
+    /// re-reads one float per (row, 128-block) pair), which is what matters
+    /// once decode is bandwidth-bound on the RX 7600. On the gfx902 iGPU it is
+    /// ~3% slower (that part is latency-bound, not bandwidth-bound).
+    /// `BONSAI_MATVEC=2pass` restores the old two-pass path.
     pub fn rec_matvec(
         &mut self,
         w: &DevBuf,
@@ -2156,22 +2183,30 @@ impl Gpu {
         base_row: u32,
         rows: u32,
     ) -> Result<(), String> {
-        self.ensure_kernel("pq2_partial", PQ2_PARTIAL_SPV)?;
-        self.ensure_kernel("pq2_rowsum", PQ2_ROWSUM_SPV)?;
-        let nblocks = ne0.div_ceil(128);
-        let total = (rows as u64 * nblocks as u64).max(1);
-        let groups = (total as u32).div_ceil(256).max(1);
-        let pc_p = [ne0, base_row];
-        let pc_pb = unsafe {
-            std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+        if matvec_legacy() {
+            self.ensure_kernel("pq2_partial", PQ2_PARTIAL_SPV)?;
+            self.ensure_kernel("pq2_rowsum", PQ2_ROWSUM_SPV)?;
+            let nblocks = ne0.div_ceil(128);
+            let total = (rows as u64 * nblocks as u64).max(1);
+            let groups = (total as u32).div_ceil(256).max(1);
+            let pc_p = [ne0, base_row];
+            let pc_pb = unsafe {
+                std::slice::from_raw_parts(pc_p.as_ptr() as *const u8, std::mem::size_of_val(&pc_p))
+            };
+            self.rec_dispatch("pq2_partial", w, x, partials, pc_pb, groups)?;
+            let pc_r = [nblocks, ybase];
+            let pc_rb = unsafe {
+                std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
+            };
+            // rowsum only uses bindings 0 (partials) and 2 (y); bind y twice
+            return self.rec_dispatch("pq2_rowsum", partials, y, y, pc_rb, rows.max(1));
+        }
+        self.ensure_kernel("pq2_matvec_fused", PQ2_MATVEC_FUSED_SPV)?;
+        let pc = [ne0, base_row, ybase, rows];
+        let pcb = unsafe {
+            std::slice::from_raw_parts(pc.as_ptr() as *const u8, std::mem::size_of_val(&pc))
         };
-        self.rec_dispatch("pq2_partial", w, x, partials, pc_pb, groups)?;
-        let pc_r = [nblocks, ybase];
-        let pc_rb = unsafe {
-            std::slice::from_raw_parts(pc_r.as_ptr() as *const u8, std::mem::size_of_val(&pc_r))
-        };
-        // rowsum only uses bindings 0 (partials) and 2 (y); bind y twice
-        self.rec_dispatch("pq2_rowsum", partials, y, y, pc_rb, rows.max(1))
+        self.rec_dispatch("pq2_matvec_fused", w, x, y, pcb, rows.max(1))
     }
 
     /// Record the **N-column two-pass PQ2_0 GEMM** (P2 of notes/prefill-plan.md)

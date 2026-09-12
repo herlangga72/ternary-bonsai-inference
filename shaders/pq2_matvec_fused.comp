@@ -1,0 +1,85 @@
+#version 450
+// Fused PQ2_0 matvec: one workgroup per output row.
+//
+// Replaces the two-pass pair (`pq2_partial` + `pq2_rowsum`). The per-block dot
+// products are reduced in shared memory inside this dispatch, so the
+// `partials` buffer is never written to or read from global memory. That round
+// trip costs ~2x4 bytes per (row, 128-block) pair, i.e. ~24% extra traffic on
+// top of the 7.1 GB weight stream at decode time - the thing that matters once
+// the RX 7600 makes decode bandwidth-bound.
+//
+// Grid: one workgroup per row (gl_WorkGroupID.x); gl_WorkGroupID.x is the
+// maxComputeWorkGroupCount[0] dimension, which is effectively unbounded on
+// RADV. Threads stride over the row's 128-weight blocks and reduce.
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer W { uint data[]; } w;
+layout(set = 0, binding = 1, std430) readonly buffer X { float data[]; } x;
+layout(set = 0, binding = 2, std430) buffer Y { float data[]; } y;
+layout(push_constant) uniform PC { uint ne0; uint base_row; uint ybase; uint rows; } pc;
+
+shared float red[128];
+
+// Byte `j + rem` of the 9-word block window starting at word `sw`.
+uint u8b(uint j, uint rem, uint wd[9]) {
+    uint idx = (j + rem) >> 2;
+    uint shift = ((j + rem) & 3u) << 3;
+    return (wd[idx] >> shift) & 0xffu;
+}
+
+float half_to_float(uint h) {
+    uint sign = (h >> 15) & 1u; uint exp = (h >> 10) & 0x1fu; uint man = h & 0x3ffu;
+    uint bits;
+    if (exp == 0u) { if (man == 0u) { bits = sign << 31; } else {
+        int e = 127 - 15 + 1; uint m = man;
+        while ((m & 0x400u) == 0u) { m <<= 1; e -= 1; } m &= 0x3ffu;
+        bits = (sign << 31) | (uint(e) << 23) | (m << 13); } }
+    else if (exp == 0x1fu) { bits = (sign << 31) | 0x7f800000u | (man << 13); }
+    else { bits = (sign << 31) | ((exp + 127u - 15u) << 23) | (man << 13); }
+    return uintBitsToFloat(bits);
+}
+
+// Dot product of one 128-weight block of `row` with x, including the fp16
+// group scale. Mirrors pq2_partial.comp's per-block math exactly.
+float block_dot(uint row, uint block, uint nblocks) {
+    uint rowbytes = nblocks * 34u;
+    uint blk_start = row * rowbytes + block * 34u;
+    uint sw = blk_start >> 2;
+    uint rem = blk_start & 3u; // byte offset inside the first word
+    uint wd[9];
+    for (uint i = 0u; i < 9u; ++i) { wd[i] = w.data[sw + i]; }
+    float scale = half_to_float(u8b(0u, rem, wd) | (u8b(1u, rem, wd) << 8));
+    uint colbase = block * 128u;
+    float acc = 0.0f;
+    for (uint k = 0u; k < 32u; ++k) {
+        uint cb = u8b(2u + k, rem, wd);
+        uint c0 = cb & 3u; uint c1 = (cb >> 2) & 3u;
+        uint c2 = (cb >> 4) & 3u; uint c3 = (cb >> 6) & 3u;
+        uint col = colbase + 4u * k;
+        acc += x.data[col + 0u] * float(int(c0) - 1);
+        acc += x.data[col + 1u] * float(int(c1) - 1);
+        acc += x.data[col + 2u] * float(int(c2) - 1);
+        acc += x.data[col + 3u] * float(int(c3) - 1);
+    }
+    return acc * scale;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) { return; } // uniform per workgroup, safe before barrier
+    uint lid = gl_LocalInvocationID.x;
+    uint nblocks = (pc.ne0 + 127u) / 128u;
+    uint grow = row + pc.base_row;
+
+    float acc = 0.0f;
+    for (uint block = lid; block < nblocks; block += 128u) {
+        acc += block_dot(grow, block, nblocks);
+    }
+
+    red[lid] = acc;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] += red[lid + s]; }
+        barrier();
+    }
+    if (lid == 0u) { y.data[pc.ybase + row] = red[0]; }
+}
