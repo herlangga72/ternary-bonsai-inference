@@ -312,6 +312,34 @@ pub fn pq2_matvec_range(
     Ok(())
 }
 
+/// Single-threaded variant of `pq2_matvec_range` using the production row
+/// kernel (AVX2 when available). Used by microbenchmarks so kernel throughput
+/// can be measured without thread-scheduling noise.
+pub fn pq2_matvec_range_single(
+    payload: &[u8],
+    ne0: usize,
+    base_row: u64,
+    n_rows: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), String> {
+    if x.len() != ne0 {
+        return Err("pq2_matvec_range_single: x length mismatch".into());
+    }
+    if y.len() < n_rows {
+        return Err("pq2_matvec_range_single: y too small".into());
+    }
+    let row_bytes = pq2_row_bytes(ne0);
+    let need = (base_row as usize + n_rows)
+        .checked_mul(row_bytes)
+        .ok_or("pq2_matvec_range_single: overflow")?;
+    if need > payload.len() {
+        return Err("pq2_matvec_range_single: row range exceeds payload".into());
+    }
+    dot_rows_into(payload, ne0, base_row as usize, 0..n_rows, x, &mut y[..n_rows]);
+    Ok(())
+}
+
 /// Dot rows `base + range` (local row index within `range`) into `y`, one
 /// output float per row. Shared by the scalar and the per-thread paths so the
 /// decode math is bit-identical either way. On x86-64 with AVX2+FMA the inner
@@ -364,9 +392,10 @@ fn row_dot_scalar(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
 
 /// AVX2+FMA row dot. For each 128-weight block a 4KB table maps every byte
 /// (4 two-bit codes) to four f32 multipliers in {-1,0,1,2}; four lanes are
-/// multiplied per FMA. The block scale is applied once after the packed
-/// accumulation, so the result differs from the scalar path only by fp
-/// rounding order (~1e-6 relative).
+/// multiplied per FMA. The accumulator is kept in a 256-bit register across
+/// every block and the block scale is folded in with one FMA per block, so the
+/// only horizontal reduction is a single 8-lane sum per row. The result
+/// differs from the scalar path only by fp rounding order (~1e-6 relative).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn row_dot_avx2(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
@@ -382,29 +411,63 @@ unsafe fn row_dot_avx2(raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
         }
         v
     });
+    let lutp = lut.as_ptr();
 
-    let mut acc = 0.0f32;
+    // Running vector sum of scale * (block dot). Reduced to a scalar once.
+    let mut total = _mm256_setzero_ps();
     let n_blocks = ne0 / PQ2_QK;
     for block in 0..n_blocks {
         let b = block * PQ2_BLOCK;
         let scale = half_to_f32(u16::from_le_bytes([raw[b], raw[b + 1]]));
-        let qs = &raw[b + 2..b + 2 + PQ2_QK / 4];
+        let qs = raw.as_ptr().add(b + 2);
         let xoff = block * PQ2_QK;
-        let mut vacc = _mm256_setzero_ps();
-        // two bytes per iteration = 8 lanes of x with one 256-bit FMA
-        for k in (0..32).step_by(2) {
-            let byte_a = qs[k] as usize;
-            let byte_b = qs[k + 1] as usize;
-            let xv = _mm256_loadu_ps(x.as_ptr().add(xoff + 8 * (k / 2)));
-            let wa = _mm_loadu_ps(lut.as_ptr().add(byte_a * 4));
-            let wb = _mm_loadu_ps(lut.as_ptr().add(byte_b * 4));
-            let wv = _mm256_insertf128_ps(_mm256_castps128_ps256(wa), wb, 1);
-            vacc = _mm256_fmadd_ps(xv, wv, vacc);
+        // Eight code bytes (=32 columns) per iteration into four independent
+        // 256-bit accumulators, so the FMA latency chain does not serialize the
+        // block. The code bytes are fetched with one unaligned 64-bit load.
+        let mut a0 = _mm256_setzero_ps();
+        let mut a1 = _mm256_setzero_ps();
+        let mut a2 = _mm256_setzero_ps();
+        let mut a3 = _mm256_setzero_ps();
+        let mut k = 0usize;
+        while k < 32 {
+            let word = (qs.add(k) as *const u64).read_unaligned();
+            let c = |sh: u32| ((word >> sh) & 0xff) as usize;
+            let w0 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_loadu_ps(lutp.add(c(0) * 4))),
+                _mm_loadu_ps(lutp.add(c(8) * 4)),
+                1,
+            );
+            let w1 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_loadu_ps(lutp.add(c(16) * 4))),
+                _mm_loadu_ps(lutp.add(c(24) * 4)),
+                1,
+            );
+            let w2 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_loadu_ps(lutp.add(c(32) * 4))),
+                _mm_loadu_ps(lutp.add(c(40) * 4)),
+                1,
+            );
+            let w3 = _mm256_insertf128_ps(
+                _mm256_castps128_ps256(_mm_loadu_ps(lutp.add(c(48) * 4))),
+                _mm_loadu_ps(lutp.add(c(56) * 4)),
+                1,
+            );
+            let xp = x.as_ptr().add(xoff + 4 * k);
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp), w0, a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(8)), w1, a1);
+            a2 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(16)), w2, a2);
+            a3 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(24)), w3, a3);
+            k += 8;
         }
-        let mut lanes = [0.0f32; 8];
-        _mm256_storeu_ps(lanes.as_mut_ptr(), vacc);
-        acc += scale * (lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7]);
+        let s01 = _mm256_add_ps(a0, a1);
+        let s23 = _mm256_add_ps(a2, a3);
+        let vacc = _mm256_add_ps(s01, s23);
+        total = _mm256_fmadd_ps(vacc, _mm256_set1_ps(scale), total);
     }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), total);
+    let mut acc = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+        + (lanes[4] + lanes[5]) + (lanes[6] + lanes[7]);
     // scalar tail for ne0 not a multiple of 128
     let tail_start = n_blocks * PQ2_QK;
     if tail_start < ne0 {

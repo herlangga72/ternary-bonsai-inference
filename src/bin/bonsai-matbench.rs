@@ -1,6 +1,9 @@
-//! bonsai-matbench: microbenchmark PQ2_0 mat-vec throughput to size the Rust
-//! engine. Loads one tensor fully into RAM and computes y = W @ x across rows,
-//! single-threaded and multi-threaded.
+//! bonsai-matbench: PQ2_0 mat-vec throughput microbenchmark.
+//!
+//! Measures the **production** row kernel (`kernels::pq2_matvec_range`) plus a
+//! scalar reference, single- and multi-threaded, on one real tensor. Each
+//! variant runs several times and the best (min) time is reported to reduce
+//! noise from other processes sharing the machine.
 
 #[path = "../gguf.rs"]
 mod gguf;
@@ -22,7 +25,8 @@ fn rand_floats(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn matvec_rows(data: &[u8], ne0: usize, rows: &[u64], x: &[f32]) -> Vec<f32> {
+/// Scalar reference (old kernel): per-element shift/mask + float multiply.
+fn matvec_rows_scalar(data: &[u8], ne0: usize, rows: &[u64], x: &[f32]) -> Vec<f32> {
     let row_bytes = kernels::pq2_row_bytes(ne0);
     let mut y = Vec::with_capacity(rows.len());
     for &r in rows {
@@ -47,6 +51,7 @@ fn matvec_rows(data: &[u8], ne0: usize, rows: &[u64], x: &[f32]) -> Vec<f32> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let model = args.first().cloned().unwrap();
+    let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
     let mut g = GGUF::open(&model).unwrap();
     let name = "blk.0.ffn_up.weight";
     let t = g
@@ -64,43 +69,51 @@ fn main() {
 
     let x = rand_floats(3, ne0);
     let total_mac = n_rows * ne0 as u64;
+    let gmac = |s: f64| total_mac as f64 / s / 1e9;
     println!(
-        "{name}: {n_rows} rows x {ne0} cols, {:.1} MiB, {:.3} G MACs",
+        "{name}: {n_rows} rows x {ne0} cols, {:.1} MiB, {:.3} G MACs, best of {reps}",
         nbytes as f64 / 1048576.0,
         total_mac as f64 / 1e9
     );
 
-    // warmup: 8 rows
-    let _ = matvec_rows(&data, ne0, &[0, 1, 2, 3, 4, 5, 6, 7], &x);
-
     let all_rows: Vec<u64> = (0..n_rows).collect();
+    // warmup (first-touch the payload + LUT)
+    let _ = matvec_rows_scalar(&data, ne0, &all_rows[..256], &x);
+    let mut y = vec![0.0f32; n_rows as usize];
 
-    let t0 = Instant::now();
-    let _ = matvec_rows(&data, ne0, &all_rows, &x);
-    let dt = t0.elapsed();
+    // ---- scalar, single thread ----
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        let _ = matvec_rows_scalar(&data, ne0, &all_rows, &x);
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    let scalar1 = best;
+    println!("scalar  1-thread: {scalar1:.3}s -> {:.2} GMAC/s", gmac(scalar1));
+
+    // ---- production kernel, single thread ----
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        kernels::pq2_matvec_range_single(&data, ne0, 0, n_rows as usize, &x, &mut y).unwrap();
+        best = best.min(t0.elapsed().as_secs_f64());
+    }
+    let prod1 = best;
     println!(
-        "single-thread: {:.3}s -> {:.2} GMAC/s",
-        dt.as_secs_f32(),
-        total_mac as f64 / dt.as_secs_f64() / 1e9
+        "kernel  1-thread: {prod1:.3}s -> {:.2} GMAC/s  ({:.2}x scalar)",
+        gmac(prod1),
+        scalar1 / prod1
     );
 
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let t0 = Instant::now();
-    let mut handles = Vec::new();
-    let chunk = all_rows.len() / n_threads + 1;
-    for th in 0..n_threads {
-        let rows: Vec<u64> = all_rows[th * chunk..((th + 1) * chunk).min(all_rows.len())].to_vec();
-        let data = data.clone();
-        let x = x.clone();
-        handles.push(std::thread::spawn(move || matvec_rows(&data, ne0, &rows, &x)));
+    // ---- production kernel, multi thread ----
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let t0 = Instant::now();
+        kernels::pq2_matvec_range(&data, ne0, 0, n_rows as usize, &x, &mut y).unwrap();
+        best = best.min(t0.elapsed().as_secs_f64());
     }
-    for h in handles {
-        let _ = h.join().unwrap();
-    }
-    let dt = t0.elapsed();
-    println!(
-        "{n_threads}-thread:  {:.3}s -> {:.2} GMAC/s",
-        dt.as_secs_f32(),
-        total_mac as f64 / dt.as_secs_f64() / 1e9
+    let n_threads = kernels::scaled_threads(
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
     );
+    println!("kernel {n_threads}-thread: {best:.3}s -> {:.2} GMAC/s", gmac(best));
 }
