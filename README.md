@@ -97,6 +97,9 @@ AVX2 CPU path) and matches the golden prompt: greedy 8160, logit rel 4.4e-3.
 The same engine is what targets the RX 7600 (288 GB/s) for the big speedup.
 On APUs weights default to host-visible RAM (device-local heap < model); set
 `BONSAI_VRAM=1` to force device-local (fits after per-layer cache reduction).
+The PQ2_0 matvec is the fused single-pass kernel (`pq2_matvec_fused.comp`, one
+workgroup per row with a shared-memory reduction, no `partials` round trip);
+`BONSAI_MATVEC=2pass` restores the older two-pass path for comparison.
 
 ```sh
 ./target/release/bonsai-grun Ternary-Bonsai-27B-PQ2_0.gguf "What is the capital of France?" 24
@@ -153,8 +156,9 @@ when you want to re-run the kernel/activation reference checks.
 ```
 
 Sampling defaults are Bonsai-flavored (top-k 20, top-p 0.9, temp 0.6); the docs
-recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`. The scalar Rust
-decoder is slow, so start with `-n 1..4` and a short prompt.
+recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`. On a 4-core Ryzen
+3200G a token takes ~1.1-1.4 s (AVX2 PQ2_0 dot, 4 threads), so start with
+`-n 1..4` and a short prompt.
 
 ## Performance expectations
 
@@ -164,13 +168,17 @@ decoder is slow, so start with `-n 1..4` and a short prompt.
 | phase | rate |
 | --- | --- |
 | model load (header + tensor index) | ~1 s |
-| prefill | ~2.0-2.5 s/token |
-| decode | ~1.9-2.5 s/token (LM head included; AVX2 PQ2_0 dot) |
+| prefill | ~1.1-1.4 s/token |
+| decode | ~1.1-1.4 s/token (LM head included; AVX2 PQ2_0 dot) |
+
+Numbers fluctuate with machine load (the box is shared); the AVX2 PQ2_0 row
+kernel is ~27x the scalar reference and hits 9 GMAC/s single-thread, 28 GMAC/s
+across 4 threads. `bonsai-matbench <model>` measures the shipped kernel.
 
 The model is a reasoning model. The prompt is seeded with `<think>`, the model
 streams its reasoning, closes `</think>`, then gives the final answer and stops
 at `<|im_end|>`. A short factual prompt needs ~150-200 generated tokens, so
-budget ~5-8 minutes per full answer on CPU-only hardware (or use the golden
+budget ~3-5 minutes per full answer on CPU-only hardware (or use the golden
 logits + short prompts for validation).
 
 ## Sample run
