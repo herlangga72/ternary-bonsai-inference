@@ -19,85 +19,85 @@ use std::ffi::CStr;
 /// SPIR-V for the PQ2_0 matvec shader, compiled from `shaders/pq2_matvec.comp`
 /// by build.rs (glslangValidator) into OUT_DIR.
 pub const PQ2_MATVEC_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_matvec.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_matvec.spv"));
 
 /// SPIR-V for the RMSNorm shader (`shaders/rms_norm.comp`).
 pub const RMS_NORM_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/rms_norm.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm.spv"));
 
 /// SPIR-V for the fused elementwise shader (`shaders/elem.comp`).
 pub const ELEM_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/elem.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/elem.spv"));
 
 /// SPIR-V for the row-wise norm shader (`shaders/norm_rows.comp`).
 pub const NORM_ROWS_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/norm_rows.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/norm_rows.spv"));
 
 /// SPIR-V for the masked softmax shader (`shaders/softmax_row.comp`).
 pub const SOFTMAX_ROW_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/softmax_row.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_row.spv"));
 
 /// SPIR-V for the IMROPE shader (`shaders/rope_imrope.comp`).
 pub const ROPE_IMROPE_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/rope_imrope.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/rope_imrope.spv"));
 
 /// SPIR-V for the gated-delta-net step (`shaders/gdn_step.comp`).
 pub const GDN_STEP_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/gdn_step.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_step.spv"));
 
 /// SPIR-V for the attention trio (`shaders/attn_scores.comp`,
 /// `softmax_inplace.comp`, `attn_out.comp`).
 pub const ATTN_SCORES_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/attn_scores.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_scores.spv"));
 pub const SOFTMAX_INPLACE_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/softmax_inplace.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/softmax_inplace.spv"));
 pub const ATTN_OUT_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/attn_out.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_out.spv"));
 
 /// SPIR-V for the two-pass PQ2_0 matvec (`shaders/pq2_partial.comp`,
 /// `shaders/pq2_rowsum.comp`).
 pub const PQ2_PARTIAL_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_partial.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_partial.spv"));
 pub const PQ2_ROWSUM_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_rowsum.spv"));
 
 /// SPIR-V for the **fused single-pass** PQ2_0 matvec
 /// (`shaders/pq2_matvec_fused.comp`): one workgroup per row, shared-memory
 /// reduction, no `partials` round trip. Replaces the two-pass pair for the
 /// single-token decode path.
 pub const PQ2_MATVEC_FUSED_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_matvec_fused.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_matvec_fused.spv"));
 
 /// SPIR-V for the N-column (batched) two-pass PQ2_0 GEMM
 /// (`shaders/pq2_partial_n.comp`, `shaders/pq2_rowsum_n.comp`), P2 of
 /// notes/prefill-plan.md. One weight block is read once and reused across N
 /// activation columns; N=1 is bit-identical to the single-vector pair above.
 pub const PQ2_PARTIAL_N_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_partial_n.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_partial_n.spv"));
 pub const PQ2_ROWSUM_N_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/pq2_rowsum_n.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/pq2_rowsum_n.spv"));
 
 /// SPIR-V for device arena ops (slice 1 of the full decode):
 /// residual add, fused q|gate split, KV append.
 pub const ADD_RESIDUAL_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/add_residual.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/add_residual.spv"));
 pub const SPLIT_QGATE_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/split_qgate.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/split_qgate.spv"));
 pub const KV_STORE_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/kv_store.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/kv_store.spv"));
 
 /// SPIR-V for a device-to-device row copy used by the batched (P3) prefill
 /// driver (`shaders/tile_copy.comp`): dst[dbase+i] = src[sbase+i].
 pub const TILE_COPY_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/tile_copy.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/tile_copy.spv"));
 
 /// SPIR-V for recurrent-layer kernels (conv1d+silu, l2 in place, gdn prep).
 pub const CONV1D_SILU_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/conv1d_silu.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/conv1d_silu.spv"));
 pub const L2_INPLACE_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/l2_inplace.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/l2_inplace.spv"));
 pub const GDN_PREP_SPV: &[u8] =
-    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/spv/gdn_prep.spv"));
+    include_bytes!(concat!(env!("OUT_DIR"), "/gdn_prep.spv"));
 
 /// Storage + transfer-dst usage for device buffers created by the decode
 /// module (weights and scratch alike).

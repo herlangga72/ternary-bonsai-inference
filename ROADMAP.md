@@ -57,11 +57,14 @@ Migrate from the outside in:
 
 ## Next: inference performance (M8+) and GPU (RX 7600)
 
-The migration is done; the remaining gap is speed (~23-34 s/token today). An
-RX 7600 (288 GB/s) arrives soon and is now the target: ~25 ms/token decode
-floor, ~20-40 tok/s expected. See `notes/perf-plan.md` for the full plan:
-slim CPU work now (mmap + threaded matvec, ~5-8 s/token fallback), then an
-OpenCL backend (buildable + validated on the current gfx902 iGPU today):
-PQ2_0 matvec + norm/activation kernels (G0), device weight store (G1),
-single-stream GPU decode (G2), then batched prefill and tuning on the 7600
-(G3).
+The migration is done. The CPU and GPU speedups planned here have landed:
+mmap + threaded matvec + the AVX2 PQ2_0 row dot (CPU decode ~1.2-1.4 s/token),
+and the Vulkan/RADV backend with device weights and single-submit decode
+(GDev, ~1.4 s/token on the gfx902 iGPU, DRAM-parity with CPU). The PQ2_0
+matvec now uses a fused single-pass kernel that drops the `partials` round
+trip. See `notes/baseline.md` for the 2026-09-13 baseline and log.
+
+What is left for the RX 7600 (288 GB/s, ~25 ms/token decode floor, ~20-40
+tok/s projected): validate and tune the existing kernels on the discrete card,
+and finish batched prefill (P1-P5 landed; on the APU a token loop wins, so
+this is validated only when the card arrives).

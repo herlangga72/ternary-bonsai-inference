@@ -1,5 +1,13 @@
 # Perf plan: Ternary-Bonsai-27B inference fast on CPU, then on an RX 7600
 
+> Status update (2026-09-13): the numbers below are the 2026-09-06 planning
+> estimates and are kept for history. Current measured state on the 3200G:
+> CPU decode ~1.2-1.4 s/token (AVX2 PQ2_0 dot, 4 threads; was 23-34 s/token
+> when this plan was written), GPU single-submit decode ~1.4 s/token on the
+> gfx902 iGPU. M8.1/M8.3/M8.4 and G0/G1/G2 are done. The PQ2_0 matvec now
+> uses a fused single-pass kernel. See `notes/baseline.md` for the 2026-09-13
+> baseline and optimization log.
+
 Status: 2026-09-06. The M1..M7 Rust migration is functionally complete
 (correct, golden-verified, standalone). Speed today is ~23-34 s/token on the
 4-core Ryzen 3200G. An RX 7600 arrives in a few days; this document tracks

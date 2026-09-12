@@ -2,22 +2,19 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Compile every GLSL compute shader under `shaders/` to SPIR-V in OUT_DIR.
-/// `glslangValidator` ships with the Vulkan SDK; the pure-CPU engine never
-/// needs it, but the Vulkan backend (`bonsai-vk`) fails to build without the
-/// generated modules.
+/// Ensure `OUT_DIR` holds a SPIR-V module for every compute shader.
+///
+/// Preferred path: compile `shaders/<name>.comp` with `glslangValidator`, so a
+/// shader edit takes effect on the next `cargo build`. If the compiler is
+/// unavailable (or fails), fall back to the committed copy under
+/// `spv/<name>.spv`. The Rust side always includes from `OUT_DIR`, so it can
+/// never silently pick up a module that does not match the GLSL source.
 fn compile_shaders() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shader_dir = manifest.join("shaders");
+    let vendored = manifest.join("spv");
     let tool = find_in_path("glslangValidator");
-    let Some(tool) = tool else {
-        println!(
-            "cargo:warning=glslangValidator not found in PATH: Vulkan SPIR-V modules will not be \
-             refreshed (vendored copies under spv/ are used by bonsai-vk)"
-        );
-        return;
-    };
     let Ok(entries) = std::fs::read_dir(&shader_dir) else {
         return;
     };
@@ -29,26 +26,45 @@ fn compile_shaders() {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         let dst = out.join(format!("{name}.spv"));
         println!("cargo:rerun-if-changed={}", path.display());
-        let status = Command::new(&tool)
-            .arg("-V")
-            .arg("--target-env")
-            .arg("vulkan1.2")
-            .arg("-o")
-            .arg(&dst)
-            .arg(&path)
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                println!("cargo:rerun-if-changed={}", dst.display());
+
+        let mut built = false;
+        if let Some(tool) = &tool {
+            let status = Command::new(tool)
+                .arg("-V")
+                .arg("--target-env")
+                .arg("vulkan1.2")
+                .arg("-o")
+                .arg(&dst)
+                .arg(&path)
+                .status();
+            match status {
+                Ok(s) if s.success() => built = true,
+                // A broken shader must fail the build; silently falling back to
+                // the committed module would hide the error.
+                other => panic!(
+                    "glslangValidator failed for {}: {other:?}",
+                    path.display()
+                ),
             }
-            other => {
+        }
+
+        if !built {
+            let src = vendored.join(format!("{name}.spv"));
+            if src.is_file() {
+                if std::fs::copy(&src, &dst).is_err() {
+                    panic!("failed to vendor spv/{name}.spv into OUT_DIR");
+                }
                 println!(
-                    "cargo:warning=glslangValidator failed for {}: {:?}",
-                    path.display(),
-                    other
+                    "cargo:warning=glslangValidator not found: using vendored spv/{name}.spv"
+                );
+            } else {
+                panic!(
+                    "no SPIR-V for shader '{name}': glslangValidator unavailable and \
+                     spv/{name}.spv missing"
                 );
             }
         }
+        println!("cargo:rerun-if-changed={}", vendored.join(format!("{name}.spv")).display());
     }
 }
 

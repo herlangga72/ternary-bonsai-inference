@@ -62,6 +62,13 @@ compiler to improve. Reverted; builds stay fast and portable.
 with best-of-N instead of a private scalar reimplementation, which understated
 the real throughput by ~27x.
 
+Shader build wiring: `build.rs` now guarantees `OUT_DIR` holds a SPIR-V module
+for every `.comp` (compile with `glslangValidator`, or copy the committed
+`spv/` fallback only when the compiler is absent), and `vk.rs` includes from
+`OUT_DIR`. Before, `vk.rs` read the committed `spv/`, so editing a shader
+silently had no effect, and a broken shader was not caught. A bad shader now
+fails the build with the glslang error.
+
 ## Reproduce
 
 ```sh
@@ -81,5 +88,3 @@ BONSAI_MATVEC=2pass ./target/release/bonsai-gdecode Ternary-Bonsai-27B-PQ2_0.ggu
 - Descriptor-set caching (host record is only ~2.5 ms/token, so low value).
 - RX 7600 validation of the fused matvec (expected ~19% traffic cut).
 - Prefill still uses the N-column two-pass (`pq2_partial_n`/`pq2_rowsum_n`).
-- `build.rs` compiles shaders to `OUT_DIR` but `vk.rs` uses the committed
-  `spv/`, so a shader edit needs a manual `glslangValidator` run into `spv/`.
