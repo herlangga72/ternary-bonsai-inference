@@ -225,3 +225,21 @@ The suspected remaining causes, in order, are the taps semantics, the rope dims
 (`n_rot` may be < 128; the sidecar omits `rope.dimension_count`), and the
 strictly non-causal attention in the block. All three need a numeric reference
 (fork draft logits) to resolve, which this box cannot currently produce.
+
+### Wiring and final measured state (2026-09-13)
+
+`BONSAI_DSPARK=<sidecar>` + `--temp 0` in `bonsai-run` now decodes with the
+drafter; stochastic sampling stays on the plain path. Verified identical output
+to the plain run ("Here's a thinking process:\n\n1").
+
+| item | before | after |
+| --- | --- | --- |
+| draft block (`bonsai-dspark`) | 7.2 s | 1.44 s (AVX2 Q4_1 kernel) |
+| bonsai-run decode | 1.32 s/tok plain | 3.46 s/tok with BONSAI_DSPARK |
+| bonsai-run prefill | - | 2.03 s/tok with BONSAI_DSPARK |
+
+Remaining work, in priority order: (1) draft acceptance (~1/24) needs a numeric
+reference; (2) a batched verify pass (`pq2_matmul_n` is ready but the target
+layer functions still run per token) for bandwidth-bound hardware; (3) the
+`observe` cost during prefill can be folded (one encoder call per chunk instead
+of per token).
