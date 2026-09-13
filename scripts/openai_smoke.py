@@ -27,21 +27,24 @@ def post(path, body):
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as r:
-        return r
+    # caller owns the response (streaming needs it open while iterating)
+    return urllib.request.urlopen(req, timeout=600)
 
 
 print("models:", [m["id"] for m in get("/v1/models")["data"]])
 
 body = {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}],
         "max_tokens": 24, "temperature": 0}
-reply = json.loads(post("/v1/chat/completions", body).read())
+resp = post("/v1/chat/completions", body)
+reply = json.loads(resp.read())
+resp.close()
 choice = reply["choices"][0]
 print("non-stream:", repr(choice["message"]["content"]), choice["finish_reason"], reply["usage"])
 
 print("stream: ", end="", flush=True)
 streaming = dict(body, stream=True, max_tokens=16)
-with post("/v1/chat/completions", streaming) as r:
+r = post("/v1/chat/completions", streaming)
+try:
     for line in r:
         line = line.decode().strip()
         if not line.startswith("data: "):
@@ -52,4 +55,6 @@ with post("/v1/chat/completions", streaming) as r:
         delta = json.loads(payload)["choices"][0]["delta"].get("content")
         if delta:
             print(delta, end="", flush=True)
+finally:
+    r.close()
 print()

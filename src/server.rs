@@ -55,7 +55,7 @@ impl ThinkFilter {
         self.buf.push_str(text);
         if let Some(i) = self.buf.find("</think>") {
             self.seen_end = true;
-            let rest = self.buf[i + "</think>".len()..].to_string();
+            let rest = self.buf[i + "</think>".len()..].trim_start().to_string();
             self.buf.clear();
             return Some(rest);
         }
@@ -634,7 +634,7 @@ mod tests {
     fn think_filter_strips_leading_reasoning() {
         let mut f = ThinkFilter::new(true);
         assert_eq!(f.feed("<think>\nreasoning"), None);
-        assert_eq!(f.feed("\n</think>\nParis"), Some("\nParis".to_string()));
+        assert_eq!(f.feed("\n</think>\nParis"), Some("Paris".to_string()));
         assert_eq!(f.feed(" is nice"), Some(" is nice".to_string()));
     }
 
