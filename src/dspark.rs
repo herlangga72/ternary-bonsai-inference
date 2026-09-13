@@ -646,33 +646,20 @@ impl Dspark {
             let kn = self.cached_f32(&format!("blk.{il}.attn_k_norm.weight"))?;
             let fnorm = self.cached_f32(&format!("blk.{il}.ffn_norm.weight"))?;
 
-            // q/k/v projections + norms + rope, appended to the cache
+            // q/k/v projections for every block position in one pass, so each
+            // weight row is fetched once per block rather than once per position
+            let mut xn = vec![0.0f32; n_tok * ne];
+            for t in 0..n_tok {
+                xn[t * ne..(t + 1) * ne]
+                    .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &an, c.eps));
+            }
             let mut q = vec![0.0f32; n_tok * c.n_head * hd];
             let mut kk = vec![0.0f32; n_tok * n_kv_dim];
             let mut vv = vec![0.0f32; n_tok * n_kv_dim];
+            self.matvec_multi(&format!("blk.{il}.attn_q.weight"), &xn, n_tok, &mut q)?;
+            self.matvec_multi(&format!("blk.{il}.attn_k.weight"), &xn, n_tok, &mut kk)?;
+            self.matvec_multi(&format!("blk.{il}.attn_v.weight"), &xn, n_tok, &mut vv)?;
             for t in 0..n_tok {
-                let xt = kernels::rms_norm(&x[t * ne..(t + 1) * ne], &an, c.eps);
-                self.matvec_range(
-                    &format!("blk.{il}.attn_q.weight"),
-                    0,
-                    c.n_head * hd,
-                    &xt,
-                    &mut q[t * c.n_head * hd..(t + 1) * c.n_head * hd],
-                )?;
-                self.matvec_range(
-                    &format!("blk.{il}.attn_k.weight"),
-                    0,
-                    n_kv_dim,
-                    &xt,
-                    &mut kk[t * n_kv_dim..(t + 1) * n_kv_dim],
-                )?;
-                self.matvec_range(
-                    &format!("blk.{il}.attn_v.weight"),
-                    0,
-                    n_kv_dim,
-                    &xt,
-                    &mut vv[t * n_kv_dim..(t + 1) * n_kv_dim],
-                )?;
                 for h in 0..c.n_head {
                     let head = &mut q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
                     let n = kernels::rms_norm(head, &qn, c.eps);
@@ -740,34 +727,31 @@ impl Dspark {
                 }
             }
 
-            // output projection + residual, then FFN + residual
+            // output projection (batched over positions) + residual
             let mut y = vec![0.0f32; n_tok * ne];
-            for t in 0..n_tok {
-                let mut o = vec![0.0f32; ne];
-                self.matvec_range(
-                    &format!("blk.{il}.attn_output.weight"),
-                    0,
-                    ne,
-                    &attn[t * c.n_head * hd..(t + 1) * c.n_head * hd],
-                    &mut o,
-                )?;
-                for i in 0..ne {
-                    y[t * ne + i] = x[t * ne + i] + o[i];
-                }
+            let mut o = vec![0.0f32; n_tok * ne];
+            self.matvec_multi(&format!("blk.{il}.attn_output.weight"), &attn, n_tok, &mut o)?;
+            for i in 0..n_tok * ne {
+                y[i] = x[i] + o[i];
             }
+
+            // FFN, also batched
             for t in 0..n_tok {
-                let xt = kernels::rms_norm(&y[t * ne..(t + 1) * ne], &fnorm, c.eps);
-                let gate = self.matvec2(&format!("blk.{il}.ffn_gate.weight"), &xt)?;
-                let up = self.matvec2(&format!("blk.{il}.ffn_up.weight"), &xt)?;
-                let h: Vec<f32> = gate
-                    .iter()
-                    .zip(up.iter())
-                    .map(|(g, u)| kernels::silu(*g) * *u)
-                    .collect();
-                let down = self.matvec2(&format!("blk.{il}.ffn_down.weight"), &h)?;
-                for i in 0..ne {
-                    x[t * ne + i] = y[t * ne + i] + down[i];
-                }
+                xn[t * ne..(t + 1) * ne]
+                    .copy_from_slice(&kernels::rms_norm(&y[t * ne..(t + 1) * ne], &fnorm, c.eps));
+            }
+            let n_ff = c.n_ff;
+            let mut gate = vec![0.0f32; n_tok * n_ff];
+            let mut up = vec![0.0f32; n_tok * n_ff];
+            self.matvec_multi(&format!("blk.{il}.ffn_gate.weight"), &xn, n_tok, &mut gate)?;
+            self.matvec_multi(&format!("blk.{il}.ffn_up.weight"), &xn, n_tok, &mut up)?;
+            for i in 0..n_tok * n_ff {
+                gate[i] = kernels::silu(gate[i]) * up[i];
+            }
+            let mut down = vec![0.0f32; n_tok * ne];
+            self.matvec_multi(&format!("blk.{il}.ffn_down.weight"), &gate, n_tok, &mut down)?;
+            for i in 0..n_tok * ne {
+                x[i] = y[i] + down[i];
             }
         }
 
@@ -780,17 +764,11 @@ impl Dspark {
         for t in 0..n_tok {
             emb[t * ne..(t + 1) * ne]
                 .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &on, c.eps));
-            // per-position matvec: the PQ2_0 path is threaded row-wise and beats
-            // the batched GEMM here because the block is compute-bound (the
-            // batched form is the right call on bandwidth-bound hardware).
-            self.matvec_range(
-                "output.weight",
-                0,
-                c.n_vocab,
-                &emb[t * ne..(t + 1) * ne],
-                &mut base[t * c.n_vocab..(t + 1) * c.n_vocab],
-            )?;
         }
+        // LM head once for every block position: the head is the largest tensor
+        // (379 MiB), so reading it once instead of n_tok times is the main
+        // traffic cut in the draft.
+        self.matvec_multi("output.weight", &emb, n_tok, &mut base)?;
 
         t_head += t_hd.elapsed().as_secs_f64();
         let t_mk = std::time::Instant::now();
