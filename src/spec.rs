@@ -161,20 +161,25 @@ pub fn round(
     let n_taps = taps_want.len();
     let mut taps: Vec<Vec<f32>> = vec![Vec::new(); n_taps];
 
-    // forward the pending token, mirroring its features into the drafter
+    // forward the pending token
     let h = dec.forward_hidden_taps(pending, n_past, &taps_want, &mut taps)?;
-    drafter.observe(&taps, n_past)?;
     let mut lg = dec.head_logits(&h)?;
     let mut forwards = 1usize;
 
-    // draft the block (positions n_past+1 ..), or at n_past for the reference
-    // anchor convention
-    let block_start = if std::env::var("BONSAI_DSPARK_ANCHOR_NPAST").is_ok() {
-        n_past
-    } else {
-        n_past + 1
-    };
+    // Reference (DeepSpec/MLX) order: the block's slot 0 is `pending` placed at
+    // its own position n_past, and the drafter context does NOT yet include
+    // pending (it is appended after verify). The old order injected pending
+    // first and anchored the block at n_past+1, which made logits[0] predict
+    // n_past+2 and cost ~4x acceptance (2.7% -> 39.6%).
+    let ref_order = std::env::var("BONSAI_DSPARK_OLD_BLOCK_ORDER").is_err();
+    if !ref_order {
+        drafter.observe(&taps, n_past)?;
+    }
+    let block_start = if ref_order { n_past } else { n_past + 1 };
     let drafts = drafter.propose(pending, block_start, n_draft)?;
+    if ref_order {
+        drafter.observe(&taps, n_past)?;
+    }
 
     // streaming verify: forward accepted drafts, stop at the first mismatch
     let mut a = 0usize;

@@ -612,3 +612,27 @@ Remaining leads, from the MLX reference (`ARahim3/mlx-dspark`,
 - block position 0 is the anchor and has no in-block predecessor (position 1
   reads the anchor's representation);
 - the card mentions "per-source-normalized hidden-state taps".
+
+### FIX: block ordering (2026-09-13) - 2.7% -> ~40%
+
+The MLX reference (generate.py dspark loop) builds the block as
+`[pending] + mask*(w-1)` and embeds slot 0 = pending at **its own position**,
+with the drafter context NOT yet containing pending (pending is appended from
+the verify pass afterwards). Our port injected pending first (ctx included it)
+and then anchored the block at `n_past + 1`, so `logits[0]` predicted
+`n_past + 2` - the drafter tracked the sequence but one step early.
+
+Fix (`src/spec.rs::round`): with the default order, draft **before** observing
+pending, anchor the block at `n_past`, then inject pending's features after the
+draft. `BONSAI_DSPARK_OLD_BLOCK_ORDER` restores the old behaviour.
+
+Effect (code prompt, n_draft 4, greedy IDENTICAL preserved):
+
+| order | acceptance |
+| --- | --- |
+| old (anchor n_past+1, observe first) | 3/112 = 2.7% |
+| **reference (anchor n_past, draft first)** | **19/48 = 39.6%** |
+
+Rounds now chain correctly (e.g. round 9 drafts `[84,18,17,2387]` accepted
+**4/4**; rounds 9, 10, 12 all 4/4). Round 1-3 still accept 0, which is the next
+thing to look at.
