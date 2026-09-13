@@ -140,6 +140,10 @@ This is a CPU-out-of-loop microbenchmark: at 2K context the KV read is ~0.3% of
 traffic, so it does not move decode wall-clock there; it matters at long context
 and it makes the dequant cheaper per element.
 
+Two related hot-path fixes landed with it: `dot_rotated` no longer allocates a
+`Vec` per (head, position) call (`dot_rotated_scratch` reuses `AttnScratch::vidx`),
+which removed ~768k allocations per token at 2K context.
+
 ## 8. Measured: how low the bits can go
 
 `BONSAI_KV=planarN` symmetric, qa prompt, `bonsai-golden` / `bonsai-gdecode`:
