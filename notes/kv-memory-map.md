@@ -151,9 +151,12 @@ which removed ~768k allocations per token at 2K context.
 | mode | K+V B/token/layer | vs f32 | greedy | logit rel (CPU / GPU) |
 | --- | --- | --- | --- | --- |
 | f32 | 8192 | 1.0x | 8160 | 4.03e-3 |
-| planar4 | 1056 | 7.8x | 8160 | ~4.1e-2 |
+| planar4 | 1056 | 7.8x | 8160 | 4.14e-2 / 4.43e-2 |
 | planar3 | 800 | 10.2x | 8160 | 4.68e-2 / 4.55e-2 |
 | **planar2** | **544** | **15.1x** | 8160 | 7.29e-2 / 7.62e-2 |
+
+Re-checked on the current binaries (after the group3 repack): `planar4` code
+2.72e-2 / 2.73e-2 and `planar2` code 7.09e-2 / 6.70e-2, all greedy 8160.
 
 `planar2` also matches greedy on the code prompt (CPU 7.09e-2, GPU 6.70e-2).
 All symmetric planar modes exceed the harness's 1e-2 logit tolerance by design;
