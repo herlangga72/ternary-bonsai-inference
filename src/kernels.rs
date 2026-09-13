@@ -74,6 +74,24 @@ pub fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     out
 }
 
+/// Allocation-free RMSNorm: `x_i <- x_i * w_i * rsqrt(mean(x^2) + eps)`.
+/// Same math as `rms_norm`, for hot loops that would otherwise allocate a
+/// vector per call (e.g. per attention head in the drafter).
+pub fn rms_norm_inplace(x: &mut [f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    if n == 0 {
+        return;
+    }
+    let mut ss = 0.0f32;
+    for &v in x.iter() {
+        ss += v * v;
+    }
+    let scale = 1.0 / (ss / n as f32 + eps).sqrt();
+    for i in 0..n {
+        x[i] = x[i] * scale * w[i];
+    }
+}
+
 /// RMSNorm applied to consecutive rows of `row_len`, each sharing the same
 /// `row_len`-long weight (per-head norms: q/k heads of 256, v-heads of 128).
 pub fn rms_norm_rows(x: &[f32], w: &[f32], row_len: usize, eps: f32) -> Result<Vec<f32>, String> {

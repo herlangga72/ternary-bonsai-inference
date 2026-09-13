@@ -434,8 +434,9 @@ impl Dspark {
         for t in 0..n_tok {
             let x = &features[t * n_enc..(t + 1) * n_enc];
             self.matvec_range("dspark.fc.weight", 0, n_embd, x, &mut y)?;
-            out[t * n_embd..(t + 1) * n_embd]
-                .copy_from_slice(&kernels::rms_norm(&y, &hidden_norm, self.cfg.eps));
+            let dst = &mut out[t * n_embd..(t + 1) * n_embd];
+            dst.copy_from_slice(&y);
+            kernels::rms_norm_inplace(dst, &hidden_norm, self.cfg.eps);
         }
         Ok(out)
     }
@@ -548,8 +549,7 @@ impl Dspark {
                 self.matvec_range(&wv, 0, n_kv_dim, x, &mut v)?;
                 for h in 0..c.n_head_kv {
                     let head = &mut k[h * c.head_dim..(h + 1) * c.head_dim];
-                    let n = kernels::rms_norm(head, &knorm, c.eps);
-                    head.copy_from_slice(&n);
+                    kernels::rms_norm_inplace(head, &knorm, c.eps);
                     rope_neox(head, pos as f32, c.head_dim, c.rope_freq_base);
                 }
                 cache.put(il, pos, &k, &v);
@@ -639,6 +639,19 @@ impl Dspark {
             return Err(format!("dspark: block end {max_pos} > ctx {}", cache.n_ctx));
         }
 
+        // per-block scratch, allocated once and reused across layers
+        let mut q = vec![0.0f32; n_tok * c.n_head * hd];
+        let mut kk = vec![0.0f32; n_tok * n_kv_dim];
+        let mut vv = vec![0.0f32; n_tok * n_kv_dim];
+        let mut xn = vec![0.0f32; n_tok * ne];
+        let mut attn = vec![0.0f32; n_tok * c.n_head * hd];
+        let mut scores = vec![0.0f32; cache.n_ctx];
+        let mut y = vec![0.0f32; n_tok * ne];
+        let mut o = vec![0.0f32; n_tok * ne];
+        let mut gate = vec![0.0f32; n_tok * c.n_ff];
+        let mut up = vec![0.0f32; n_tok * c.n_ff];
+        let mut down = vec![0.0f32; n_tok * ne];
+
         let t_lay = std::time::Instant::now();
         for il in 0..c.n_layer {
             let an = self.cached_f32(&format!("blk.{il}.attn_norm.weight"))?;
@@ -648,29 +661,24 @@ impl Dspark {
 
             // q/k/v projections for every block position in one pass, so each
             // weight row is fetched once per block rather than once per position
-            let mut xn = vec![0.0f32; n_tok * ne];
             for t in 0..n_tok {
-                xn[t * ne..(t + 1) * ne]
-                    .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &an, c.eps));
+                let dst = &mut xn[t * ne..(t + 1) * ne];
+                dst.copy_from_slice(&x[t * ne..(t + 1) * ne]);
+                kernels::rms_norm_inplace(dst, &an, c.eps);
             }
-            let mut q = vec![0.0f32; n_tok * c.n_head * hd];
-            let mut kk = vec![0.0f32; n_tok * n_kv_dim];
-            let mut vv = vec![0.0f32; n_tok * n_kv_dim];
             self.matvec_multi(&format!("blk.{il}.attn_q.weight"), &xn, n_tok, &mut q)?;
             self.matvec_multi(&format!("blk.{il}.attn_k.weight"), &xn, n_tok, &mut kk)?;
             self.matvec_multi(&format!("blk.{il}.attn_v.weight"), &xn, n_tok, &mut vv)?;
             for t in 0..n_tok {
                 for h in 0..c.n_head {
                     let head = &mut q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
-                    let n = kernels::rms_norm(head, &qn, c.eps);
-                    head.copy_from_slice(&n);
+                    kernels::rms_norm_inplace(head, &qn, c.eps);
                     rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
                 }
                 for h in 0..c.n_head_kv {
                     let base = t * n_kv_dim + h * hd;
                     let head = &mut kk[base..base + hd];
-                    let n = kernels::rms_norm(head, &kn, c.eps);
-                    head.copy_from_slice(&n);
+                    kernels::rms_norm_inplace(head, &kn, c.eps);
                     rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
                 }
                 cache.put(
@@ -688,8 +696,6 @@ impl Dspark {
             let noncausal = std::env::var("BONSAI_DSPARK_NONCAUSAL").is_ok();
             let scale = 1.0f32 / (hd as f32).sqrt();
             let filled = cache.filled;
-            let mut attn = vec![0.0f32; n_tok * c.n_head * hd];
-            let mut scores = vec![0.0f32; filled];
             let (kcache, vcache) = cache.prefix_f32(il);
             for t in 0..n_tok {
                 let n_ctx_pos = if noncausal { filled } else { positions[t] + 1 };
@@ -728,8 +734,6 @@ impl Dspark {
             }
 
             // output projection (batched over positions) + residual
-            let mut y = vec![0.0f32; n_tok * ne];
-            let mut o = vec![0.0f32; n_tok * ne];
             self.matvec_multi(&format!("blk.{il}.attn_output.weight"), &attn, n_tok, &mut o)?;
             for i in 0..n_tok * ne {
                 y[i] = x[i] + o[i];
@@ -737,18 +741,15 @@ impl Dspark {
 
             // FFN, also batched
             for t in 0..n_tok {
-                xn[t * ne..(t + 1) * ne]
-                    .copy_from_slice(&kernels::rms_norm(&y[t * ne..(t + 1) * ne], &fnorm, c.eps));
+                let dst = &mut xn[t * ne..(t + 1) * ne];
+                dst.copy_from_slice(&y[t * ne..(t + 1) * ne]);
+                kernels::rms_norm_inplace(dst, &fnorm, c.eps);
             }
-            let n_ff = c.n_ff;
-            let mut gate = vec![0.0f32; n_tok * n_ff];
-            let mut up = vec![0.0f32; n_tok * n_ff];
             self.matvec_multi(&format!("blk.{il}.ffn_gate.weight"), &xn, n_tok, &mut gate)?;
             self.matvec_multi(&format!("blk.{il}.ffn_up.weight"), &xn, n_tok, &mut up)?;
-            for i in 0..n_tok * n_ff {
+            for i in 0..n_tok * c.n_ff {
                 gate[i] = kernels::silu(gate[i]) * up[i];
             }
-            let mut down = vec![0.0f32; n_tok * ne];
             self.matvec_multi(&format!("blk.{il}.ffn_down.weight"), &gate, n_tok, &mut down)?;
             for i in 0..n_tok * ne {
                 x[i] = y[i] + down[i];
@@ -762,8 +763,9 @@ impl Dspark {
         let mut emb = vec![0.0f32; n_tok * ne];
         let mut base = vec![0.0f32; n_tok * c.n_vocab];
         for t in 0..n_tok {
-            emb[t * ne..(t + 1) * ne]
-                .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &on, c.eps));
+            let dst = &mut emb[t * ne..(t + 1) * ne];
+            dst.copy_from_slice(&x[t * ne..(t + 1) * ne]);
+            kernels::rms_norm_inplace(dst, &on, c.eps);
         }
         // LM head once for every block position: the head is the largest tensor
         // (379 MiB), so reading it once instead of n_tok times is the main
