@@ -1,0 +1,68 @@
+#version 450
+// Quantized-K attention scores: rotate the query with the cache's Givens
+// table, dequantize each cached key coordinate (centroid lookup) and dot.
+//
+// K is stored rotated, so `(R q) . dequant(R k)` already equals `q . k` up to
+// quantization error; no inverse rotation is needed for scores.
+//
+// One workgroup per query head; the scores are produced in shared-memory-free
+// form (each lane owns whole positions, as in the f32 kernel).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Q { float data[]; } q;
+layout(set = 0, binding = 1, std430) readonly buffer K { uint data[]; } kc;
+layout(set = 0, binding = 2, std430) buffer S { float data[]; } scores;
+layout(set = 0, binding = 3, std430) readonly buffer P { float data[]; } p;
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint n_kv;
+    uint bits;
+    uint pwords;
+    uint cent_off;
+    uint scale_bits;
+} pc;
+
+shared float qr[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint hd = pc.hd;
+
+    // rotate q: lane `lid` produces rotated coordinate `lid` from its pair
+    uint g = lid >> 1u;
+    float a = (2u * g < hd) ? q.data[h * hd + 2u * g] : 0.0;
+    float b = (2u * g + 1u < hd) ? q.data[h * hd + 2u * g + 1u] : 0.0;
+    float cc = p.data[2u * g];
+    float ss = p.data[2u * g + 1u];
+    qr[lid] = ((lid & 1u) == 0u) ? (cc * a - ss * b) : (ss * a + cc * b);
+    barrier();
+
+    uint kvheads = pc.n_kv;
+    uint kv = h / (pc.nheads / kvheads);
+    float scale = uintBitsToFloat(pc.scale_bits);
+    uint mask = (1u << pc.bits) - 1u;
+    uint row_words = pc.pwords + 1u;
+
+    for (uint pos = lid; pos < pc.n_pos; pos += 256u) {
+        uint base = (pos * pc.n_kv + kv) * row_words;
+        float acc = 0.0;
+        uint bitpos = 0u;
+        for (uint i = 0u; i < hd; ++i) {
+            uint byte = bitpos >> 3u;
+            uint off = bitpos & 7u;
+            uint v = (kc.data[base + (byte >> 2u)] >> (8u * (byte & 3u) + off)) & mask;
+            if (off + pc.bits > 8u) {
+                uint byte2 = byte + 1u;
+                uint hi = (kc.data[base + (byte2 >> 2u)] >> (8u * (byte2 & 3u)))
+                    & ((1u << (off + pc.bits - 8u)) - 1u);
+                v |= hi << (8u - off);
+            }
+            acc += qr[i] * p.data[pc.cent_off + v];
+            bitpos += pc.bits;
+        }
+        float nrm = uintBitsToFloat(kc.data[base + pc.pwords]);
+        scores.data[h * pc.n_pos + pos] = acc * nrm * scale;
+    }
+}

@@ -1,41 +1,39 @@
 # Plan: RotorQuant-style KV cache quantization
 
-> ## Status (2026-09-13): R0, R1, R2 done on CPU. R3 (GPU) NOT started.
+> ## Status (2026-09-13): R0-R3 done (CPU + GPU). R4/R5 pending.
 >
 > `src/kvquant.rs` implements the quantizer; `AttnCache`/`full_attention_layer`
-> use it. Selected with `BONSAI_KV=f32|planarN|planarNk` (N = 1..8; `planarNk`
+> use it on the CPU and `kv_store_q`/`attn_scores_q`/`attn_out_q` on the GPU.
+> Selected with `BONSAI_KV=f32|planarN|planarNk` (N = 1..8; `planarNk`
 > = K only, V f32). Default is `f32`, so nothing changes unless asked.
+> Batched prefill is not available with quantized KV (it writes f32 caches);
+> `bonsai-grun` falls back to the token loop.
 >
-> **Measured (qa prompt, 20 tokens; f32 baseline logit rel diff is 4.03e-3,
-> greedy 8160):**
+> **Measured logit rel diff vs the f32 baseline (4.03e-3 CPU / 4.41e-3 GPU),
+> greedy 8160 MATCH in every row:**
 >
-> | config | logit rel diff | greedy |
+> | config | CPU | GPU |
 > | --- | --- | --- |
-> | f32 (baseline) | 4.03e-3 | MATCH |
-> | planar2k | 4.07e-2 | MATCH |
-> | planar3k | 3.13e-2 | MATCH |
-> | planar4k | 2.07e-2 | MATCH |
-> | planar6k | 1.63e-2 | MATCH |
-> | planar8k | 1.07e-2 | MATCH |
-> | planar4 (symmetric) | 4.14e-2 | MATCH |
-> | planar8 (symmetric) | 2.43e-2 | MATCH |
+> | planar3k | 3.13e-2 | 3.06e-2 |
+> | planar4k | 2.07e-2 | 2.07e-2 |
+> | planar8k | 1.07e-2 | 1.05e-2 |
+> | planar4 (symmetric) | 4.14e-2 | 4.43e-2 |
 >
-> Greedy matches at every bit width on both prompts. The quantizer is
-> textbook-exact: measured per-coordinate RMSE is 18.58% of sigma at 3-bit and
-> 9.25% at 4-bit against the theoretical 18.58% / 9.75%, halving per bit.
+> CPU and GPU agree to within rounding at every width, and the quantizer is
+> textbook-exact (per-coordinate RMSE 18.58% of sigma at 3-bit, 9.25% at
+> 4-bit, against theory 18.58% / 9.75%). The error is monotone in bits, so it
+> is inherent quantization cost, not a bug.
 >
-> **Conclusion that changes the plan:** 3-4 bit KV quantization perturbs this
-> model's logits by 2-4% (5-10x the f32 baseline error), and the error is
-> monotone in bits, so it is inherent, not a bug. On a 20-token prompt greedy
-> survives, but this is a real quality cost and the 10.3x headline should not
-> be treated as free. The defensible operating points are:
->   - **f16 KV**: 2x saving, error ~1e-3 (not implemented; trivial).
->   - **8-bit planar K-only**: ~4x on K, logit error 1.07e-2.
->   - 3-4 bit: only if long-context memory forces it, and then measure PPL.
+> **Memory (ctx 2048, 16 full-attention layers):** f32 KV is 268 MB; 4-bit
+> K-only is 151 MB (1.8x, V dominates); 4-bit symmetric is ~35 MB (7.75x).
 >
-> R3 (GPU shaders) is worth doing only for a chosen operating point; at 3-4 bit
-> the quality tradeoff is significant enough that it should be a deliberate
-> decision first.
+> **Conclusion:** 3-4 bit KV perturbs this model's logits by 2-4% (5-10x the
+> f32 baseline). On a 20-token prompt greedy survives, but this is a real
+> quality cost and the 10.3x headline is not free. Defensible operating
+> points: f16 KV (not implemented), 8-bit K-only (~4x on K, 1.05e-2), or
+> 3-4 bit only when long context forces it. R4 should measure PPL/needle
+> before any of this becomes a default.
+>
 
 
 Goal: replace the f32 KV cache with a rotated + Lloyd-Max scalar-quantized

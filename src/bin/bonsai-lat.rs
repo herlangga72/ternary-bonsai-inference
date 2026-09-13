@@ -6,6 +6,8 @@
 mod gguf;
 #[path = "../kernels.rs"]
 mod kernels;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../vk.rs"]
 mod vk;
 

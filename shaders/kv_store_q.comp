@@ -1,0 +1,87 @@
+#version 450
+// Quantized KV append: rotate one kv head's vector, Lloyd-Max quantize each
+// rotated coordinate, pack the indices, and append the norm.
+//
+// Cache row layout per (token, kv head): `pwords` uint words of packed
+// indices followed by one word holding the f32 norm. Binding 3 holds the
+// Givens table (2 floats per pair) then the centroids.
+//
+// Dispatch: one workgroup per kv head; lane i owns coordinate i.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer R { float data[]; } r;
+layout(set = 0, binding = 1, std430) buffer C { uint data[]; } c;
+layout(set = 0, binding = 3, std430) readonly buffer P { float data[]; } p;
+layout(push_constant) uniform PC {
+    uint pos;
+    uint hd;
+    uint n_kv;
+    uint bits;
+    uint pwords;   // packed index words per row (norm word follows)
+    uint cent_off;
+    uint pad0;
+    uint pad1;
+} pc;
+
+shared float xs[256];
+shared float red[256];
+shared uint idxs[256];
+shared uint words[68];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint kv = gl_WorkGroupID.x;
+    uint hd = pc.hd;
+    float x = (lid < hd) ? r.data[kv * hd + lid] : 0.0;
+    xs[lid] = x;
+    red[lid] = x * x;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) { red[lid] += red[lid + s]; }
+        barrier();
+    }
+    float n = sqrt(red[0]);
+
+    float inv = (n > 1e-12) ? 1.0 / n : 0.0;
+    uint g = lid >> 1u;
+    float a = xs[2u * g] * inv;
+    float b = xs[2u * g + 1u] * inv;
+    float cc = p.data[2u * g];
+    float ss = p.data[2u * g + 1u];
+    float rv = ((lid & 1u) == 0u) ? (cc * a - ss * b) : (ss * a + cc * b);
+
+    uint nlev = 1u << pc.bits;
+    uint best = 0u;
+    float bd = 1e30;
+    for (uint j = 0u; j < nlev; ++j) {
+        float cv = p.data[pc.cent_off + j];
+        float dv = abs(rv - cv);
+        if (dv < bd) { bd = dv; best = j; }
+    }
+    idxs[lid] = best;
+    barrier();
+
+    if (lid == 0u) {
+        uint nwords = pc.pwords;
+        for (uint w = 0u; w < nwords + 1u; ++w) { words[w] = 0u; }
+        uint bitpos = 0u;
+        for (uint i = 0u; i < hd; ++i) {
+            uint v = idxs[i];
+            uint byte = bitpos >> 3u;
+            uint off = bitpos & 7u;
+            words[byte >> 2u] |= v << (8u * (byte & 3u) + off);
+            if (off + pc.bits > 8u) {
+                uint byte2 = byte + 1u;
+                words[byte2 >> 2u] |= (v >> (8u - off)) << (8u * (byte2 & 3u));
+            }
+            bitpos += pc.bits;
+        }
+        words[nwords] = floatBitsToUint(n); // norm word
+    }
+    barrier();
+
+    uint row_words = pc.pwords + 1u;
+    uint base = (pc.pos * pc.n_kv + kv) * row_words;
+    for (uint w = lid; w < row_words; w += 256u) {
+        c.data[base + w] = words[w];
+    }
+}

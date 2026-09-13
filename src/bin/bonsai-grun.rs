@@ -96,6 +96,8 @@ fn main() {
     // the token loop, so the default there is the token loop unless BONSAI_BATCH
     // names an explicit window. ----
     let (batch_enabled, window) = gdev::batch_cfg(dev.gpu.discrete);
+    // Quantized KV only supports the single-token path for now.
+    let batch_enabled = batch_enabled && dev.kv_quantized().is_none();
     let use_batch = batch_enabled && toks.len() >= 2;
     if use_batch {
         // gather all N prompt embeddings into one tile, then run the batched

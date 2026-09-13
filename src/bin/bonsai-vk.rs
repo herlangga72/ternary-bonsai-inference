@@ -13,6 +13,8 @@ mod gdn;
 mod kernels;
 #[path = "../rope.rs"]
 mod rope;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../vk.rs"]
 mod vk;
 

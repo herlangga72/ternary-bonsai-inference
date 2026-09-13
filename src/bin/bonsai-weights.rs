@@ -11,6 +11,8 @@ mod gguf;
 mod kernels;
 #[path = "../weights.rs"]
 mod weights;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../vk.rs"]
 mod vk;
 

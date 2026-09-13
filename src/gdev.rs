@@ -231,6 +231,14 @@ pub struct GDev {
 
     kcache: Vec<Option<DevBuf>>,
     vcache: Vec<Option<DevBuf>>,
+    /// Quantized KV path (BONSAI_KV): params needed to pack/unpack and the
+    /// packed caches. `None` on every field means the f32 path is in use.
+    kv_bits: Option<u32>,
+    kv_pwords: usize,
+    kv_cent_off: usize,
+    kv_v_quant: bool,
+    kq: Vec<Option<DevBuf>>,
+    vq: Vec<Option<DevBuf>>,
     conv_cache: Vec<Option<DevBuf>>,
     state: Vec<Option<DevBuf>>,
 }
@@ -318,18 +326,95 @@ impl GDev {
         let kv_bytes = vec![0u8; n_ctx * KV_STRIDE * 4];
         let conv_bytes = vec![0u8; 3 * GDN_CH * 4];
         let state_bytes = vec![0u8; GDN_STATE_ELEMS * 4];
+
+        // KV quantization (BONSAI_KV): pack K (and optionally V) instead of f32.
+        let (kq_mode, vq_mode) = crate::kvquant::from_env(HEAD_D);
+        let mut kq: Vec<Option<DevBuf>> = Vec::new();
+        let mut vq: Vec<Option<DevBuf>> = Vec::new();
+        let kv_bits;
+        let kv_pwords;
+        let kv_cent_off;
+        let kv_v_quant;
+        match kq_mode.as_ref() {
+            Some(pqm) => {
+                let bits = pqm.bits;
+                let pbytes = pqm.packed_len();
+                if pbytes % 4 != 0 {
+                    return Err(format!(
+                        "gdev: packed KV row of {pbytes} bytes is not word aligned"
+                    ));
+                }
+                kv_bits = Some(bits);
+                kv_pwords = pbytes / 4;
+                kv_cent_off = HEAD_D.div_ceil(2) * 2;
+                kv_v_quant = vq_mode.is_some();
+                let mut data: Vec<f32> = Vec::with_capacity(kv_cent_off + 256);
+                for (c, s) in crate::kvquant::givens_table(HEAD_D) {
+                    data.push(*c);
+                    data.push(*s);
+                }
+                data.extend_from_slice(crate::kvquant::codebook(HEAD_D, bits));
+                gpu.upload_kv_params(&data)?;
+                let n_fa = (0..cfg.n_layer)
+                    .filter(|&l| cfg.is_full_attention(l))
+                    .count();
+                let f32_bytes = n_fa * 2 * n_ctx * KV_STRIDE * 4;
+                let q_bytes = n_fa * n_ctx * N_KV * (kv_pwords + 1) * 4
+                    * if kv_v_quant { 2 } else { 1 }
+                    + if kv_v_quant {
+                        0
+                    } else {
+                        n_fa * n_ctx * KV_STRIDE * 4
+                    };
+                eprintln!(
+                    "[gdev] KV quantized: {} bits, K{}: ctx {n_ctx} -> {:.1} MB (f32 {:.1} MB, {:.1}x)",
+                    bits,
+                    if kv_v_quant { "+V" } else { " only" },
+                    q_bytes as f64 / 1e6,
+                    f32_bytes as f64 / 1e6,
+                    f32_bytes as f64 / q_bytes as f64
+                );
+            }
+            None => {
+                kv_bits = None;
+                kv_pwords = 0;
+                kv_cent_off = 0;
+                kv_v_quant = false;
+            }
+        }
+
         for il in 0..cfg.n_layer {
             let fa = cfg.is_full_attention(il);
             if fa {
-                let k = make(&mut gpu, n_ctx * KV_STRIDE)?;
-                let v = make(&mut gpu, n_ctx * KV_STRIDE)?;
-                gpu.upload(&k, &kv_bytes)?;
-                gpu.upload(&v, &kv_bytes)?;
-                kcache.push(Some(k));
-                vcache.push(Some(v));
+                if kv_bits.is_some() {
+                    let words = n_ctx * N_KV * (kv_pwords + 1);
+                    kq.push(Some(make(&mut gpu, words)?));
+                    if kv_v_quant {
+                        vq.push(Some(make(&mut gpu, words)?));
+                        vcache.push(None);
+                    } else {
+                        // K-only: V stays f32, so the existing attn_out applies.
+                        vq.push(None);
+                        let v = make(&mut gpu, n_ctx * KV_STRIDE)?;
+                        gpu.upload(&v, &kv_bytes)?;
+                        vcache.push(Some(v));
+                    }
+                    kcache.push(None);
+                } else {
+                    let k = make(&mut gpu, n_ctx * KV_STRIDE)?;
+                    let v = make(&mut gpu, n_ctx * KV_STRIDE)?;
+                    gpu.upload(&k, &kv_bytes)?;
+                    gpu.upload(&v, &kv_bytes)?;
+                    kcache.push(Some(k));
+                    vcache.push(Some(v));
+                    kq.push(None);
+                    vq.push(None);
+                }
             } else {
                 kcache.push(None);
                 vcache.push(None);
+                kq.push(None);
+                vq.push(None);
             }
             if fa {
                 conv_cache.push(None);
@@ -400,6 +485,12 @@ impl GDev {
             h1,
             kcache,
             vcache,
+            kv_bits,
+            kv_pwords,
+            kv_cent_off,
+            kv_v_quant,
+            kq,
+            vq,
             conv_cache,
             state,
         })
@@ -411,6 +502,11 @@ impl GDev {
             .get(name)
             .ok_or_else(|| format!("gdev: tensor {name} missing"))?;
         Ok((t.buf, t.ne0, t.rows))
+    }
+
+    /// Some(bits) when the device path is using a quantized KV cache.
+    pub fn kv_quantized(&self) -> Option<u32> {
+        self.kv_bits
     }
 
     fn rec_attn_layer(&mut self, il: usize, pos: usize) -> Result<(), String> {
@@ -457,40 +553,168 @@ impl GDev {
         self.gpu.rec_dispatch("rope_imrope", &self.qn, &self.qn, &self.qn, pc_u32(&pc_rope), N_HEAD as u32)?;
         self.gpu.rec_dispatch("rope_imrope", &self.kn, &self.kn, &self.kn, pc_u32(&pc_rope), N_KV as u32)?;
 
-        self.gpu.ensure_kernel("kv_store", vk::KV_STORE_SPV)?;
-        let pc_kv = [pos as u32, KV_STRIDE as u32];
-        self.gpu.rec_dispatch(
-            "kv_store",
-            &self.kn,
-            self.kcache[il].as_ref().unwrap(),
-            self.kcache[il].as_ref().unwrap(),
-            pc_u32(&pc_kv),
-            KV_STRIDE.div_ceil(256) as u32,
-        )?;
-        self.gpu.rec_dispatch(
-            "kv_store",
-            &self.vraw,
-            self.vcache[il].as_ref().unwrap(),
-            self.vcache[il].as_ref().unwrap(),
-            pc_u32(&pc_kv),
-            KV_STRIDE.div_ceil(256) as u32,
-        )?;
-
         let n_pos = pos + 1;
+        let scale_bits = (1.0 / (HEAD_D as f32).sqrt()).to_bits();
         let pc_att = [
             N_HEAD as u32,
             n_pos as u32,
             HEAD_D as u32,
             KV_STRIDE as u32,
-            (1.0 / (HEAD_D as f32).sqrt()).to_bits(),
+            scale_bits,
             0,
         ];
-        self.gpu.ensure_kernel("attn_scores", vk::ATTN_SCORES_SPV)?;
-        self.gpu.rec_dispatch("attn_scores", &self.qn, self.kcache[il].as_ref().unwrap(), &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
-        self.gpu.ensure_kernel("softmax_inplace", vk::SOFTMAX_INPLACE_SPV)?;
-        self.gpu.rec_dispatch("softmax_inplace", &self.scores, &self.scores, &self.scores, pc_u32(&pc_att), N_HEAD as u32)?;
-        self.gpu.ensure_kernel("attn_out", vk::ATTN_OUT_SPV)?;
-        self.gpu.rec_dispatch("attn_out", &self.scores, self.vcache[il].as_ref().unwrap(), &self.attn_h, pc_u32(&pc_att), N_HEAD as u32)?;
+
+        if let Some(bits) = self.kv_bits {
+            // Quantized path: pack K (and V) then attend against the packed cache.
+            let pwords = self.kv_pwords as u32;
+            let cent_off = self.kv_cent_off as u32;
+            let pc_q = [
+                pos as u32,
+                HEAD_D as u32,
+                N_KV as u32,
+                bits,
+                pwords,
+                cent_off,
+                0,
+                0,
+            ];
+            self.gpu.ensure_kernel("kv_store_q", vk::KV_STORE_Q_SPV)?;
+            let kqb = self.kq[il].as_ref().unwrap();
+            self.gpu
+                .rec_dispatch("kv_store_q", &self.kn, kqb, kqb, pc_u32(&pc_q), N_KV as u32)?;
+            if let Some(vqb) = self.vq[il].as_ref() {
+                self.gpu.rec_dispatch(
+                    "kv_store_q",
+                    &self.vraw,
+                    vqb,
+                    vqb,
+                    pc_u32(&pc_q),
+                    N_KV as u32,
+                )?;
+            } else {
+                // K-only: V still lands in the f32 cache for the f32 attn_out.
+                self.gpu.ensure_kernel("kv_store", vk::KV_STORE_SPV)?;
+                let pc_kv = [pos as u32, KV_STRIDE as u32];
+                self.gpu.rec_dispatch(
+                    "kv_store",
+                    &self.vraw,
+                    self.vcache[il].as_ref().unwrap(),
+                    self.vcache[il].as_ref().unwrap(),
+                    pc_u32(&pc_kv),
+                    KV_STRIDE.div_ceil(256) as u32,
+                )?;
+            }
+
+            let pc_a = [
+                N_HEAD as u32,
+                n_pos as u32,
+                HEAD_D as u32,
+                N_KV as u32,
+                bits,
+                pwords,
+                cent_off,
+                scale_bits,
+            ];
+            self.gpu
+                .ensure_kernel("attn_scores_q", vk::ATTN_SCORES_Q_SPV)?;
+            self.gpu.rec_dispatch(
+                "attn_scores_q",
+                &self.qn,
+                kqb,
+                &self.scores,
+                pc_u32(&pc_a),
+                N_HEAD as u32,
+            )?;
+            self.gpu
+                .ensure_kernel("softmax_inplace", vk::SOFTMAX_INPLACE_SPV)?;
+            self.gpu.rec_dispatch(
+                "softmax_inplace",
+                &self.scores,
+                &self.scores,
+                &self.scores,
+                pc_u32(&pc_att),
+                N_HEAD as u32,
+            )?;
+            if let Some(vqb) = self.vq[il].as_ref() {
+                self.gpu.ensure_kernel("attn_out_q", vk::ATTN_OUT_Q_SPV)?;
+                let pc_o = [
+                    N_HEAD as u32,
+                    n_pos as u32,
+                    HEAD_D as u32,
+                    N_KV as u32,
+                    bits,
+                    pwords,
+                    cent_off,
+                    0,
+                ];
+                self.gpu.rec_dispatch(
+                    "attn_out_q",
+                    &self.scores,
+                    vqb,
+                    &self.attn_h,
+                    pc_u32(&pc_o),
+                    N_HEAD as u32,
+                )?;
+            } else {
+                self.gpu.ensure_kernel("attn_out", vk::ATTN_OUT_SPV)?;
+                self.gpu.rec_dispatch(
+                    "attn_out",
+                    &self.scores,
+                    self.vcache[il].as_ref().unwrap(),
+                    &self.attn_h,
+                    pc_u32(&pc_att),
+                    N_HEAD as u32,
+                )?;
+            }
+        } else {
+            self.gpu.ensure_kernel("kv_store", vk::KV_STORE_SPV)?;
+            let pc_kv = [pos as u32, KV_STRIDE as u32];
+            self.gpu.rec_dispatch(
+                "kv_store",
+                &self.kn,
+                self.kcache[il].as_ref().unwrap(),
+                self.kcache[il].as_ref().unwrap(),
+                pc_u32(&pc_kv),
+                KV_STRIDE.div_ceil(256) as u32,
+            )?;
+            self.gpu.rec_dispatch(
+                "kv_store",
+                &self.vraw,
+                self.vcache[il].as_ref().unwrap(),
+                self.vcache[il].as_ref().unwrap(),
+                pc_u32(&pc_kv),
+                KV_STRIDE.div_ceil(256) as u32,
+            )?;
+
+            self.gpu.ensure_kernel("attn_scores", vk::ATTN_SCORES_SPV)?;
+            self.gpu.rec_dispatch(
+                "attn_scores",
+                &self.qn,
+                self.kcache[il].as_ref().unwrap(),
+                &self.scores,
+                pc_u32(&pc_att),
+                N_HEAD as u32,
+            )?;
+            self.gpu
+                .ensure_kernel("softmax_inplace", vk::SOFTMAX_INPLACE_SPV)?;
+            self.gpu.rec_dispatch(
+                "softmax_inplace",
+                &self.scores,
+                &self.scores,
+                &self.scores,
+                pc_u32(&pc_att),
+                N_HEAD as u32,
+            )?;
+            self.gpu.ensure_kernel("attn_out", vk::ATTN_OUT_SPV)?;
+            self.gpu.rec_dispatch(
+                "attn_out",
+                &self.scores,
+                self.vcache[il].as_ref().unwrap(),
+                &self.attn_h,
+                pc_u32(&pc_att),
+                N_HEAD as u32,
+            )?;
+        }
 
         // out = wo @ (sigmoid(gate) . attn_h); reuse qfull as the gated buffer
         rec_elem(&mut self.gpu, &self.gate, &self.attn_h, &self.qfull, N_HEAD * HEAD_D, 4)?;
@@ -1027,6 +1251,13 @@ impl GDev {
         n: usize,
         window: usize,
     ) -> Result<Vec<f32>, String> {
+        if self.kv_bits.is_some() {
+            return Err(
+                "prefill_batch_windowed: not available with BONSAI_KV quantization \
+                 (the batched path writes f32 KV caches); use the token loop"
+                    .into(),
+            );
+        }
         if n < 1 {
             return Err("prefill_batch_windowed: empty batch".into());
         }

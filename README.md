@@ -101,6 +101,12 @@ The PQ2_0 matvec is the fused single-pass kernel (`pq2_matvec_fused.comp`, one
 workgroup per row with a shared-memory reduction, no `partials` round trip);
 `BONSAI_MATVEC=2pass` restores the older two-pass path for comparison.
 
+The KV cache can be rotation-quantized (RotorQuant/PlanarQuant family, see
+`notes/kv-rotorquant-plan.md`): `BONSAI_KV=planarN` (N = 1..8) quantizes both K
+and V, `planarNk` quantizes K only. Default is `f32`. This trades quality for
+memory (4-bit symmetric is ~7.75x smaller at ctx 2048) and is not a speedup at
+short context; batched prefill is unavailable while it is on.
+
 ```sh
 ./target/release/bonsai-grun Ternary-Bonsai-27B-PQ2_0.gguf "What is the capital of France?" 24
 ./target/release/bonsai-gdecode Ternary-Bonsai-27B-PQ2_0.gguf golden/prompts/qa.txt golden/qa.logits.bin

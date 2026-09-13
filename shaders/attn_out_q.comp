@@ -1,0 +1,66 @@
+#version 450
+// Quantized-V attention output: dequantize each cached value coordinate, form
+// the probability-weighted sum in rotated space, then inverse-rotate once.
+//
+// One workgroup per query head; lane d owns dimension d of the output head.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Pr { float data[]; } prob;
+layout(set = 0, binding = 1, std430) readonly buffer V { uint data[]; } vc;
+layout(set = 0, binding = 2, std430) buffer O { float data[]; } o;
+layout(set = 0, binding = 3, std430) readonly buffer P { float data[]; } p;
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint n_kv;
+    uint bits;
+    uint pwords;
+    uint cent_off;
+    uint pad;
+} pc;
+
+shared float acc[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint hd = pc.hd;
+    uint kvheads = pc.n_kv;
+    uint kv = h / (pc.nheads / kvheads);
+
+    uint mask = (1u << pc.bits) - 1u;
+    uint row_words = pc.pwords + 1u;
+    // pre-extract this lane's bit position within a packed row
+    uint bitpos = lid * pc.bits;
+    uint byte = bitpos >> 3u;
+    uint off = bitpos & 7u;
+    uint wi0 = byte >> 2u;
+    uint sh0 = 8u * (byte & 3u) + off;
+    bool need2 = (off + pc.bits) > 8u;
+    uint wi1 = (byte + 1u) >> 2u;
+    uint sh1 = 8u * ((byte + 1u) & 3u);
+    uint himask = (1u << (off + pc.bits - 8u)) - 1u;
+
+    float a = 0.0;
+    for (uint pos = 0u; pos < pc.n_pos; ++pos) {
+        float pr = prob.data[h * pc.n_pos + pos];
+        if (pr == 0.0) { continue; }
+        uint base = (pos * pc.n_kv + kv) * row_words;
+        uint v = (vc.data[base + wi0] >> sh0) & mask;
+        if (need2) {
+            v |= ((vc.data[base + wi1] >> sh1) & himask) << (8u - off);
+        }
+        float nrm = uintBitsToFloat(vc.data[base + pc.pwords]);
+        a += pr * nrm * p.data[pc.cent_off + v];
+    }
+    acc[lid] = a;
+    barrier();
+
+    uint g = lid >> 1u;
+    float x0 = acc[2u * g];
+    float x1 = acc[2u * g + 1u];
+    float cc = p.data[2u * g];
+    float ss = p.data[2u * g + 1u];
+    float outv = ((lid & 1u) == 0u) ? (cc * x0 + ss * x1) : (-ss * x0 + cc * x1);
+    o.data[h * hd + lid] = outv;
+}

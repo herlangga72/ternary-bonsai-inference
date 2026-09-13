@@ -68,6 +68,15 @@ pub const PQ2_ROWSUM_SPV: &[u8] =
 pub const PQ2_MATVEC_FUSED_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pq2_matvec_fused.spv"));
 
+/// SPIR-V for the quantized-KV path (`shaders/kv_store_q.comp`,
+/// `attn_scores_q.comp`, `attn_out_q.comp`). See notes/kv-rotorquant-plan.md.
+pub const KV_STORE_Q_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/kv_store_q.spv"));
+pub const ATTN_SCORES_Q_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_scores_q.spv"));
+pub const ATTN_OUT_Q_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_out_q.spv"));
+
 /// SPIR-V for the N-column (batched) two-pass PQ2_0 GEMM
 /// (`shaders/pq2_partial_n.comp`, `shaders/pq2_rowsum_n.comp`), P2 of
 /// notes/prefill-plan.md. One weight block is read once and reused across N
@@ -129,6 +138,10 @@ pub const GDN_STATE_LEN: usize = GDN_HV * 128 * 128;
 /// GLSL source.
 pub const LOCAL_X: u32 = 256;
 
+/// Size of the KV quantization params buffer (binding 3): up to 128 Givens
+/// pairs (256 f32) followed by up to 256 Lloyd-Max centroids.
+const KV_PARAMS_FLOATS: usize = 512;
+
 struct RawBuf {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -169,6 +182,9 @@ pub struct Gpu {
     rec_fence: Option<vk::Fence>,
     rec_dummy: Option<DevBuf>,
     rec_open: bool,
+    /// Binding 3 for every pipeline: KV quantization tables (Givens pairs then
+    /// Lloyd-Max centroids). Always bound; unused by kernels that ignore it.
+    kv_params: Option<RawBuf>,
     pub name: String,
     pub discrete: bool,
 }
@@ -294,7 +310,7 @@ impl Gpu {
             "create_command_pool",
         )?;
 
-        // ---- descriptor set layout: 3 storage buffers -----------------------
+        // ---- descriptor set layout: 4 storage buffers -----------------------
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -308,6 +324,11 @@ impl Gpu {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -379,9 +400,46 @@ impl Gpu {
             rec_fence: None,
             rec_dummy: None,
             rec_open: false,
+            kv_params: None,
             name,
             discrete,
         })
+    }
+
+    /// Create the shared KV-quantization params buffer (binding 3) if absent.
+    pub fn ensure_kv_params(&mut self) -> Result<(), String> {
+        if self.kv_params.is_some() {
+            return Ok(());
+        }
+        let b = unsafe {
+            self.create_host_buffer(
+                KV_PARAMS_FLOATS * 4,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?
+        };
+        self.kv_params = Some(b);
+        Ok(())
+    }
+
+    /// Upload the KV quantization tables: `[givens (2*n_groups f32)][centroids]`.
+    pub fn upload_kv_params(&mut self, data: &[f32]) -> Result<(), String> {
+        self.ensure_kv_params()?;
+        let b = self.kv_params.as_mut().unwrap();
+        if data.len() * 4 > b.len {
+            return Err(format!(
+                "upload_kv_params: {} floats do not fit {} bytes",
+                data.len(),
+                b.len
+            ));
+        }
+        let mut bytes = Vec::with_capacity(data.len() * 4);
+        for v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        unsafe {
+            b.data_mut()[..bytes.len()].copy_from_slice(&bytes);
+        }
+        Ok(())
     }
 
     /// Pre-allocate the reusable matvec cache. `max_ne0`/`max_rows` must cover
@@ -399,7 +457,7 @@ impl Gpu {
 
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3)];
+                .descriptor_count(4)];
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&sizes);
@@ -674,16 +732,19 @@ impl Gpu {
     }
 
     /// Create a descriptor set for one [w, x, y] storage-buffer binding from a
-    /// fresh pool (max_sets 1). Used by the bench and, later, per launch.
+    /// fresh pool (max_sets 1). Binding 3 is always the KV params buffer.
+    /// Used by the bench and, later, per launch.
     unsafe fn make_set(
-        &self,
+        &mut self,
         w: vk::Buffer,
         x: vk::Buffer,
         y: vk::Buffer,
     ) -> Result<(vk::DescriptorPool, vk::DescriptorSet), String> {
+        self.ensure_kv_params()?;
+        let params = self.kv_params.as_ref().unwrap().buffer;
         let sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(3)];
+            .descriptor_count(4)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(1)
             .pool_sizes(&sizes);
@@ -704,6 +765,7 @@ impl Gpu {
             vk::DescriptorBufferInfo::default().buffer(w).range(vk::WHOLE_SIZE),
             vk::DescriptorBufferInfo::default().buffer(x).range(vk::WHOLE_SIZE),
             vk::DescriptorBufferInfo::default().buffer(y).range(vk::WHOLE_SIZE),
+            vk::DescriptorBufferInfo::default().buffer(params).range(vk::WHOLE_SIZE),
         ];
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -721,6 +783,11 @@ impl Gpu {
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&infos[2..3]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&infos[3..4]),
         ];
         self.device.update_descriptor_sets(&writes, &[]);
         Ok((pool, set))
@@ -1889,7 +1956,7 @@ impl Gpu {
             // descriptor set for this run
             let pool_sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(3)];
+                .descriptor_count(4)];
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(1)
                 .pool_sizes(&pool_sizes);
@@ -2012,7 +2079,7 @@ impl Gpu {
         if self.rec_pool.is_none() {
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(8192 * 3)];
+                .descriptor_count(8192 * 4)];
             let pool_info = vk::DescriptorPoolCreateInfo::default()
                 .max_sets(8192)
                 .pool_sizes(&sizes);
@@ -2056,6 +2123,7 @@ impl Gpu {
     /// Allocate one descriptor set from the per-token pool and point it at the
     /// three buffers (bindings 0,1,2).
     fn rec_set(&mut self, a: &DevBuf, b: &DevBuf, c: &DevBuf) -> Result<vk::DescriptorSet, String> {
+        self.ensure_kv_params()?;
         let pool = self.rec_pool.ok_or("rec_set: pool not created")?;
         unsafe {
             let layouts = [self.desc_layout];
@@ -2067,10 +2135,16 @@ impl Gpu {
                 .allocate_descriptor_sets(&alloc_info)
                 .map_err(|e| format!("rec_set: alloc: {e}"))?;
             let set = sets[0];
+            let params = self
+                .kv_params
+                .as_ref()
+                .ok_or("rec_set: kv params buffer not created")?
+                .buffer;
             let infos = [
                 vk::DescriptorBufferInfo::default().buffer(a.buffer).range(vk::WHOLE_SIZE),
                 vk::DescriptorBufferInfo::default().buffer(b.buffer).range(vk::WHOLE_SIZE),
                 vk::DescriptorBufferInfo::default().buffer(c.buffer).range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default().buffer(params).range(vk::WHOLE_SIZE),
             ];
             let writes = [
                 vk::WriteDescriptorSet::default()
@@ -2088,6 +2162,11 @@ impl Gpu {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                     .buffer_info(&infos[2..3]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&infos[3..4]),
             ];
             self.device.update_descriptor_sets(&writes, &[]);
             Ok(set)

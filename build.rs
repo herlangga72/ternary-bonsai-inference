@@ -15,6 +15,9 @@ fn compile_shaders() {
     let shader_dir = manifest.join("shaders");
     let vendored = manifest.join("spv");
     let tool = find_in_path("glslangValidator");
+    // Watch the directory too: a newly added .comp must re-run this script,
+    // otherwise OUT_DIR would be missing its module.
+    println!("cargo:rerun-if-changed={}", shader_dir.display());
     let Ok(entries) = std::fs::read_dir(&shader_dir) else {
         return;
     };
