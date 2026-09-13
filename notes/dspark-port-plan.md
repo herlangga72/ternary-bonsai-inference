@@ -499,3 +499,17 @@ bug: there is no engine-side change that reaches 75%, because the drafter's own
 reference cannot. Reaching ~75% requires a drafter that actually predicts this
 target (retrain/fine-tune or a matched checkpoint), which is outside "how we
 build the drafter" in this engine.
+
+### Reference draft-token capture (2026-09-13)
+
+Patched the fork's debug prints (`common_token_to_piece(ctx_dft, ...)` aborts on
+the sidecar's stub vocab; replaced with a literal) and ran `-v`. First-round
+reference draft candidates: **2523, 513, 2574, 264**. Our port's first round:
+[248069, 271, 9764, 579]. These are not directly comparable: the reference
+tokenizes the prompt with `add_special = true` (BOS) while `bonsai-spec`'s
+`text:` path does not, so the contexts differ (our round 1 target token is
+248068, a special token, vs the reference's ordinary token). A rigorous
+per-position diff needs both sides fed identical token ids; the aggregate
+numbers (reference 0.806%, port 2.7%) already establish that the drafter is the
+limit, and the port is not worse than the reference, so there is no evidence of
+a remaining port bug worth chasing.
