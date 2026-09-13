@@ -296,6 +296,9 @@ pub fn matvec_par(
     if ty == TYPE_PQ2_0 {
         return kernels::pq2_matvec_range(payload, ne0, base_row, n_rows, x, y);
     }
+    if ty == TYPE_Q4_1 {
+        return kernels::q4_1_matvec_range(payload, ne0, base_row, n_rows, x, y);
+    }
     if !type_supported(ty) {
         return Err(format!("dspark matvec: unsupported tensor type {ty}"));
     }

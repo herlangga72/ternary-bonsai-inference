@@ -403,6 +403,155 @@ pub fn pq2_matmul_n(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Q4_1 (used only by the dspark drafter sidecar)
+// ---------------------------------------------------------------------------
+
+const Q4_1_QK: usize = 32;
+const Q4_1_BLOCK: usize = 20; // fp16 d, fp16 m, 16 nibble bytes
+
+/// Row stride in bytes for a Q4_1 tensor with `ne0` columns.
+pub fn q4_1_row_bytes(ne0: usize) -> usize {
+    ne0.div_ceil(Q4_1_QK) * Q4_1_BLOCK
+}
+
+/// Scalar Q4_1 row dot: `sum_j x[j] * (d*q_j + m)`, laid out as ggml
+/// (`block_q4_1`: elements 0..16 low nibbles, 16..32 high nibbles).
+fn q4_1_row_dot_scalar(raw: &[u8], ne0: usize, x: &[f32], xbs: &[f32]) -> f32 {
+    let nblk = ne0.div_ceil(Q4_1_QK);
+    let mut acc = 0.0f32;
+    for blk in 0..nblk {
+        let chunk = &raw[blk * Q4_1_BLOCK..(blk + 1) * Q4_1_BLOCK];
+        let d = half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        let m = half_to_f32(u16::from_le_bytes([chunk[2], chunk[3]]));
+        let qs = &chunk[4..20];
+        let base = blk * Q4_1_QK;
+        let mut bs = 0.0f32;
+        for j in 0..16 {
+            if base + j < ne0 {
+                bs += x[base + j] * (qs[j] & 0x0f) as f32;
+            }
+            if base + 16 + j < ne0 {
+                bs += x[base + 16 + j] * (qs[j] >> 4) as f32;
+            }
+        }
+        acc += d * bs + m * xbs[blk];
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4_1_row_dot_avx2(raw: &[u8], ne0: usize, x: &[f32], xbs: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(ne0 % Q4_1_QK, 0);
+    let nblk = ne0 / Q4_1_QK;
+    let mask = _mm_set1_epi8(0x0f);
+    let mut scalar_acc = 0.0f32;
+    for blk in 0..nblk {
+        let chunk = raw.as_ptr().add(blk * Q4_1_BLOCK);
+        let d = half_to_f32(u16::from_le_bytes([*chunk, *chunk.add(1)]));
+        let m = half_to_f32(u16::from_le_bytes([*chunk.add(2), *chunk.add(3)]));
+        let qs = chunk.add(4);
+        let mut acc = _mm256_setzero_ps();
+        for k in 0..2 {
+            let v = _mm_loadl_epi64(qs.add(k * 8) as *const __m128i);
+            let lo = _mm_and_si128(v, mask);
+            let hi = _mm_and_si128(_mm_srli_epi16(v, 4), mask);
+            let lo_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+            let hi_f = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+            let xlo = _mm256_loadu_ps(x.as_ptr().add(blk * Q4_1_QK + k * 8));
+            let xhi = _mm256_loadu_ps(x.as_ptr().add(blk * Q4_1_QK + 16 + k * 8));
+            acc = _mm256_fmadd_ps(xlo, lo_f, acc);
+            acc = _mm256_fmadd_ps(xhi, hi_f, acc);
+        }
+        let mut lanes = [0.0f32; 8];
+        _mm256_storeu_ps(lanes.as_mut_ptr(), acc);
+        let bs = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+            + (lanes[4] + lanes[5]) + (lanes[6] + lanes[7]);
+        scalar_acc += d * bs + m * xbs[blk];
+    }
+    scalar_acc
+}
+
+/// Per-32-block sums of `x`, used to fold Q4_1's per-block `m` term.
+fn block_sums(x: &[f32]) -> Vec<f32> {
+    x.chunks(Q4_1_QK)
+        .map(|c| c.iter().sum::<f32>())
+        .collect()
+}
+
+fn q4_1_row_dot(raw: &[u8], ne0: usize, x: &[f32], xbs: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && ne0 % Q4_1_QK == 0
+        {
+            return unsafe { q4_1_row_dot_avx2(raw, ne0, x, xbs) };
+        }
+    }
+    q4_1_row_dot_scalar(raw, ne0, x, xbs)
+}
+
+/// `y[..n_rows] = W[base_row..] @ x` for a Q4_1 matrix, threaded over rows.
+pub fn q4_1_matvec_range(
+    payload: &[u8],
+    ne0: usize,
+    base_row: u64,
+    n_rows: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), String> {
+    if x.len() != ne0 {
+        return Err("q4_1_matvec_range: x length mismatch".into());
+    }
+    if y.len() < n_rows {
+        return Err("q4_1_matvec_range: y too small".into());
+    }
+    let rb = q4_1_row_bytes(ne0);
+    let need = (base_row as usize + n_rows)
+        .checked_mul(rb)
+        .ok_or("q4_1_matvec_range: overflow")?;
+    if need > payload.len() {
+        return Err("q4_1_matvec_range: row range exceeds payload".into());
+    }
+    let base = base_row as usize;
+    let xbs = block_sums(x);
+    let dot = |r: usize| -> f32 { q4_1_row_dot(&payload[r * rb..(r + 1) * rb], ne0, x, &xbs) };
+
+    const MIN_PARALLEL_ROWS: usize = 1024;
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_cores = scaled_threads(avail);
+    if n_rows < MIN_PARALLEL_ROWS || n_cores <= 1 {
+        for (k, o) in y[..n_rows].iter_mut().enumerate() {
+            *o = dot(base + k);
+        }
+        return Ok(());
+    }
+    let n_workers = n_cores.min(n_rows);
+    let chunk = n_rows.div_ceil(n_workers);
+    let ranges: Vec<std::ops::Range<usize>> = (0..n_workers)
+        .map(|w| {
+            let s = w * chunk;
+            s..(s + chunk).min(n_rows)
+        })
+        .collect();
+    let mut rest = &mut y[..n_rows];
+    std::thread::scope(|scope| {
+        for range in ranges {
+            let (head, tail) = rest.split_at_mut(range.len());
+            rest = tail;
+            scope.spawn(move || {
+                for (k, o) in head.iter_mut().enumerate() {
+                    *o = dot(base + range.start + k);
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
 /// Single-threaded variant of `pq2_matvec_range` using the production row
 /// kernel (AVX2 when available). Used by microbenchmarks so kernel throughput
 /// can be measured without thread-scheduling noise.
@@ -774,6 +923,57 @@ mod tests {
             for r in 0..n_rows {
                 assert_eq!(y_n[t * n_rows + r], y1[r], "t {t} row {r}");
             }
+        }
+    }
+
+    #[test]
+    fn q4_1_matvec_matches_dequantized_dot() {
+        let ne0 = 64usize;
+        let n_rows = 5usize;
+        let rb = q4_1_row_bytes(ne0);
+        let mut seed = 0x9e37_79b9u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut payload = vec![0u8; n_rows * rb];
+        for r in 0..n_rows {
+            for blk in 0..ne0 / Q4_1_QK {
+                let b = r * rb + blk * Q4_1_BLOCK;
+                let d = crate::gguf::f32_to_half(((next() % 400) as f32) / 200.0 + 0.005);
+                let m = crate::gguf::f32_to_half(((next() % 200) as f32 - 100.0) / 400.0);
+                payload[b] = (d & 0xff) as u8;
+                payload[b + 1] = (d >> 8) as u8;
+                payload[b + 2] = (m & 0xff) as u8;
+                payload[b + 3] = (m >> 8) as u8;
+                for k in 0..16 {
+                    payload[b + 4 + k] = (next() % 256) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..ne0)
+            .map(|_| ((next() % 2001) as f32 - 1000.0) / 500.0)
+            .collect();
+        let mut y = vec![0.0f32; n_rows];
+        q4_1_matvec_range(&payload, ne0, 0, n_rows, &x, &mut y).unwrap();
+        for (r, y_r) in y.iter().enumerate() {
+            let row = &payload[r * rb..(r + 1) * rb];
+            let mut want = 0.0f32;
+            for blk in 0..ne0 / Q4_1_QK {
+                let b = blk * Q4_1_BLOCK;
+                let d = half_to_f32(u16::from_le_bytes([row[b], row[b + 1]]));
+                let m = half_to_f32(u16::from_le_bytes([row[b + 2], row[b + 3]]));
+                for j in 0..16 {
+                    let qlo = (row[b + 4 + j] & 0x0f) as f32;
+                    let qhi = (row[b + 4 + j] >> 4) as f32;
+                    want += x[blk * 32 + j] * (d * qlo + m);
+                    want += x[blk * 32 + 16 + j] * (d * qhi + m);
+                }
+            }
+            let scale = want.abs().max(1.0);
+            assert!((want - y_r).abs() / scale < 1e-4, "row {r}: {want} != {y_r}");
         }
     }
 }
