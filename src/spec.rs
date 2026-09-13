@@ -83,12 +83,23 @@ impl Drafter {
         let block = self.ds.draft_block(&mut self.dcache, id_last, block_start)?;
         self.dcache.truncate(block_start);
         let n_vocab = self.ds.cfg.n_vocab;
+        // anchor-first drafts read block positions 0..; the anchorless convention
+        // treats position 0 as a bonus anchor and reads 1..
+        let i_beg = if std::env::var("BONSAI_DSPARK_ANCHORLESS").is_ok() {
+            1
+        } else {
+            0
+        };
         let mut out = Vec::with_capacity(n_draft);
         for t in 0..n_draft {
-            if block.conf[t] < self.p_min {
+            let idx = i_beg + t;
+            if idx >= block.conf.len() {
                 break;
             }
-            out.push(argmax(&block.logits[t * n_vocab..(t + 1) * n_vocab]) as u32);
+            if block.conf[idx] < self.p_min {
+                break;
+            }
+            out.push(argmax(&block.logits[idx * n_vocab..(idx + 1) * n_vocab]) as u32);
         }
         Ok(out)
     }
@@ -111,6 +122,8 @@ pub fn argmax(v: &[f32]) -> usize {
 pub struct RoundOut {
     /// tokens to emit, in order (accepted drafts followed by the target token)
     pub emitted: Vec<u32>,
+    /// the raw draft proposals (before verification)
+    pub drafts: Vec<u32>,
     /// number of draft tokens accepted
     pub accepted: usize,
     /// the target's own next token (the new pending), with its logits
@@ -163,6 +176,7 @@ pub fn round(
 
     Ok(RoundOut {
         emitted,
+        drafts,
         accepted: a,
         pending: pending_next,
         logits: lg,

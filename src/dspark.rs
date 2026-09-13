@@ -570,8 +570,9 @@ impl Dspark {
         id_last: u32,
         n_past: usize,
     ) -> Result<DraftBlock, String> {
+        let anchorless = std::env::var("BONSAI_DSPARK_ANCHORLESS").is_ok();
         let c = &self.cfg;
-        let n_tok = c.block_size;
+        let n_tok = c.block_size + if anchorless { 1 } else { 0 };
         let ne = c.n_embd;
         let hd = c.head_dim;
         let n_kv_dim = c.n_head_kv * hd;
@@ -748,8 +749,12 @@ impl Dspark {
 
         let mut logits = vec![0.0f32; n_tok * c.n_vocab];
         let mut conf_out = vec![0.0f32; n_tok];
+        // ablation switches for localizing draft-quality issues
+        let no_markov = std::env::var("BONSAI_DSPARK_NO_MARKOV").is_ok();
+        let ignore_bias = no_markov;
+        let i_beg = if anchorless { 1 } else { 0 };
         let mut prev = id_last as u64;
-        for t in 0..n_tok {
+        for t in i_beg..n_tok {
             // markov_w1 row `prev` -> [rank]
             let start = prev as usize * mw1_rb;
             let mut w1_prev = vec![0.0f32; mw1_ne0];
@@ -758,7 +763,7 @@ impl Dspark {
             self.matvec_range("dspark.markov_head_b.weight", 0, c.n_vocab, &w1_prev, &mut bias)?;
             let col = &mut logits[t * c.n_vocab..(t + 1) * c.n_vocab];
             for i in 0..c.n_vocab {
-                col[i] = base[t * c.n_vocab + i] + bias[i];
+                col[i] = base[t * c.n_vocab + i] + if ignore_bias { 0.0 } else { bias[i] };
             }
             // confidence: sigmoid(conf_proj . [emb ; w1_prev] + b)
             let mut feat = vec![0.0f32; ne + mw1_ne0];
