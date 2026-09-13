@@ -636,3 +636,15 @@ Effect (code prompt, n_draft 4, greedy IDENTICAL preserved):
 Rounds now chain correctly (e.g. round 9 drafts `[84,18,17,2387]` accepted
 **4/4**; rounds 9, 10, 12 all 4/4). Round 1-3 still accept 0, which is the next
 thing to look at.
+
+### Confirmation and next steps (2026-09-13)
+
+Longer run, canonical Q4_1, code prompt, n=64: **44/84 drafts = 52.4%** (21
+rounds, 66 target forwards), greedy IDENTICAL. The `-shared`/`-ternary` repacks
+give ~0% (64 forwards for 64 tokens): they were produced by the old repack path
+through the broken type-42 parse, so they are stale and must be regenerated from
+the canonical Q4_1/bf16 with the fixed loader.
+
+Remaining gap to the card's tau ~ 3.7: rounds 1-3 still accept 0 (drafter context
+warmup right after prefill) and the confidence/markov path has not been revisited
+since the ordering fix.
