@@ -1,0 +1,58 @@
+diff --git a/examples/speculative/speculative.cpp b/examples/speculative/speculative.cpp
+index 17071aa..2a18d5f 100644
+--- a/examples/speculative/speculative.cpp
++++ b/examples/speculative/speculative.cpp
+@@ -45,6 +45,10 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    // local: skip the warmup, which segfaults on the dflash/dspark encoder graph
++    // (llm_graph_input_embd::set_input on the warmup batch) - see llama-context encode
++    params.warmup = false;
++
+     if (params.n_predict < -1) {
+         LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
+         return 1;
+@@ -112,14 +116,19 @@ int main(int argc, char ** argv) {
+     const bool vocab_type_dft = llama_vocab_type(vocab_dft);
+     LOG_DBG("vocab_type dft: %d\n", vocab_type_dft);
+ 
+-    if (vocab_type_tgt != vocab_type_dft) {
++    // local: a draft with a 'none' tokenizer stub (as the dspark sidecars ship)
++    // has no real vocab; the reference driver is expected to skip the vocab
++    // compatibility checks for it.
++    const bool dft_stub = vocab_type_dft == LLAMA_VOCAB_TYPE_NONE;
++
++    if (!dft_stub && vocab_type_tgt != vocab_type_dft) {
+         LOG_ERR("%s: draft model vocab type must match target model to use speculation but ", __func__);
+         LOG_ERR("vocab_type_dft = %d while vocab_type_tgt = %d\n", vocab_type_dft, vocab_type_tgt);
+         return 1;
+     }
+ 
+-    if (llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
+-        (llama_vocab_get_add_bos(vocab_tgt) && llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft))) {
++    if (!dft_stub && (llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
++        (llama_vocab_get_add_bos(vocab_tgt) && llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft)))) {
+         LOG_ERR("%s: draft model bos tokens must match target model to use speculation. add: %d - %d, id: %d - %d)\n",
+                 __func__,
+                 llama_vocab_get_add_bos(vocab_tgt), llama_vocab_get_add_bos(vocab_dft),
+@@ -127,8 +136,8 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
+-    if (llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
+-        (llama_vocab_get_add_eos(vocab_tgt) && llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft))) {
++    if (!dft_stub && (llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
++        (llama_vocab_get_add_eos(vocab_tgt) && llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft)))) {
+         LOG_ERR("%s: draft model eos tokens must match target model to use speculation. add: %d - %d, id: %d - %d)\n",
+                 __func__,
+                 llama_vocab_get_add_eos(vocab_tgt), llama_vocab_get_add_eos(vocab_dft),
+@@ -136,7 +145,7 @@ int main(int argc, char ** argv) {
+         return 1;
+     }
+ 
+-    {
++    if (!dft_stub) {
+         const int n_vocab_tgt = llama_vocab_n_tokens(vocab_tgt);
+         const int n_vocab_dft = llama_vocab_n_tokens(vocab_dft);
+         const int vocab_diff  = n_vocab_tgt > n_vocab_dft

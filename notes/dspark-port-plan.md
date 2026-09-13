@@ -243,3 +243,37 @@ reference; (2) a batched verify pass (`pq2_matmul_n` is ready but the target
 layer functions still run per token) for bandwidth-bound hardware; (3) the
 `observe` cost during prefill can be folded (one encoder call per chunk instead
 of per token).
+
+## Fork reference is now runnable (2026-09-13)
+
+The earlier "fork hangs" was wrong: `llama-cli` without `-st`/piped stdin just
+waits in interactive mode, and its `ps %CPU` is a lifetime average, not a hung
+loop. The fork loads and runs the target fine.
+
+`llama-speculative --spec-type draft-dspark -md <converted sidecar>` crashed for
+two unrelated reasons, both patched locally (diff saved as
+`tools/fork-dspark-ref.patch`):
+
+1. **Warmup segfault.** `common_init_from_params` warmups via `llama_encode`,
+   which crashes in `llm_graph_input_embd::set_input -> ggml_element_size` for
+   the dflash encoder graph. The `--no-warmup` flag is not wired to the
+   speculative example, so the patch sets `params.warmup = false` in
+   `examples/speculative/speculative.cpp`.
+2. **Stub vocab rejected.** The sidecar ships `tokenizer.ggml.model = none` (a
+   dummy 248320-token stub), but the driver requires the draft and target vocab
+   types to match. The patch skips the vocab-type/bos/eos/content checks when the
+   draft vocab type is `NONE` (which is what the "a 'none' stub skips the vocab"
+   comment already implies).
+
+### Reference acceptance vs the Rust port (qa prompt, greedy)
+
+| | drafted | accepted | rate | predicted tokens |
+| --- | --- | --- | --- | --- |
+| llama.cpp fork | 24 | 3 | 12.5% | 10 |
+| Rust (`bonsai-spec`, n_draft 4) | 24 | 1 | 4.2% | 8 |
+
+Both are low and the samples are tiny (3 vs 1 events), so the low acceptance is
+a property of this drafter/prompt rather than an obvious port bug: the reference
+implementation with the real weights is not much better. A larger corpus is
+needed to say whether the Rust draft is systematically worse. Fork prompt eval
+was 1386 ms/token, i.e. the same speed class as our engine on this box.
