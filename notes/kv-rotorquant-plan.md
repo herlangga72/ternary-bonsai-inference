@@ -33,8 +33,12 @@
 > | 16384 | 2147 MB (OOM) | 1074 MB (ok) | 1212 MB (ok) | 277 MB (ok) |
 > | 32768 | 4295 MB (OOM) | 2148 MB (OOM) | 2424 MB (OOM) | 554 MB (ok) |
 >
-> Only 4-bit symmetric makes 32K context fit here, and it was verified to
-> decode end-to-end at 32768 (golden MATCH, 1.38 s/token, coherent output).
+> Only 4-bit symmetric makes 32K context fit here. With `BONSAI_CTX=32768`
+> and `BONSAI_KV=planar4` the engine was verified to decode end-to-end (golden
+> MATCH, coherent output, 1.38 s/token) and 16K/32K goldens pass with the same
+> rel diffs as at 2048. Note these runs use a short prompt: they prove the
+> allocation, the shaders and the path at those context settings, **not**
+> operation at depth (positions in the thousands).
 > `BONSAI_CTX` was clamped to 16384 and is now 262144, so long context is
 > reachable at all; the caches are still allocated for the full setting, so a
 > too-large value fails at allocation rather than silently.
