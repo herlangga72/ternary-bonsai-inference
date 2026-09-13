@@ -552,9 +552,7 @@ impl Dspark {
                     head.copy_from_slice(&n);
                     rope_neox(head, pos as f32, c.head_dim, c.rope_freq_base);
                 }
-                let dst = pos * n_kv_dim;
-                cache.k[il][dst..dst + n_kv_dim].copy_from_slice(&k);
-                cache.v[il][dst..dst + n_kv_dim].copy_from_slice(&v);
+                cache.put(il, pos, &k, &v);
             }
         }
         let end = positions.iter().copied().max().map(|m| m + 1).unwrap_or(0);
@@ -688,23 +686,26 @@ impl Dspark {
                     head.copy_from_slice(&n);
                     rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
                 }
-                let dst = positions[t] * n_kv_dim;
-                cache.k[il][dst..dst + n_kv_dim].copy_from_slice(&kk[t * n_kv_dim..(t + 1) * n_kv_dim]);
-                cache.v[il][dst..dst + n_kv_dim].copy_from_slice(&vv[t * n_kv_dim..(t + 1) * n_kv_dim]);
+                cache.put(
+                    il,
+                    positions[t],
+                    &kk[t * n_kv_dim..(t + 1) * n_kv_dim],
+                    &vv[t * n_kv_dim..(t + 1) * n_kv_dim],
+                );
             }
             cache.filled = cache.filled.max(max_pos);
 
             // attention over the filled positions, causal like the reference
             // (`build_attn_inp_kq_mask` with hparams.causal_attn = true):
             // query at position p attends to cache positions <= p.
-            let kcache = &cache.k[il];
-            let vcache = &cache.v[il];
             let noncausal = std::env::var("BONSAI_DSPARK_NONCAUSAL").is_ok();
             let scale = 1.0f32 / (hd as f32).sqrt();
+            let filled = cache.filled;
             let mut attn = vec![0.0f32; n_tok * c.n_head * hd];
-            let mut scores = vec![0.0f32; cache.filled];
+            let mut scores = vec![0.0f32; filled];
+            let (kcache, vcache) = cache.prefix_f32(il);
             for t in 0..n_tok {
-                let n_ctx_pos = if noncausal { cache.filled } else { positions[t] + 1 };
+                let n_ctx_pos = if noncausal { filled } else { positions[t] + 1 };
                 for h in 0..c.n_head {
                     let hkv = h / group;
                     let qh = &q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
@@ -858,9 +859,14 @@ impl Dspark {
 /// Per-layer draft K/V caches plus the number of filled positions.
 pub struct DraftCache {
     pub n_ctx: usize,
-    pub k: Vec<Vec<f32>>,
-    pub v: Vec<Vec<f32>>,
+    pub n_kv_dim: usize,
+    /// K/V stored as f16: half the memory and half the read traffic. The
+    /// attended prefix is widened into `ks`/`vs` once per layer.
+    pub k16: Vec<Vec<u16>>,
+    pub v16: Vec<Vec<u16>>,
     pub filled: usize,
+    ks: Vec<f32>,
+    vs: Vec<f32>,
 }
 
 impl DraftCache {
@@ -869,15 +875,37 @@ impl DraftCache {
         let len = n_ctx * n_kv_dim;
         DraftCache {
             n_ctx,
-            k: (0..cfg.n_layer).map(|_| vec![0.0f32; len]).collect(),
-            v: (0..cfg.n_layer).map(|_| vec![0.0f32; len]).collect(),
+            n_kv_dim,
+            k16: (0..cfg.n_layer).map(|_| vec![0u16; len]).collect(),
+            v16: (0..cfg.n_layer).map(|_| vec![0u16; len]).collect(),
             filled: 0,
+            ks: vec![0.0f32; len],
+            vs: vec![0.0f32; len],
         }
     }
 
     /// Drop every position `>= len` (rejected draft tail).
     pub fn truncate(&mut self, len: usize) {
         self.filled = self.filled.min(len);
+    }
+
+    /// Widen layer `il`'s filled prefix into the f32 scratch and return it.
+    fn prefix_f32(&mut self, il: usize) -> (&[f32], &[f32]) {
+        let n = self.filled * self.n_kv_dim;
+        for i in 0..n {
+            self.ks[i] = crate::gguf::half_to_f32(self.k16[il][i]);
+            self.vs[i] = crate::gguf::half_to_f32(self.v16[il][i]);
+        }
+        (&self.ks[..n], &self.vs[..n])
+    }
+
+    /// Append one position's K/V row (`n_kv_dim` f32 values) for layer `il`.
+    fn put(&mut self, il: usize, pos: usize, k: &[f32], v: &[f32]) {
+        let dst = pos * self.n_kv_dim;
+        for i in 0..self.n_kv_dim {
+            self.k16[il][dst + i] = crate::gguf::f32_to_half(k[i]);
+            self.v16[il][dst + i] = crate::gguf::f32_to_half(v[i]);
+        }
     }
 }
 
