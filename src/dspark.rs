@@ -909,6 +909,11 @@ impl DraftCache {
         }
     }
 
+    /// Forget all context (the server reuses one drafter across requests).
+    pub fn reset(&mut self) {
+        self.filled = 0;
+    }
+
     /// Drop every position `>= len` (rejected draft tail).
     pub fn truncate(&mut self, len: usize) {
         self.filled = self.filled.min(len);

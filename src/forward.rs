@@ -635,6 +635,26 @@ impl Decoder {
             .unwrap_or(0)
     }
 
+    /// Drop all cached state so the decoder can start a fresh sequence (the
+    /// server reuses one decoder across requests).
+    pub fn reset(&mut self) {
+        let n_layer = self.cfg.n_layer;
+        for il in 0..n_layer {
+            self.attn.k[il].clear();
+            self.attn.v[il].clear();
+            self.attn.kq[il].clear();
+            self.attn.kn[il].clear();
+            self.attn.vq[il].clear();
+            self.attn.vn[il].clear();
+            self.attn.k16[il].clear();
+            self.attn.v16[il].clear();
+            if self.cfg.is_recurrent(il) {
+                self.ssm.conv[il].fill(0.0);
+                self.ssm.state[il] = crate::gdn::zero_state();
+            }
+        }
+    }
+
     /// Forward one token at absolute position `pos`, updating the recurrent,
     /// conv and attention caches (causal, single stream). Returns the
     /// output-normalized hidden vector (length n_embd).
