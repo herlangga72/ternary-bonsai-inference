@@ -522,11 +522,21 @@ behaves like an untrained or mismatched checkpoint: its own reference scores
 0.806% and our port 2.7%, so no serving-side change reaches 75%.
 
 The route to ~75% is therefore to train a DSpark drafter for this target, not to
-tune the engine. Public tooling exists:
-- SpecForge (SGLang) — trains EAGLE3 / DFlash / DSpark / Domino drafters.
-- DeepSpec (deepseek-ai) — data prep, draft model implementations, training.
-- NeMo AutoModel — DSpark recipe, 2-GPU FSDP2.
+tune the engine. Public tooling exists and was verified:
 
-Requirements: an existing trained dspark checkpoint matched to
-Ternary-Bonsai-27B, or GPUs + data to train one. Neither is available on this
-4-core APU box, so this is blocked here and out of scope for the engine port.
+- **SpecForge** (SGLang) — docs list DSpark among the trained draft families
+  (EAGLE3, P-EAGLE, DFlash, DFlash2, DSpark, Domino, MTP), and say to "prepare a
+  dataset by regenerating responses with the target model so the draft learns
+  its distribution". CUDA / ROCm / Ascend.
+- **DeepSpec** (deepseek-ai) — full DSpark training stack. Released DSpark
+  checkpoints exist for Qwen3-4B/8B/14B and Gemma-4-12B, **not** for
+  Ternary-Bonsai-27B. The default recipe assumes one node with **8 GPUs** and a
+  target cache of roughly **38 TB**.
+- **NeMo AutoModel** — DSpark recipe, 2-GPU FSDP2.
+
+So a trained drafter for this target needs GPUs plus a regenerated dataset, or an
+existing DSpark checkpoint matched to Ternary-Bonsai-27B. Neither is available
+on this 4-core APU box, so this is blocked here and out of scope for the engine
+port. The engine side is done: our port already accepts more than the reference
+(2.7% vs 0.806%) with the shipped sidecar.
+
