@@ -98,7 +98,7 @@ already ship as `BONSAI_KV=planar3`.
 | 5 | drop the f32 norm word by folding it into the exponent of the centroids per row | 4 B / vector (~4%) | lossy, needs a per-row scale anyway |
 | 6 | GQA-aware kernel: one workgroup per **kv** head, 6 query heads inside | **6x less K/V read traffic** | biggest traffic lever; restructure shaders + scores buffer |
 | 7 | deferred prefill (keep f32/f16 during prefill, quantize on insert) | none (quality) | extra scratch (plan R5) |
-| 8 | 2-bit + 1-bit sign (planar2) | 1.47x vs planar3 | quality cliff, untested |
+| 8 | 2-bit planar (planar2) | 1.47x vs planar3 | greedy holds both prompts; logits 7e-2 (see §8) |
 
 ## 6. Recommendation
 
@@ -114,3 +114,38 @@ remaining wins for **data moved through memory** are:
 
 Norm width (option 4) is a ~2% rounding error on top of these and is not worth
 its own format change unless it rides along with option 3.
+
+## 7. Implemented: grouped byte-aligned plane packing
+
+`kvquant::pack_planes` / `unpack_planes` and the three `*_q` shaders now use the
+upstream arrangement instead of the little-endian bitstream:
+
+| bits | planes |
+| --- | --- |
+| 2 | one 2-bit plane, 4 coords/byte |
+| 3 | 2-bit low plane (4 coords/byte) then 1-bit sign plane (8 coords/byte) |
+| 4 | one 4-bit plane, 2 coords/byte |
+| 5..8 | unchanged bitstream |
+
+The row size (`packed_len`) is unchanged, so strides and buffers do not move.
+The win is on the unpack side: no `off + bits > 8` straddle fix-up, and a
+coordinate's field is a single byte load plus a shift. 2-bit is a single clean
+plane. Verified byte-identical to the old bitstream packing (CPU planar3 qa rel
+4.6768e-2, the same as before), and CPU/GPU agree.
+
+## 8. Measured: how low the bits can go
+
+`BONSAI_KV=planarN` symmetric, qa prompt, `bonsai-golden` / `bonsai-gdecode`:
+
+| mode | K+V B/token/layer | vs f32 | greedy | logit rel (CPU / GPU) |
+| --- | --- | --- | --- | --- |
+| f32 | 8192 | 1.0x | 8160 | 4.03e-3 |
+| planar4 | 1056 | 7.8x | 8160 | ~4.1e-2 |
+| planar3 | 800 | 10.2x | 8160 | 4.68e-2 / 4.55e-2 |
+| **planar2** | **544** | **15.1x** | 8160 | 7.29e-2 / 7.62e-2 |
+
+`planar2` also matches greedy on the code prompt (CPU 7.09e-2, GPU 6.70e-2).
+All symmetric planar modes exceed the harness's 1e-2 logit tolerance by design;
+the gate is the greedy id, which holds for every row. `planar2` is the smallest
+working mode (15x, 2-bit, one plane); `planar3` is the quality/size sweet spot.
+
