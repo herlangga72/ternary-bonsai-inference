@@ -277,3 +277,37 @@ a property of this drafter/prompt rather than an obvious port bug: the reference
 implementation with the real weights is not much better. A larger corpus is
 needed to say whether the Rust draft is systematically worse. Fork prompt eval
 was 1386 ms/token, i.e. the same speed class as our engine on this box.
+
+## Footprint / packing (2026-09-13)
+
+The drafter's cost is dominated by four tensors: `output.weight` 758 MiB (Q4_1),
+`token_embd` 322 MiB (PQ2_0), `fc` 78 MiB (Q4_1) and `markov_head_a` 121 MiB
+(BF16); the 42 block matrices are another ~468 MiB. Total 1856 MiB.
+
+`bonsai-dspark repack <in> <out>` requantizes every Q4_1/BF16 matrix to PQ2_0
+(ternary, per-128 absmax scale) and rewrites the GGUF:
+
+| | Q4_1 sidecar | repacked |
+| --- | --- | --- |
+| file / payload | 1856 MiB | 924 MiB (50%) |
+| draft block (warm) | 1.44 s | 0.52 s |
+| acceptance (qa, n_draft 4) | 2/28 (7.1%) | 3/24 (12.5%) |
+
+Acceptance did not get worse (tiny samples; the fork reference is 3/24), so
+ternary packing halves the draft's memory and traffic and speeds the block up
+2.8x at no measured quality cost. The block speedup comes from the PQ2_0
+matvec using the AVX2 row kernel.
+
+Two RAM fixes on the Rust side:
+
+- `encode` was dequantizing the whole `fc` (25600x5120 -> **524 MiB**) to f32 on
+  every observed token, and `logsnr_embed` the same for `fc2` (105 MiB) per
+  block. Both now run row-by-row matvecs; norms/biases are memoized.
+- The draft KV cache is clamped to the sidecar's `context_length` (4096) instead
+  of the caller's 8192, halving it.
+
+Draft-only peak RSS is now 575 MiB (was dominated by the 524 MiB fc spike).
+
+Still open for footprint: store the draft KV cache as f16 (halves the remaining
+~100 MiB and its read traffic), and the same f16 option for the target's
+full-attention KV.
