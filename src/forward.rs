@@ -639,6 +639,21 @@ impl Decoder {
     /// conv and attention caches (causal, single stream). Returns the
     /// output-normalized hidden vector (length n_embd).
     pub fn forward_hidden(&mut self, token: u32, pos: usize) -> Result<Vec<f32>, String> {
+        self.forward_hidden_taps(token, pos, &[], &mut [])
+    }
+
+    /// Forward one token at position `pos`, and additionally capture the layer
+    /// *input* (the residual stream entering the layer, before its attention
+    /// norm) for each layer index in `want`. `taps[i]` receives layer
+    /// `want[i]`'s input. This is the "layer input" the dspark encoder consumes
+    /// (reference: `llama_set_embeddings_layer_inp`).
+    pub fn forward_hidden_taps(
+        &mut self,
+        token: u32,
+        pos: usize,
+        want: &[u32],
+        taps: &mut [Vec<f32>],
+    ) -> Result<Vec<f32>, String> {
         let Self {
             w,
             cfg,
@@ -649,15 +664,20 @@ impl Decoder {
         } = self;
         let eps = cfg.eps;
         let n_embd = cfg.n_embd;
+        if taps.len() != want.len() {
+            return Err("forward_hidden_taps: taps length != want length".into());
+        }
 
-        // ---- token embedding row -------------------------------------------
         let mut cur = w.row_f32("token_embd.weight", token as u64)?;
         if cur.len() != n_embd {
             return Err(format!("decode_token: embedding len {} != n_embd", cur.len()));
         }
 
-        // ---- transformer layers ----------------------------------------------
         for il in 0..cfg.n_layer {
+            if let Some(k) = want.iter().position(|&x| x as usize == il) {
+                taps[k].clear();
+                taps[k].extend_from_slice(&cur);
+            }
             let attn_norm_w = w.vec_f32(&cfg.blk_name(il, "attn_norm.weight"))?;
             let x_norm = kernels::rms_norm(&cur, &attn_norm_w, eps);
             let attn_out = if cfg.is_recurrent(il) {
@@ -677,7 +697,6 @@ impl Decoder {
             }
         }
 
-        // ---- output norm ------------------------------------------------------
         let out_norm_w = w.vec_f32("output_norm.weight")?;
         Ok(kernels::rms_norm(&cur, &out_norm_w, eps))
     }
