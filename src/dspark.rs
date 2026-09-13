@@ -403,6 +403,11 @@ impl Dspark {
     /// byte-identical to the target's, e.g. the 322 MiB token embedding).
     pub fn open_with_target(path: &str, target_path: Option<&str>) -> Result<Dspark, String> {
         let gguf = GGUF::open(path)?;
+        // Fail fast on a malformed sidecar (tensor offsets that do not match the
+        // layout). Without this the first tensor read aborts mid-decode with a
+        // confusing `slice_at ... past mmap end`.
+        gguf.check_layout()
+            .map_err(|e| format!("{path}: malformed sidecar: {e}"))?;
         let cfg = DsparkCfg::from_gguf(&gguf)?;
         let shared_names: Vec<String> = gguf
             .get("dspark.shared_tensors")

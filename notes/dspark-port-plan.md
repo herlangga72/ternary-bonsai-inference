@@ -540,3 +540,21 @@ on this 4-core APU box, so this is blocked here and out of scope for the engine
 port. The engine side is done: our port already accepts more than the reference
 (2.7% vs 0.806%) with the shipped sidecar.
 
+
+### Sidecar packaging audit (2026-09-13)
+
+`bonsai-gguf inspect` on every dspark artifact:
+
+| sidecar | tensors | arch | layout |
+| --- | --- | --- | --- |
+| `-dflash` (original Q4_1) | 79 | dflash | **ok** (1856 MiB, types q4_1 x46, q1_0 x3, pq2_0 x1) |
+| `-Q4_1` (dspark-named) | 79 | dspark | **error**: `dspark.fc.weight` offset 337718592 != expected 5085596992 |
+| `-ternary` (repacked) | 79 | dspark | ok (924 MiB, pq2_0 x50) |
+| `-shared` (repacked, shared embd) | 78 | dspark | ok (602 MiB, pq2_0 x49) |
+
+The dspark-named Q4_1 sidecar is malformed and truncated relative to its declared
+tensors (declared layout needs ~5.1 GB, the file is 1.9 GB). Anything measured on
+"Q4_1" earlier in this log therefore came from a different artifact; the current
+file cannot run. `Dspark::open_with_target` now calls `GGUF::check_layout` and
+fails fast with a clear message instead of aborting mid-decode with
+`slice_at ... past mmap end`.
