@@ -76,7 +76,8 @@ fn parse(args: &[String]) -> Result<Cli, String> {
                      \n  --host <ip>     bind address (default 127.0.0.1)\n\
                      \x20 --port <n>      port (default 8080)\n\
                      \x20 --id <name>     model id reported to clients\n\
-                     \x20 --no-think      omit <think> from the chat prompt\n                     \x20 --keep-think    keep the <think>...</think> block in the reply\n\
+                     \x20 --no-think      omit <think> from the chat prompt\n                     \x20 --keep-think    inline the reasoning in content (default: separate\n\
+                     \x20                 'reasoning_content' field)\n\
                      \n  env BONSAI_DSPARK=<sidecar.gguf>  speculative greedy decode\n\
                      \x20     BONSAI_DSPARK_N=<n>            draft length (default 4)"
                 );
@@ -183,7 +184,7 @@ fn main() {
         stop,
         model_id: model_id.clone(),
         think: cli.think,
-        strip_think: cli.strip,
+        split_reasoning: cli.strip,
     };
 
     eprintln!("model: {model_id}  ({} layers)", engine.dec.cfg.n_layer);

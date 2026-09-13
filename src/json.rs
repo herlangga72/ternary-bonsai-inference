@@ -230,6 +230,59 @@ fn parse_obj(b: &[u8], i: &mut usize) -> Result<J, String> {
     }
 }
 
+/// Serialize a value back to compact JSON (order preserved).
+pub fn to_json(v: &J) -> String {
+    let mut out = String::new();
+    write_json(v, &mut out);
+    out
+}
+
+fn write_json(v: &J, out: &mut String) {
+    match v {
+        J::Null => out.push_str("null"),
+        J::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        J::Num(n) => {
+            if n.is_finite() {
+                if n.fract() == 0.0 && n.abs() < 1e15 {
+                    out.push_str(&format!("{}", *n as i64));
+                } else {
+                    out.push_str(&format!("{n}"));
+                }
+            } else {
+                out.push_str("null");
+            }
+        }
+        J::Str(s) => {
+            out.push('"');
+            out.push_str(&escape(s));
+            out.push('"');
+        }
+        J::Arr(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json(it, out);
+            }
+            out.push(']');
+        }
+        J::Obj(pairs) => {
+            out.push('{');
+            for (i, (k, val)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('"');
+                out.push_str(&escape(k));
+                out.push_str("\":");
+                write_json(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 /// JSON string escape (RFC 8259).
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -266,6 +319,13 @@ mod tests {
     fn parses_unicode_escapes() {
         let v = J::parse(r#""a\u00e9b""#).unwrap();
         assert_eq!(v.as_str(), Some("aéb"));
+    }
+
+    #[test]
+    fn serializes_back_to_compact_json() {
+        let src = r#"{"a":1,"b":[true,null,"x"],"c":{"d":-2.5},"e":"q\"z"}"#;
+        let v = J::parse(src).unwrap();
+        assert_eq!(to_json(&v), src);
     }
 
     #[test]

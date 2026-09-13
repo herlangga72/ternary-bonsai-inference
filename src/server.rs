@@ -30,56 +30,131 @@ pub struct Engine {
     pub model_id: String,
     /// emit `<think>` (qwen35 thinking mode) before the answer
     pub think: bool,
-    /// strip a leading `<think>...</think>` block from the reply so agents get
-    /// the answer (the model emits the block itself even without the scaffold)
-    pub strip_think: bool,
+    /// split the `<think>...</think>` block into `reasoning_content` instead of
+    /// inlining it in `content`
+    pub split_reasoning: bool,
 }
 
-/// Removes a leading reasoning block from streamed text. Until `</think>` is
-/// seen the text is buffered; then the remainder flows (and is streamed live if
-/// enough of it is already buffered).
-struct ThinkFilter {
-    strip: bool,
-    seen_end: bool,
-    buf: String,
+/// The exact tool preamble from the model's `tokenizer.chat_template`.
+pub const TOOL_INSTRUCTIONS: &str = r#"If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>"#;
+
+/// One chat message as the template consumes it.
+#[derive(Debug, Clone, Default)]
+pub struct Msg {
+    pub role: String,
+    pub content: String,
+    /// assistant tool calls: (function name, arguments as a JSON object string)
+    pub tool_calls: Vec<(String, String)>,
 }
 
-impl ThinkFilter {
-    fn new(strip: bool) -> ThinkFilter {
-        ThinkFilter { strip, seen_end: !strip, buf: String::new() }
+/// Split an assistant message into (reasoning, answer) the way the template does.
+fn split_think(content: &str) -> (String, String) {
+    match content.split_once("</think>") {
+        Some((before, after)) => (
+            before.split("<think>").last().unwrap_or("").trim().to_string(),
+            after.trim_start_matches('\n').to_string(),
+        ),
+        None => (String::new(), content.to_string()),
     }
-    fn feed(&mut self, text: &str) -> Option<String> {
-        if self.seen_end {
-            return Some(text.to_string());
+}
+
+/// Splits a reply into (reasoning, content) at `</think>`, streaming both.
+/// The model emits a leading `<think>...</think>` block; agents get the answer
+/// in `content` and the trace in `reasoning_content` (the DeepSeek/Qwen
+/// convention). `keep` disables the split and passes everything as content.
+struct ThinkSplitter {
+    buf: String,
+    /// 0 = undecided, 1 = inside the reasoning block, 2 = content
+    phase: u8,
+    keep: bool,
+}
+
+impl ThinkSplitter {
+    fn new(keep: bool) -> ThinkSplitter {
+        ThinkSplitter { buf: String::new(), phase: if keep { 2 } else { 0 }, keep }
+    }
+
+    fn feed(&mut self, text: &str) -> (String, String) {
+        if self.keep {
+            return (String::new(), text.to_string());
         }
         self.buf.push_str(text);
-        if let Some(i) = self.buf.find("</think>") {
-            self.seen_end = true;
-            let rest = self.buf[i + "</think>".len()..].trim_start().to_string();
-            self.buf.clear();
-            return Some(rest);
+        let mut reason = String::new();
+        let mut content = String::new();
+        loop {
+            match self.phase {
+                2 => {
+                    content.push_str(&self.buf);
+                    self.buf.clear();
+                    break;
+                }
+                0 => {
+                    let t = self.buf.trim_start();
+                    if t.len() < "<think".len() && "<think".starts_with(t) {
+                        break; // need more bytes to decide
+                    }
+                    if t.starts_with("<think") {
+                        self.buf = t["<think>".len()..].trim_start_matches('\n').to_string();
+                        self.phase = 1;
+                    } else {
+                        self.phase = 2;
+                    }
+                }
+                _ => {
+                    if let Some(i) = self.buf.find("</think>") {
+                        reason.push_str(&self.buf[..i]);
+                        self.buf = self.buf[i + "</think>".len()..]
+                            .trim_start_matches('\n')
+                            .to_string();
+                        self.phase = 2;
+                        continue;
+                    }
+                    // hold back a possible split closing tag
+                    let keep = "</think>".len() - 1;
+                    if self.buf.len() > keep {
+                        let cut = self.buf.len() - keep;
+                        reason.push_str(&self.buf[..cut]);
+                        self.buf = self.buf[cut..].to_string();
+                    }
+                    break;
+                }
+            }
         }
-        // Not (yet) a reasoning block: `think` off plus a model that does not
-        // prefix one. Once enough text has arrived without a leading <think we
-        // stream it rather than buffering the whole reply.
-        if self.buf.len() >= 8 && !self.buf.starts_with("<think") {
-            self.seen_end = true;
-            // keep a short prefix in case "</think>" straddles the boundary
-            return Some(std::mem::take(&mut self.buf));
-        }
-        if self.buf.len() > 8192 {
-            self.seen_end = true;
-            return Some(std::mem::take(&mut self.buf));
-        }
-        None
+        (reason, content)
     }
-    /// Whatever is left if the model never closed its reasoning block.
-    fn flush(&mut self) -> Option<String> {
-        if self.seen_end || self.buf.is_empty() {
-            return None;
+
+    /// Whatever is left (an unterminated reasoning block stays reasoning).
+    fn flush(&mut self) -> (String, String) {
+        let s = std::mem::take(&mut self.buf);
+        if self.keep {
+            return (String::new(), s);
         }
-        self.seen_end = true;
-        Some(std::mem::take(&mut self.buf))
+        if self.phase == 1 {
+            (s, String::new())
+        } else {
+            (String::new(), s)
+        }
     }
 }
 
@@ -92,20 +167,102 @@ impl Engine {
         }
     }
 
-    /// qwen35 chat template over the message list.
-    pub fn build_prompt(&self, msgs: &[(String, String)]) -> String {
+    /// Render the conversation with the model's own chat template, including
+    /// the tool definitions and assistant tool-call blocks.
+    pub fn build_prompt(&self, msgs: &[Msg], tools: &[String]) -> String {
         let mut out = String::new();
-        for (role, content) in msgs {
-            out.push_str("<|im_start|>");
-            out.push_str(role);
-            out.push('\n');
-            out.push_str(content);
+        let system = msgs
+            .first()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.trim().to_string())
+            .filter(|c| !c.is_empty());
+
+        if !tools.is_empty() {
+            out.push_str("<|im_start|>system\n");
+            out.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+            for t in tools {
+                out.push('\n');
+                out.push_str(t);
+            }
+            out.push_str("\n</tools>\n\n");
+            out.push_str(TOOL_INSTRUCTIONS);
+            if let Some(c) = &system {
+                out.push_str("\n\n");
+                out.push_str(c);
+            }
+            out.push_str("<|im_end|>\n");
+        } else if let Some(c) = &system {
+            out.push_str("<|im_start|>system\n");
+            out.push_str(c);
             out.push_str("<|im_end|>\n");
         }
-        out.push_str("<|im_start|>assistant\n");
-        if self.think {
-            out.push_str("<think>\n");
+
+        for m in msgs {
+            match m.role.as_str() {
+                // emitted in the preamble above
+                "system" => {}
+                "user" => {
+                    out.push_str("<|im_start|>user\n");
+                    out.push_str(m.content.trim());
+                    out.push_str("<|im_end|>\n");
+                }
+                "assistant" => {
+                    let (reasoning, content) = split_think(&m.content);
+                    out.push_str("<|im_start|>assistant\n");
+                    if self.think && !reasoning.is_empty() {
+                        out.push_str("<think>\n");
+                        out.push_str(&reasoning);
+                        out.push_str("\n</think>\n\n");
+                    }
+                    out.push_str(&content);
+                    for (i, (name, args)) in m.tool_calls.iter().enumerate() {
+                        if i == 0 {
+                            if content.trim().is_empty() {
+                                out.push_str("<tool_call>\n");
+                            } else {
+                                out.push_str("\n\n<tool_call>\n");
+                            }
+                        } else {
+                            out.push_str("\n<tool_call>\n");
+                        }
+                        out.push_str("<function=");
+                        out.push_str(name);
+                        out.push_str(">\n");
+                        if let Ok(J::Obj(pairs)) = J::parse(args) {
+                            for (k, v) in pairs {
+                                out.push_str("<parameter=");
+                                out.push_str(&k);
+                                out.push_str(">\n");
+                                match &v {
+                                    J::Str(x) => out.push_str(x),
+                                    other => out.push_str(&crate::json::to_json(other)),
+                                }
+                                out.push_str("\n</parameter>\n");
+                            }
+                        }
+                        out.push_str("</function>\n</tool_call>");
+                    }
+                    out.push_str("<|im_end|>\n");
+                }
+                "tool" => {
+                    out.push_str("<|im_start|>user\n<tool_response>\n");
+                    out.push_str(m.content.trim());
+                    out.push_str("\n</tool_response><|im_end|>\n");
+                }
+                _ => {
+                    out.push_str("<|im_start|>user\n");
+                    out.push_str(&m.content);
+                    out.push_str("<|im_end|>\n");
+                }
+            }
         }
+        out.push_str("<|im_start|>assistant\n");
+        // the template closes an empty reasoning block when thinking is off
+        out.push_str(if self.think {
+            "<think>\n"
+        } else {
+            "<think>\n\n</think>\n\n"
+        });
         out
     }
 
@@ -347,7 +504,7 @@ fn err_json(msg: &str) -> String {
     format!("{{\"error\":{{\"message\":\"{}\",\"type\":\"invalid_request_error\"}}}}", escape(msg))
 }
 
-fn parse_chat(body: &[u8], default_model: &str) -> Result<(Vec<(String, String)>, ChatOpts), String> {
+fn parse_chat(body: &[u8]) -> Result<(Vec<Msg>, Vec<String>, ChatOpts), String> {
     let txt = std::str::from_utf8(body).map_err(|_| "body is not UTF-8".to_string())?;
     let j = J::parse(txt).map_err(|e| format!("bad JSON: {e}"))?;
     let msgs = j
@@ -356,7 +513,7 @@ fn parse_chat(body: &[u8], default_model: &str) -> Result<(Vec<(String, String)>
         .ok_or("missing 'messages' array")?;
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
-        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user").to_string();
         // content may be a string or an array of parts
         let content = match m.get("content") {
             Some(J::Str(s)) => s.clone(),
@@ -367,10 +524,136 @@ fn parse_chat(body: &[u8], default_model: &str) -> Result<(Vec<(String, String)>
                 .join(""),
             _ => String::new(),
         };
-        out.push((role.to_string(), content));
+        // assistant tool calls carried back by the client
+        let mut tool_calls = Vec::new();
+        if let Some(tc) = m.get("tool_calls").and_then(|t| t.as_arr()) {
+            for c in tc {
+                let f = c.get("function").unwrap_or(c);
+                let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                if name.is_empty() {
+                    continue;
+                }
+                let args = match f.get("arguments") {
+                    Some(J::Str(s)) => s.clone(),
+                    Some(other) => crate::json::to_json(other),
+                    None => "{}".to_string(),
+                };
+                tool_calls.push((name.to_string(), args));
+            }
+        }
+        out.push(Msg { role, content, tool_calls });
     }
-    let _ = default_model;
-    Ok((out, ChatOpts::from(&j)))
+    let mut tools: Vec<String> = j
+        .get("tools")
+        .and_then(|t| t.as_arr())
+        .map(|a| a.iter().map(crate::json::to_json).collect())
+        .unwrap_or_default();
+    if matches!(j.get("tool_choice").and_then(|v| v.as_str()), Some("none")) {
+        tools.clear();
+    }
+    let _ = out.first();
+    Ok((out, tools, ChatOpts::from(&j)))
+}
+
+/// Pull `<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`
+/// blocks out of a reply: returns (remaining content, calls).
+pub fn parse_tool_calls(text: &str) -> (String, Vec<(String, String)>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    let mut rest = text;
+    while let Some(i) = rest.find(OPEN) {
+        content.push_str(&rest[..i]);
+        let after = &rest[i + OPEN.len()..];
+        match after.find(CLOSE) {
+            Some(j) => {
+                if let Some(c) = parse_tool_block(&after[..j]) {
+                    calls.push(c);
+                }
+                rest = &after[j + CLOSE.len()..];
+            }
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    content.push_str(rest);
+    (content.trim().to_string(), calls)
+}
+
+/// Parse the inside of a `<tool_call>` block into (name, arguments JSON object).
+fn parse_tool_block(block: &str) -> Option<(String, String)> {
+    let fs = block.find("<function=")? + "<function=".len();
+    let fe = block[fs..].find('>')? + fs;
+    let name = block[fs..fe].trim().to_string();
+    let body_end = block.find("</function>").unwrap_or(block.len());
+    let body = block.get(fe + 1..body_end).unwrap_or("");
+    let mut pairs: Vec<(String, J)> = Vec::new();
+    let mut r = body;
+    while let Some(i) = r.find("<parameter=") {
+        let p0 = i + "<parameter=".len();
+        let Some(gt) = r[p0..].find('>') else { break };
+        let pname = r[p0..p0 + gt].trim().to_string();
+        let vstart = p0 + gt + 1;
+        let Some(vrel) = r[vstart..].find("</parameter>") else { break };
+        let val = r[vstart..vstart + vrel].trim_matches('\n').to_string();
+        // the template writes string values raw and everything else as JSON
+        let v = J::parse(&val).unwrap_or(J::Str(val));
+        pairs.push((pname, v));
+        r = &r[vstart + vrel + "</parameter>".len()..];
+    }
+    Some((name, crate::json::to_json(&J::Obj(pairs))))
+}
+
+/// Streaming counterpart: holds back `<tool_call>` blocks (and a possible
+/// partial opening tag) so they never leak into `content`.
+struct ToolFilter {
+    buf: String,
+    calls: Vec<(String, String)>,
+}
+
+impl ToolFilter {
+    fn new() -> ToolFilter {
+        ToolFilter { buf: String::new(), calls: Vec::new() }
+    }
+
+    fn feed(&mut self, text: &str) -> String {
+        const OPEN: &str = "<tool_call>";
+        const CLOSE: &str = "</tool_call>";
+        self.buf.push_str(text);
+        let mut out = String::new();
+        loop {
+            if let Some(i) = self.buf.find(OPEN) {
+                if let Some(jrel) = self.buf[i..].find(CLOSE) {
+                    let end = i + jrel + CLOSE.len();
+                    let block = self.buf[i + OPEN.len()..i + jrel].to_string();
+                    if let Some(c) = parse_tool_block(&block) {
+                        self.calls.push(c);
+                    }
+                    out.push_str(&self.buf[..i]);
+                    self.buf = self.buf[end..].to_string();
+                    continue;
+                }
+                out.push_str(&self.buf[..i]);
+                self.buf = self.buf[i..].to_string();
+                return out;
+            }
+            // hold back a possible split opening tag
+            let keep = OPEN.len() - 1;
+            if self.buf.len() > keep {
+                let cut = self.buf.len() - keep;
+                out.push_str(&self.buf[..cut]);
+                self.buf = self.buf[cut..].to_string();
+            }
+            return out;
+        }
+    }
+
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.buf)
+    }
 }
 
 struct ChatOpts {
@@ -437,22 +720,15 @@ fn handle(stream: &mut TcpStream, engine: &Arc<Mutex<Engine>>) {
             respond_json(stream, "200 OK", &models_json(&id));
         }
         ("POST", "/v1/chat/completions") => {
-            let (msgs, opts) = {
-                let e = match engine.lock() {
-                    Ok(e) => e,
-                    Err(_) => return,
-                };
-                match parse_chat(&body, &e.model_id) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        drop(e);
-                        respond_json(stream, "400 Bad Request", &err_json(&err));
-                        return;
-                    }
+            let (msgs, tools, opts) = match parse_chat(&body) {
+                Ok(v) => v,
+                Err(err) => {
+                    respond_json(stream, "400 Bad Request", &err_json(&err));
+                    return;
                 }
             };
             let prompt = match engine.lock() {
-                Ok(e) => e.build_prompt(&msgs),
+                Ok(e) => e.build_prompt(&msgs, &tools),
                 Err(_) => return,
             };
             run_completion(stream, engine, &prompt, &opts, true);
@@ -499,8 +775,9 @@ fn run_completion(
         let model2 = model_id.clone();
         let mut buf: Vec<u8> = Vec::new();
         let mut pending_bytes: Vec<u8> = Vec::new();
-        let strip = e.strip_think;
-        let mut filt = ThinkFilter::new(strip);
+        let split = e.split_reasoning;
+        let mut filt = ThinkSplitter::new(!split);
+        let mut tfilt = ToolFilter::new();
         // Buffer pieces so multi-byte UTF-8 is not split across SSE frames.
         let res = e.generate(prompt, opts.max_tokens, &cfg, &mut |piece| {
             buf.extend_from_slice(piece);
@@ -515,12 +792,21 @@ fn run_completion(
             let text = String::from_utf8_lossy(&buf[..valid]).to_string();
             pending_bytes.extend_from_slice(&buf[..valid]);
             buf.drain(..valid);
-            let text = match filt.feed(&text) {
-                Some(t) => t,
-                None => return true,
-            };
-            if text.is_empty() {
-                return true;
+            let (reason, content) = filt.feed(&text);
+            let content = tfilt.feed(&content);
+            let mut ok = true;
+            if !reason.is_empty() && chat {
+                let d = format!(
+                    "{{\"id\":\"{id2}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\
+                     \"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_content\":\"{}\"}},\
+                     \"finish_reason\":null}}]}}",
+                    escape(&model2),
+                    escape(&reason)
+                );
+                ok = sse_chunk(stream, &d);
+            }
+            if content.is_empty() {
+                return ok;
             }
             let delta = if chat {
                 format!(
@@ -528,19 +814,21 @@ fn run_completion(
                      \"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\
                      \"finish_reason\":null}}]}}",
                     escape(&model2),
-                    escape(&text)
+                    escape(&content)
                 )
             } else {
                 format!(
                     "{{\"id\":\"{id2}\",\"object\":\"text_completion\",\"created\":{created},\
                      \"model\":\"{}\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":null}}]}}",
                     escape(&model2),
-                    escape(&text)
+                    escape(&content)
                 )
             };
             sse_chunk(stream, &delta)
         });
-        if let Some(tail) = filt.flush() {
+        let mut tail = filt.flush().1;
+        tail.push_str(&tfilt.flush());
+        {
             if !tail.is_empty() {
                 let d = if chat {
                     format!(
@@ -561,7 +849,31 @@ fn run_completion(
                 sse_chunk(stream, &d);
             }
         }
-        let (pt, ct, finish) = res.unwrap_or((0, 0, "error".into()));
+        let (pt, ct, finish0) = res.unwrap_or((0, 0, "error".into()));
+        if !tfilt.calls.is_empty() && chat {
+            let tc: Vec<String> = tfilt
+                .calls
+                .iter()
+                .enumerate()
+                .map(|(i, (n, a))| {
+                    format!(
+                        "{{\"index\":{i},\"id\":\"call_{i}\",\"type\":\"function\",\
+                         \"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                        escape(n),
+                        escape(a)
+                    )
+                })
+                .collect();
+            let d = format!(
+                "{{\"id\":\"{id2}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\
+                 \"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{tc}]}},\
+                 \"finish_reason\":null}}]}}",
+                escape(&model2),
+                tc = tc.join(",")
+            );
+            sse_chunk(stream, &d);
+        }
+        let finish = if !tfilt.calls.is_empty() { "tool_calls".to_string() } else { finish0 };
         let last = if chat {
             format!(
                 "{{\"id\":\"{id2}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\
@@ -590,23 +902,56 @@ fn run_completion(
         true
     });
     let body = match res {
-        Ok((pt, ct, finish)) => {
+        Ok((pt, ct, finish0)) => {
             let raw = String::from_utf8_lossy(&text).to_string();
-            let content = if e.strip_think {
-                match raw.find("</think>") {
-                    Some(i) => raw[i + "</think>".len()..].trim_start().to_string(),
-                    None => raw,
-                }
-            } else {
-                raw
+            let (reasoning, body_text) = {
+                let mut sp = ThinkSplitter::new(!e.split_reasoning);
+                let (mut r, mut c) = sp.feed(&raw);
+                let (r2, c2) = sp.flush();
+                r.push_str(&r2);
+                c.push_str(&c2);
+                (r.trim().to_string(), c)
             };
-            if chat {
+            let (content, calls) = parse_tool_calls(&body_text);
+            let content = content.trim_start().to_string();
+            let reasoning_field = if reasoning.is_empty() {
+                String::new()
+            } else {
+                format!("\"reasoning_content\":\"{}\",", escape(&reasoning))
+            };
+            let finish = if calls.is_empty() { finish0 } else { "tool_calls".to_string() };
+            if !calls.is_empty() && chat {
+                let tc: Vec<String> = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, a))| {
+                        format!(
+                            "{{\"id\":\"call_{i}\",\"type\":\"function\",\
+                             \"function\":{{\"name\":\"{}\",\"arguments\":\"{}\"}}}}",
+                            escape(n),
+                            escape(a)
+                        )
+                    })
+                    .collect();
                 format!(
                     "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\
-                     \"model\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}},\
-                     \"finish_reason\":\"{finish}\"}}],\
+                     \"model\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\
+                     {}\"content\":\"{}\",\"tool_calls\":[{}]}},\"finish_reason\":\"tool_calls\"}}],\
                      \"usage\":{{\"prompt_tokens\":{pt},\"completion_tokens\":{ct},\"total_tokens\":{}}}}}",
                     escape(&model_id),
+                    reasoning_field,
+                    escape(&content),
+                    tc.join(","),
+                    pt + ct
+                )
+            } else if chat {
+                format!(
+                    "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\
+                     \"model\":\"{}\",\"choices\":[{{\"index\":0,\"message\":{{\"role\":\"assistant\",\
+                     {}\"content\":\"{}\"}},\"finish_reason\":\"{finish}\"}}],\
+                     \"usage\":{{\"prompt_tokens\":{pt},\"completion_tokens\":{ct},\"total_tokens\":{}}}}}",
+                    escape(&model_id),
+                    reasoning_field,
                     escape(&content),
                     pt + ct
                 )
@@ -631,26 +976,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn think_filter_strips_leading_reasoning() {
-        let mut f = ThinkFilter::new(true);
-        assert_eq!(f.feed("<think>\nreasoning"), None);
-        assert_eq!(f.feed("\n</think>\nParis"), Some("Paris".to_string()));
-        assert_eq!(f.feed(" is nice"), Some(" is nice".to_string()));
+    fn parses_tool_call_blocks() {
+        let text = "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text);
+        assert_eq!(content, "Let me check.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "get_weather");
+        assert_eq!(calls[0].1, r#"{"city":"Paris","days":3}"#);
     }
 
     #[test]
-    fn think_filter_passes_plain_text() {
-        // no leading <think: stream it once a few bytes have arrived
-        let mut f = ThinkFilter::new(true);
-        assert_eq!(f.feed("hello world"), Some("hello world".to_string()));
+    fn parses_two_tool_calls() {
+        let text = "<tool_call>\n<function=a>\n</function>\n</tool_call><tool_call>\n<function=b>\n<parameter=x>\nhi\n</parameter>\n</function>\n</tool_call>";
+        let (content, calls) = parse_tool_calls(text);
+        assert_eq!(content, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "a");
+        assert_eq!(calls[0].1, "{}");
+        assert_eq!(calls[1], ("b".to_string(), r#"{"x":"hi"}"#.to_string()));
     }
 
     #[test]
-    fn think_filter_flushes_unclosed_block() {
-        let mut f = ThinkFilter::new(true);
-        assert_eq!(f.feed("<think>still thinking"), None);
-        assert_eq!(f.flush(), Some("<think>still thinking".to_string()));
-        assert_eq!(f.flush(), None);
+    fn tool_filter_holds_back_a_split_tag() {
+        let mut f = ToolFilter::new();
+        // the filter always holds back the last 10 bytes (a split "<tool_call>")
+        let out = f.feed("Hello there, how are");
+        assert_eq!(out, "Hello ther");
+        let out2 = f.feed(" you<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>");
+        assert_eq!(out2, "e, how are you");
+        assert_eq!(f.calls.len(), 1);
+        assert_eq!(f.calls[0].0, "f");
+        assert_eq!(f.calls[0].1, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn split_think_separates_reasoning() {
+        let (r, c) = split_think("<think>\nreason\n</think>\n\nParis");
+        assert_eq!(r, "reason");
+        assert_eq!(c, "Paris");
+        let (r2, c2) = split_think("plain");
+        assert_eq!(r2, "");
+        assert_eq!(c2, "plain");
+    }
+
+    #[test]
+    fn splitter_separates_reasoning_from_content() {
+        let mut f = ThinkSplitter::new(false);
+        let (mut reason, mut content) = f.feed("<think>\nreasoning...");
+        assert!(content.is_empty());
+        let (r2, c2) = f.feed("\n</think>\n\nParis");
+        reason.push_str(&r2);
+        content.push_str(&c2);
+        assert_eq!(reason, "reasoning...\n");
+        assert_eq!(content, "Paris");
+    }
+
+    #[test]
+    fn splitter_passes_plain_text_as_content() {
+        let mut f = ThinkSplitter::new(false);
+        let (r, c) = f.feed("hello world");
+        assert!(r.is_empty());
+        assert_eq!(c, "hello world");
+    }
+
+    #[test]
+    fn splitter_keeps_an_unterminated_block_as_reasoning() {
+        let mut f = ThinkSplitter::new(false);
+        let (mut reason, content) = f.feed("<think>still thinking");
+        assert!(content.is_empty());
+        let (r2, c2) = f.flush();
+        reason.push_str(&r2);
+        assert_eq!(reason, "still thinking");
+        assert!(c2.is_empty());
+    }
+
+    #[test]
+    fn splitter_disabled_inlines_everything() {
+        let mut f = ThinkSplitter::new(true);
+        let (r, c) = f.feed("<think>x</think>y");
+        assert!(r.is_empty());
+        assert_eq!(c, "<think>x</think>y");
     }
 }
 
