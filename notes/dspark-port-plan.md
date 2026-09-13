@@ -587,3 +587,28 @@ read wrong. PrismML's own card reports accepted length tau ~ 3.7 at k=4 (a
 The per-round draft log also shows a consistent **one-position offset**: round 10
 drafts `[84,18,17,2387]` and round 11 emits `84`. The drafter tracks the sequence
 well but is consumed one step early, which is the anchor convention under test.
+
+### Correction: the earlier "drafter is weak" conclusion is void (2026-09-13)
+
+The 2.7% (port) and 0.806% (fork reference) numbers were both measured with
+*converted* sidecars (`-shared`/`-ternary`/`-dflash`), and the legacy-type-42
+misparse corrupted them. With the canonical drafter loaded correctly, the same
+port and prompt gives **10.2% (9/88)**. So:
+
+- The drafter is fine; our loader was reading it wrong.
+- PrismML's card reports accepted length tau ~ 3.7 at k=4 (1.34x on H100), so
+  10.2% is still well below what the drafter can do.
+- The two anchor variants tested with the fixed drafter are *worse*:
+  `BONSAI_DSPARK_ANCHORLESS` 4/108 (3.7%), `BONSAI_DSPARK_ANCHOR_NPAST` 2/116
+  (1.7%, drafts degrade to junk) - so the default anchor is correct and the
+  remaining gap is elsewhere.
+
+Remaining leads, from the MLX reference (`ARahim3/mlx-dspark`,
+`dflash_model.py`) that the card cites:
+- the drafter is a **block-diffusion** model with a **CandidateSelector** that
+  walks one coherent path slot-to-slot (slot 0 is the verified anchor, slot s
+  reads slot s-1's candidates) using the markov head; our port argmaxes slots
+  independently;
+- block position 0 is the anchor and has no in-block predecessor (position 1
+  reads the anchor's representation);
+- the card mentions "per-source-normalized hidden-state taps".
