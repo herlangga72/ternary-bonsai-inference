@@ -9,30 +9,22 @@
 > Batched prefill is not available with a non-f32 cache (it writes f32 caches);
 > `bonsai-grun` falls back to the token loop.
 >
-> **Correctness (greedy 8160 MATCH in every row; f32 baseline 4.03e-3 CPU /
-> 4.41e-3 GPU):**
+> **Correctness: greedy 8160 MATCH in every row.** Logit rel diff (f32 baseline:
+> qa 4.035e-3 CPU / 4.409e-3 GPU, code 3.360e-3 / 3.237e-3):
 >
-> | config | CPU rel | GPU rel |
-> | --- | --- | --- |
-> | f16 | 4.019e-3 | 4.397e-3 |
-> | planar3k | 3.13e-2 | 3.06e-2 |
-> | planar4k | 2.07e-2 | 2.07e-2 |
-> | planar8k | 1.07e-2 | 1.05e-2 |
-> | planar4 (symmetric) | 4.14e-2 | 4.43e-2 |
+> | config | qa CPU | qa GPU | code CPU | code GPU |
+> | --- | --- | --- | --- | --- |
+> | f16 | 4.019e-3 | 4.397e-3 | 3.356e-3 | 3.238e-3 |
+> | planar8k | 1.07e-2 | 1.05e-2 | - | - |
+> | planar4k | 2.07e-2 | 2.07e-2 | 1.41e-2 | 1.44e-2 |
+> | planar3k | 3.13e-2 | 3.06e-2 | - | - |
+> | planar4 (symmetric) | 4.14e-2 | 4.43e-2 | - | - |
 >
-> **f16 is lossless within measurement** on both prompts and both engines, and
-> gives 2x:
->
-> | prompt | engine | f32 | f16 |
-> | --- | --- | --- | --- |
-> | qa | CPU | 4.0346e-3 | 4.0192e-3 |
-> | qa | GPU | 4.4090e-3 | 4.3970e-3 |
-> | code | CPU | 3.3598e-3 | 3.3556e-3 |
-> | code | GPU | 3.2374e-3 | 3.2379e-3 |
->
-> The planar modes are textbook-exact but 3-4 bit perturbs this model's logits
-> 2-4% (5-10x baseline); the error is monotone in bits, so it is inherent, not
-> a bug.
+> **f16 is lossless within measurement** on both prompts and both engines: its
+> rel diff never differs from f32 by more than 1.4e-5, against a 3.2-4.4e-3
+> baseline. The planar modes are textbook-exact but 3-4 bit perturbs this
+> model's logits 2-4% (5-10x baseline); the error is monotone in bits, so it is
+> inherent, not a bug. CPU and GPU agree to within rounding in every row.
 >
 > **Long context (R4), measured on this box (15 GB, host-visible buffers):**
 >
