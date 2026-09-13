@@ -309,7 +309,7 @@ pub fn full_attention_layer(
                 let r0 = (j * cache.n_kv + kv) * plen;
                 let row = &kq[r0..r0 + plen];
                 let norm = kn[j * cache.n_kv + kv];
-                s.scores[j] = pq.dot_rotated(&s.qrot, row, norm) * scale;
+                s.scores[j] = pq.dot_rotated_scratch(&s.qrot, row, norm, &mut s.vidx) * scale;
             }
         } else if cache.f16_kv {
             let k16 = &cache.k16[il];

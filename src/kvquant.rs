@@ -453,9 +453,22 @@ impl PlanarQuant {
     /// `q_rot` must already be forward-rotated with the same table; the result
     /// equals `q . k_original` up to quantization error.
     pub fn dot_rotated(&self, q_rot: &[f32], packed: &[u8], norm: f32) -> f32 {
-        let c = self.centroids();
         let mut idx = vec![0u8; self.hd_padded];
-        unpack_idx(packed, self.hd_padded, self.bits, &mut idx);
+        self.dot_rotated_scratch(q_rot, packed, norm, &mut idx)
+    }
+
+    /// As `dot_rotated`, but without allocating: `idx` is caller scratch of at
+    /// least `hd_padded` bytes. The attention hot path calls this once per
+    /// (head, position), so the allocation mattered.
+    pub fn dot_rotated_scratch(
+        &self,
+        q_rot: &[f32],
+        packed: &[u8],
+        norm: f32,
+        idx: &mut [u8],
+    ) -> f32 {
+        let c = self.centroids();
+        unpack_idx(packed, self.hd_padded, self.bits, &mut idx[..self.hd_padded]);
         let mut acc = 0.0f32;
         for i in 0..self.hd {
             acc += q_rot[i] * c[idx[i] as usize];
