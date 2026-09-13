@@ -337,11 +337,7 @@ impl GDev {
         // KV quantization (BONSAI_KV): pack K (and optionally V) instead of f32.
         let kv_mode = crate::kvquant::mode_from_env();
         let f16_mode = kv_mode == crate::kvquant::KvMode::F16;
-        let (kq_mode, vq_mode) = if f16_mode {
-            (None, None)
-        } else {
-            crate::kvquant::from_env(HEAD_D)
-        };
+        let (kq_mode, vq_mode) = crate::kvquant::quantizers_for(kv_mode, HEAD_D);
         let mut kq: Vec<Option<DevBuf>> = Vec::new();
         let mut vq: Vec<Option<DevBuf>> = Vec::new();
         let mut k16: Vec<Option<DevBuf>> = Vec::new();

@@ -20,9 +20,19 @@
 > | planar8k | 1.07e-2 | 1.05e-2 |
 > | planar4 (symmetric) | 4.14e-2 | 4.43e-2 |
 >
-> **f16 is lossless within measurement** and gives 2x. The planar modes are
-> textbook-exact but 3-4 bit perturbs this model's logits 2-4% (5-10x baseline);
-> the error is monotone in bits, so it is inherent, not a bug.
+> **f16 is lossless within measurement** on both prompts and both engines, and
+> gives 2x:
+>
+> | prompt | engine | f32 | f16 |
+> | --- | --- | --- | --- |
+> | qa | CPU | 4.0346e-3 | 4.0192e-3 |
+> | qa | GPU | 4.4090e-3 | 4.3970e-3 |
+> | code | CPU | 3.3598e-3 | 3.3556e-3 |
+> | code | GPU | 3.2374e-3 | 3.2379e-3 |
+>
+> The planar modes are textbook-exact but 3-4 bit perturbs this model's logits
+> 2-4% (5-10x baseline); the error is monotone in bits, so it is inherent, not
+> a bug.
 >
 > **Long context (R4), measured on this box (15 GB, host-visible buffers):**
 >

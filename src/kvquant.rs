@@ -331,44 +331,6 @@ impl PlanarQuant {
     }
 }
 
-/// KV quantization selected by `BONSAI_KV`, returning `(k_quant, v_quant)`:
-///   unset / `f32`     -> (None, None)   full-precision cache (the anchor)
-///   `planar3`/`iso3`  -> both K and V (symmetric)
-///   `planar4`/`iso4`  -> both K and V
-///   `planarNk`        -> K only, V stays f32 (asymmetric, lower risk)
-pub fn from_env(hd: usize) -> (Option<PlanarQuant>, Option<PlanarQuant>) {
-    let Ok(v) = std::env::var("BONSAI_KV") else {
-        return (None, None);
-    };
-    if v.is_empty() || v == "f32" {
-        return (None, None);
-    }
-    let (name, k_only) = match v.strip_suffix('k') {
-        Some(base) => (base, true),
-        None => (v.as_str(), false),
-    };
-    let bits = match name {
-        "planar3" | "iso3" => 3,
-        "planar4" | "iso4" => 4,
-        other => match other
-            .strip_prefix("planar")
-            .or_else(|| other.strip_prefix("iso"))
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|b| (1..=8).contains(b))
-        {
-            Some(b) => b,
-            None => return (None, None),
-        },
-    };
-    let k = PlanarQuant::new(hd, bits);
-    let vq = if k_only {
-        None
-    } else {
-        Some(PlanarQuant::new(hd, bits))
-    };
-    (Some(k), vq)
-}
-
 // ---------------------------------------------------------------------------
 // Mode selection
 // ---------------------------------------------------------------------------
@@ -398,16 +360,14 @@ impl KvMode {
     }
 }
 
-/// Parse `BONSAI_KV`:
-///   unset/`f32`        -> F32
+/// Parse a `BONSAI_KV` value (pure, so it is testable without touching env):
+///   "" / `f32`         -> F32
 ///   `f16`/`fp16`/`half`-> F16
 ///   `planarN`/`isoN`   -> Planar { bits: N, v_quant: true }
 ///   `planarNk`/`isoNk` -> Planar { bits: N, v_quant: false }
-pub fn mode_from_env() -> KvMode {
-    let Ok(v) = std::env::var("BONSAI_KV") else {
-        return KvMode::F32;
-    };
-    match v.as_str() {
+/// Anything else (including N outside 1..=8) falls back to F32.
+pub fn parse_mode(s: &str) -> KvMode {
+    match s {
         "" | "f32" => KvMode::F32,
         "f16" | "fp16" | "half" => KvMode::F16,
         other => {
@@ -434,6 +394,35 @@ pub fn mode_from_env() -> KvMode {
             }
         }
     }
+}
+
+/// `BONSAI_KV` parsed, defaulting to F32 when unset.
+pub fn mode_from_env() -> KvMode {
+    std::env::var("BONSAI_KV")
+        .map(|v| parse_mode(&v))
+        .unwrap_or(KvMode::F32)
+}
+
+/// The per-K / per-V quantizers implied by a mode (`None` when that side keeps
+/// its f32 storage, which includes the f16 mode).
+pub fn quantizers_for(mode: KvMode, hd: usize) -> (Option<PlanarQuant>, Option<PlanarQuant>) {
+    match mode {
+        KvMode::Planar { bits, v_quant } => {
+            let k = PlanarQuant::new(hd, bits);
+            let v = if v_quant {
+                Some(PlanarQuant::new(hd, bits))
+            } else {
+                None
+            };
+            (Some(k), v)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Convenience: parse `BONSAI_KV` and build the quantizers.
+pub fn from_env(hd: usize) -> (Option<PlanarQuant>, Option<PlanarQuant>) {
+    quantizers_for(mode_from_env(), hd)
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +518,59 @@ mod tests {
         }
         // 4-bit: relative L2 error should be a few percent
         assert!(worst_rel < 0.12, "worst relative L2 error {worst_rel}");
+    }
+
+    #[test]
+    fn kv_mode_parsing() {
+        use KvMode::*;
+        assert_eq!(parse_mode(""), F32);
+        assert_eq!(parse_mode("f32"), F32);
+        assert_eq!(parse_mode("f16"), F16);
+        assert_eq!(parse_mode("fp16"), F16);
+        assert_eq!(parse_mode("half"), F16);
+        assert_eq!(
+            parse_mode("planar4"),
+            Planar {
+                bits: 4,
+                v_quant: true
+            }
+        );
+        assert_eq!(
+            parse_mode("planar4k"),
+            Planar {
+                bits: 4,
+                v_quant: false
+            }
+        );
+        assert_eq!(
+            parse_mode("iso3"),
+            Planar {
+                bits: 3,
+                v_quant: true
+            }
+        );
+        assert_eq!(
+            parse_mode("iso8k"),
+            Planar {
+                bits: 8,
+                v_quant: false
+            }
+        );
+        // out of range / unknown fall back to f32 rather than failing
+        assert_eq!(parse_mode("planar9"), F32);
+        assert_eq!(parse_mode("planar0"), F32);
+        assert_eq!(parse_mode("garbage"), F32);
+        assert_eq!(parse_mode("planark"), F32);
+
+        // quantizer pairing follows the mode
+        let (k, v) = quantizers_for(parse_mode("planar4"), DEFAULT_HD);
+        assert!(k.is_some() && v.is_some());
+        let (k, v) = quantizers_for(parse_mode("planar4k"), DEFAULT_HD);
+        assert!(k.is_some() && v.is_none());
+        let (k, v) = quantizers_for(parse_mode("f16"), DEFAULT_HD);
+        assert!(k.is_none() && v.is_none());
+        let (k, v) = quantizers_for(parse_mode("f32"), DEFAULT_HD);
+        assert!(k.is_none() && v.is_none());
     }
 
     #[test]

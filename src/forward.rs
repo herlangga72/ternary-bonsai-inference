@@ -53,8 +53,9 @@ pub struct AttnCache {
 impl AttnCache {
     pub fn new(cfg: &Qwen35) -> AttnCache {
         let n_kv_elems = cfg.n_head_kv * cfg.n_embd_head;
-        let (pq, pqv) = crate::kvquant::from_env(cfg.n_embd_head);
-        let f16_kv = crate::kvquant::mode_from_env() == crate::kvquant::KvMode::F16;
+        let mode = crate::kvquant::mode_from_env();
+        let (pq, pqv) = crate::kvquant::quantizers_for(mode, cfg.n_embd_head);
+        let f16_kv = mode == crate::kvquant::KvMode::F16;
         AttnCache {
             n_kv_elems,
             n_kv: cfg.n_head_kv,
