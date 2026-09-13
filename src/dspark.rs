@@ -20,7 +20,39 @@
 
 use crate::gguf::{half_to_f32, GGUF, TensorInfo, TYPE_BF16, TYPE_F32, TYPE_PQ2_0, TYPE_Q4_1};
 use crate::kernels;
-use crate::rope::rope_neox;
+use crate::rope::{rope_imrope, rope_neox};
+
+/// Draft RoPE variant, selected once from `BONSAI_DSPARK_ROPE`:
+///   unset / `neox`   -> full-dim NEOX (current default)
+///   `neox64`         -> NEOX on the first 64 dims only
+///   `imrope64`       -> target-style interleaved M-RoPE, 64 dims
+/// The sidecar omits any rope dimension/section metadata, so this exists to
+/// A/B the "rope dims" suspect in the draft-acceptance bisect.
+fn draft_rope_mode() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("BONSAI_DSPARK_ROPE").as_deref() {
+        Ok("neox64") => 1,
+        Ok("imrope64") => 2,
+        _ => 0,
+    })
+}
+
+fn draft_rope(head: &mut [f32], pos: f32, hd: usize, freq_base: f32) {
+    match draft_rope_mode() {
+        1 => rope_neox(head, pos, 64.min(hd), freq_base),
+        2 => rope_imrope(
+            head,
+            pos as i64,
+            pos as i64,
+            pos as i64,
+            pos as i64,
+            64.min(hd),
+            [11, 11, 10, 0],
+            freq_base,
+        ),
+        _ => rope_neox(head, pos, hd, freq_base),
+    }
+}
 
 /// Sidecar metadata resolved into the numbers the graph needs.
 #[derive(Debug, Clone)]
@@ -596,7 +628,7 @@ impl Dspark {
                 for h in 0..c.n_head_kv {
                     let head = &mut k[h * c.head_dim..(h + 1) * c.head_dim];
                     kernels::rms_norm_inplace(head, &knorm, c.eps);
-                    rope_neox(head, pos as f32, c.head_dim, c.rope_freq_base);
+                    draft_rope(head, pos as f32, c.head_dim, c.rope_freq_base);
                 }
                 cache.put(il, pos, &k, &v);
             }
@@ -719,13 +751,13 @@ impl Dspark {
                 for h in 0..c.n_head {
                     let head = &mut q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
                     kernels::rms_norm_inplace(head, &qn, c.eps);
-                    rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
+                    draft_rope(head, positions[t] as f32, hd, c.rope_freq_base);
                 }
                 for h in 0..c.n_head_kv {
                     let base = t * n_kv_dim + h * hd;
                     let head = &mut kk[base..base + hd];
                     kernels::rms_norm_inplace(head, &kn, c.eps);
-                    rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
+                    draft_rope(head, positions[t] as f32, hd, c.rope_freq_base);
                 }
                 cache.put(
                     il,
