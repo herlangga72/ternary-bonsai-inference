@@ -648,3 +648,12 @@ the canonical Q4_1/bf16 with the fixed loader.
 Remaining gap to the card's tau ~ 3.7: rounds 1-3 still accept 0 (drafter context
 warmup right after prefill) and the confidence/markov path has not been revisited
 since the ordering fix.
+
+### Repack is not equivalent (2026-09-13)
+
+Regenerated a ternary repack from the canonical Q4_1 with the fixed loader:
+`bonsai-dspark repack` -> 923.9 MiB, layout ok. Acceptance on the same prompt:
+**14/196 = 7.1%**, versus **52.4%** for the canonical Q4_1. So PQ2_0 (2-bit
+ternary) requantization of the drafter is far too lossy - the publisher's "4-bit
+is essentially unchanged" does not extend to 2-bit. Use the canonical Q4_1 (or
+bf16) sidecar; do not requantize the drafter to ternary.
