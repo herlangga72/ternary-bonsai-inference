@@ -252,7 +252,7 @@ fn main() {
         if cli.temp > 0.0 {
             eprintln!("[dspark] disabled: speculative decode requires greedy (--temp 0)");
         } else {
-            match spec::Drafter::new(p, 8192, 0.0) {
+            match spec::Drafter::new(p, Some(&cli.model), 8192, 0.0) {
                 Ok(d) => {
                     eprintln!("[dspark] speculative decode active (n_draft={n_draft})");
                     drafter = Some(d);

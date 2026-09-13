@@ -17,17 +17,19 @@ use std::process::exit;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage:\n  bonsai-dspark <sidecar.gguf>\n  bonsai-dspark repack <sidecar-in.gguf> <out.gguf>");
+        eprintln!("usage:\n  bonsai-dspark <sidecar.gguf> [target.gguf]\n  bonsai-dspark repack <sidecar-in.gguf> <out.gguf> [reference-target.gguf]");
         exit(1);
     }
     if args[0] == "repack" {
-        if args.len() != 3 {
-            eprintln!("usage: bonsai-dspark repack <sidecar-in.gguf> <out.gguf>");
+        if args.len() < 3 || args.len() > 4 {
+            eprintln!("usage: bonsai-dspark repack <sidecar-in.gguf> <out.gguf> [reference-target.gguf]");
             exit(1);
         }
-        match dspark::repack_ternary(&args[1], &args[2]) {
-            Ok((n, bin, bout)) => println!(
-                "repacked {n} tensors to PQ2_0: {:.1} -> {:.1} MiB ({:.0}% of original)",
+        let reference = args.get(3).map(|s| s.as_str());
+        match dspark::repack_ternary(&args[1], &args[2], reference) {
+            Ok((n, dropped, bin, bout)) => println!(
+                "repacked {n} tensors to PQ2_0, dropped {dropped} shared with the reference: \
+                 {:.1} -> {:.1} MiB ({:.0}% of original)",
                 bin as f64 / 1048576.0,
                 bout as f64 / 1048576.0,
                 100.0 * bout as f64 / bin as f64
@@ -40,7 +42,8 @@ fn main() {
         return;
     }
     let args = args;
-    let d = match Dspark::open(&args[0]) {
+    let target = args.get(1).map(|s| s.as_str());
+    let d = match Dspark::open_with_target(&args[0], target) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("open: {e}");

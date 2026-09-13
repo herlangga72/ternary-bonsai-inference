@@ -91,7 +91,7 @@ fn main() {
         }
     };
     let ctx = 4096;
-    let mut drafter = match Drafter::new(&sidecar, ctx, 0.0) {
+    let mut drafter = match Drafter::new(&sidecar, Some(&target), ctx, 0.0) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("open sidecar: {e}");

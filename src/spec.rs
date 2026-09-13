@@ -36,8 +36,15 @@ pub struct Drafter {
 }
 
 impl Drafter {
-    pub fn new(dspark_path: &str, n_ctx: usize, p_min: f32) -> Result<Drafter, String> {
-        let ds = Dspark::open(dspark_path)?;
+    /// `target_path` is needed only when the sidecar shares tensors with the
+    /// target (see `dspark.shared_tensors`).
+    pub fn new(
+        dspark_path: &str,
+        target_path: Option<&str>,
+        n_ctx: usize,
+        p_min: f32,
+    ) -> Result<Drafter, String> {
+        let ds = Dspark::open_with_target(dspark_path, target_path)?;
         let taps_want = ds.cfg.target_layers.clone();
         // the draft cache only needs the sidecar's trained context length
         let n_ctx = n_ctx.min(ds.cfg.context_length);

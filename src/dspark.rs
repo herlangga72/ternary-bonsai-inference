@@ -353,6 +353,9 @@ pub fn matvec_par(
 pub struct Dspark {
     pub cfg: DsparkCfg,
     pub gguf: GGUF,
+    /// Tensors the sidecar omits because they are byte-identical to the target
+    /// model's (recorded as `dspark.shared_tensors`), plus that target GGUF.
+    shared: Option<(GGUF, Vec<String>)>,
     /// Memoized small f32 tensors (norms, biases). Dequantizing them on every
     /// draft call is pure waste; they never change.
     f32_memo: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
@@ -360,32 +363,78 @@ pub struct Dspark {
 
 impl Dspark {
     pub fn open(path: &str) -> Result<Dspark, String> {
+        Self::open_with_target(path, None)
+    }
+
+    /// Open the sidecar, resolving any tensor listed in `dspark.shared_tensors`
+    /// from `target_path` (they were dropped at repack time because they are
+    /// byte-identical to the target's, e.g. the 322 MiB token embedding).
+    pub fn open_with_target(path: &str, target_path: Option<&str>) -> Result<Dspark, String> {
         let gguf = GGUF::open(path)?;
         let cfg = DsparkCfg::from_gguf(&gguf)?;
+        let shared_names: Vec<String> = gguf
+            .get("dspark.shared_tensors")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shared = if shared_names.is_empty() {
+            None
+        } else {
+            let tp = target_path.ok_or_else(|| {
+                format!(
+                    "{path}: needs the target model to resolve {} shared tensor(s); \
+                     pass --model <target.gguf>",
+                    shared_names.len()
+                )
+            })?;
+            Some((GGUF::open(tp)?, shared_names))
+        };
         Ok(Dspark {
             cfg,
             gguf,
+            shared,
             f32_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
 
-    pub fn tensor(&self, name: &str) -> Result<&TensorInfo, String> {
-        self.gguf
-            .tensors
-            .iter()
-            .find(|t| t.name == name)
-            .ok_or_else(|| format!("dspark: tensor '{name}' missing"))
+    /// Locate a tensor and the GGUF that owns it: the sidecar first, then the
+    /// target for names declared shared.
+    fn resolve<'a>(&'a self, name: &str) -> Result<(&'a GGUF, TensorInfo), String> {
+        if let Some(t) = self.gguf.tensors.iter().find(|t| t.name == name) {
+            return Ok((&self.gguf, t.clone()));
+        }
+        if let Some((g, names)) = &self.shared {
+            if names.iter().any(|n| n == name) {
+                if let Some(t) = g.tensors.iter().find(|t| t.name == name) {
+                    return Ok((g, t.clone()));
+                }
+            }
+        }
+        Err(format!("dspark: tensor '{name}' missing"))
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<TensorInfo, String> {
+        self.resolve(name).map(|(_, t)| t)
+    }
+
+    fn payload<'a>(&'a self, name: &str) -> Result<(&'a [u8], TensorInfo), String> {
+        let (g, t) = self.resolve(name)?;
+        let p = g.payload_slice(&t)?;
+        Ok((p, t))
     }
 
     /// Fetch a full tensor as f32 (small tensors only).
     pub fn read_f32(&self, name: &str) -> Result<Vec<f32>, String> {
-        let t = self.tensor(name)?.clone();
+        let (payload, t) = self.payload(name)?;
         if !type_supported(t.ty) {
             return Err(format!("dspark {name}: unsupported type {}", t.ty));
         }
         let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
         let rows = (t.n_elem() as usize) / ne0.max(1);
-        let payload = self.gguf.payload_slice(&t)?;
         let mut out = vec![0.0f32; rows * ne0];
         for r in 0..rows {
             let rb = row_bytes(t.ty, ne0);
@@ -443,13 +492,12 @@ impl Dspark {
 
     /// One tensor row (ne0 values) as f32.
     pub fn row_f32(&self, name: &str, row: u64) -> Result<Vec<f32>, String> {
-        let t = self.tensor(name)?;
+        let (payload, t) = self.payload(name)?;
         if !type_supported(t.ty) {
             return Err(format!("dspark {name}: unsupported type {}", t.ty));
         }
         let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
         let rb = row_bytes(t.ty, ne0);
-        let payload = self.gguf.payload_slice(t)?;
         let start = row as usize * rb;
         if start + rb > payload.len() {
             return Err(format!("dspark {name}: row {row} out of range"));
@@ -468,9 +516,8 @@ impl Dspark {
         x: &[f32],
         y: &mut [f32],
     ) -> Result<(), String> {
-        let t = self.tensor(name)?;
+        let (payload, t) = self.payload(name)?;
         let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
-        let payload = self.gguf.payload_slice(t)?;
         matvec_par(t.ty, payload, ne0, base_row, n_rows, x, y)
     }
 
@@ -494,13 +541,12 @@ impl Dspark {
         n_tok: usize,
         y: &mut [f32],
     ) -> Result<(), String> {
-        let t = self.tensor(name)?;
+        let (payload, t) = self.payload(name)?;
         let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
         let rows = (t.n_elem() as usize) / ne0.max(1);
         if xmat.len() != n_tok * ne0 || y.len() < n_tok * rows {
             return Err(format!("matvec_multi {name}: shape mismatch"));
         }
-        let payload = self.gguf.payload_slice(t)?;
         if t.ty == TYPE_PQ2_0 {
             return kernels::pq2_matmul_n(payload, ne0, 0, rows, xmat, n_tok, y);
         }
@@ -775,10 +821,9 @@ impl Dspark {
         t_head += t_hd.elapsed().as_secs_f64();
         let t_mk = std::time::Instant::now();
         // --- markov + confidence heads -----------------------------------
-        let mw1 = self.tensor("dspark.markov_head_a.weight")?;
+        let (mw1_payload, mw1) = self.payload("dspark.markov_head_a.weight")?;
         let mw1_ne0 = mw1.dims.first().copied().unwrap_or(0) as usize;
         let mw1_rb = row_bytes(mw1.ty, mw1_ne0);
-        let mw1_payload = self.gguf.payload_slice(mw1)?;
         let conf = self.cached_f32("dspark.confidence_head.weight")?;
         let conf_b = self.cached_f32("dspark.confidence_head.bias")?;
 
@@ -934,13 +979,23 @@ pub fn quantize_pq2_0_row(x: &[f32], out: &mut Vec<u8>) {
 ///
 /// F32 norms and any tensor whose row width is not a multiple of 128 are kept
 /// verbatim. Returns `(converted, bytes_in, bytes_out)`.
-pub fn repack_ternary(src: &str, dst: &str) -> Result<(usize, u64, u64), String> {
+pub fn repack_ternary(
+    src: &str,
+    dst: &str,
+    reference: Option<&str>,
+) -> Result<(usize, usize, u64, u64), String> {
     use crate::gguf::{tensor_nbytes_for, write_gguf, TYPE_BF16, TYPE_PQ2_0, TYPE_Q4_1};
     let g = GGUF::open(src)?;
     let mut bytes_in = 0u64;
     for t in &g.tensors {
         bytes_in += g.tensor_nbytes(t);
     }
+    // optional reference (the target model): tensors that are byte-identical to
+    // the reference's same-named tensor are dropped and resolved from it at load
+    let refg = match reference {
+        Some(p) => Some(GGUF::open(p)?),
+        None => None,
+    };
 
     // data order (the writer lays payloads out contiguously, and llama.cpp
     // requires index order == data order)
@@ -959,10 +1014,26 @@ pub fn repack_ternary(src: &str, dst: &str) -> Result<(usize, u64, u64), String>
     }
     let mut items: Vec<Item> = Vec::with_capacity(order.len());
     let mut converted = 0usize;
+    let mut shared: Vec<String> = Vec::new();
     for &i in &order {
         let t = &g.tensors[i];
         let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
         let rows = (t.n_elem() as usize) / ne0.max(1);
+        // drop a tensor that is byte-identical to the reference's
+        if let Some(rg) = &refg {
+            if let Some(rt) = rg.tensors.iter().find(|r| r.name == t.name) {
+                let same_shape = rt.ty == t.ty && rt.dims == t.dims;
+                let same_bytes = same_shape && rt.n_elem() == t.n_elem() && {
+                    let a = g.payload_slice(t)?;
+                    let b = rg.payload_slice(rt)?;
+                    a == b
+                };
+                if same_bytes {
+                    shared.push(t.name.clone());
+                    continue;
+                }
+            }
+        }
         let convertible = (t.ty == TYPE_Q4_1 || t.ty == TYPE_BF16)
             && ne0 % 128 == 0
             && ne0 > 0
@@ -985,6 +1056,19 @@ pub fn repack_ternary(src: &str, dst: &str) -> Result<(usize, u64, u64), String>
 
     let mut meta: Vec<(String, crate::gguf::Value)> =
         g.meta.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if !shared.is_empty() {
+        meta.push((
+            "dspark.shared_tensors".to_string(),
+            crate::gguf::Value::Array {
+                elem_type: 8, // GGUF string
+                items: shared
+                    .clone()
+                    .into_iter()
+                    .map(crate::gguf::Value::Str)
+                    .collect(),
+            },
+        ));
+    }
     meta.sort_by(|a, b| a.0.cmp(&b.0));
     let descs: Vec<(String, Vec<u64>, u32)> = items
         .iter()
@@ -1019,7 +1103,7 @@ pub fn repack_ternary(src: &str, dst: &str) -> Result<(usize, u64, u64), String>
         .iter()
         .map(|it| tensor_nbytes_for(it.ty, it.dims.iter().product()))
         .sum();
-    Ok((converted, bytes_in, bytes_out))
+    Ok((converted, shared.len(), bytes_in, bytes_out))
 }
 
 #[cfg(test)]
