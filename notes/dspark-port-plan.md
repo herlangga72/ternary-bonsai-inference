@@ -558,3 +558,32 @@ tensors (declared layout needs ~5.1 GB, the file is 1.9 GB). Anything measured o
 file cannot run. `Dspark::open_with_target` now calls `GGUF::check_layout` and
 fails fast with a clear message instead of aborting mid-decode with
 `slice_at ... past mmap end`.
+
+### ROOT CAUSE: legacy PQ2_0 type 42 was mis-sized (2026-09-13)
+
+The canonical drafter (`prism-ml/Ternary-Bonsai-27B-gguf`,
+`Ternary-Bonsai-27B-dspark-Q4_1.gguf`) is **byte-identical** to our local file
+(sha256 c4810091...). It stores `token_embd.weight` as **type 42** (legacy Prism
+group-128 ternary, old id). `tensor_nbytes_for` had no case for 42, so it fell
+through to 4 bytes/elem: 1,271,398,400 elems × 4 = 5.09 GB instead of 337 MB.
+That inflated every downstream offset/size and made the loader reject or corrupt
+the drafter.
+
+Fix (`src/gguf.rs`): normalize type 42 -> 142 (PQ2_0) when parsing the tensor
+table, and size 42 as (128, 34) in `tensor_nbytes_for`. Both are the same
+group-128 layout; `retag_legacy_ternary` already treated them as equivalent.
+
+Effect on acceptance (code prompt, n_draft 4, greedy, identity preserved):
+
+| sidecar | acceptance |
+| --- | --- |
+| shared (repacked, before fix) | 3/112 = 2.7% |
+| **canonical Q4_1 (after fix)** | **9/88 = 10.2%** |
+
+So the earlier "the drafter is weak" conclusion was wrong: the drafter was being
+read wrong. PrismML's own card reports accepted length tau ~ 3.7 at k=4 (a
+1.34x H100 speedup), so there is still a large gap to close.
+
+The per-round draft log also shows a consistent **one-position offset**: round 10
+drafts `[84,18,17,2387]` and round 11 emits `84`. The drafter tracks the sequence
+well but is consumed one step early, which is the anchor convention under test.

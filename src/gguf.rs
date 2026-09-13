@@ -139,7 +139,14 @@ impl GGUF {
             for _ in 0..nd {
                 dims.push(read_u64(&mut file)?);
             }
-            let ty = read_u32(&mut file)?;
+            let ty = match read_u32(&mut file)? {
+                // Legacy Prism ternary is the same group-128 layout under an old
+                // id; normalize so sizing, decoding and the PQ2_0 type checks all
+                // treat it as PQ2_0. (The canonical Bonsai dspark sidecar stores
+                // its token_embd this way.)
+                TYPE_Q2_0_LEGACY => TYPE_PQ2_0,
+                other => other,
+            };
             let offset = read_u64(&mut file)?;
             tensors.push(TensorInfo { name, dims, ty, offset });
         }
@@ -338,6 +345,7 @@ pub fn tensor_nbytes_for(ty: u32, n_elem: u64) -> u64 {
         TYPE_BF16 => (1u64, 2u64),
         TYPE_Q4_1 => (32u64, 20u64),   // 2x fp16 + 16 nibbles
         TYPE_PQ2_0 => (128u64, 34u64), // fp16 + 32 bytes of 2-bit codes
+        TYPE_Q2_0_LEGACY => (128u64, 34u64), // same layout, old id
         TYPE_TQ1_0 => (256u64, 54u64), // fp16 + trit packing
         _ => (1u64, 4u64),
     };
