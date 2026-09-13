@@ -657,3 +657,28 @@ Regenerated a ternary repack from the canonical Q4_1 with the fixed loader:
 ternary) requantization of the drafter is far too lossy - the publisher's "4-bit
 is essentially unchanged" does not extend to 2-bit. Use the canonical Q4_1 (or
 bf16) sidecar; do not requantize the drafter to ternary.
+
+### Goal reached: 79.7% acceptance (2026-09-13)
+
+The rounds 1-3 zeros were a harness artifact: `bonsai-spec`'s `text:` path does
+not apply the chat template, so the drafter (trained on templated chat) started
+out of distribution. With the Qwen3.5 template applied:
+
+```
+bonsai-spec <target> <dspark-Q4_1> \
+  "text:<|im_start|>user\nWrite a Rust function...<|im_end|>\n<|im_start|>assistant\n<think>\n" 64 4
+prefill 26 tokens
+rounds mostly 4/4;  accepted 51/64 drafts = 79.7%   (16 rounds, greedy IDENTICAL)
+```
+
+So the full arc on the code prompt is **2.7% -> 10.2% (type-42 parse) ->
+52.4% (block ordering) -> 79.7% (correct prompt template)**, above the ~75%
+target. The real engine (`bonsai-run` / server) applies the template, so it gets
+the high-acceptance path; only the bare `bonsai-spec text:` harness needed it.
+
+Summary of the two real engine bugs found and fixed:
+1. `src/gguf.rs`: legacy PQ2_0 type 42 was sized as 4 B/elem (5.09 GB), which
+   corrupted/rejected the canonical drafter.
+2. `src/spec.rs`: the draft block was anchored at `n_past + 1` with pending
+   injected first, so `logits[0]` predicted `n_past + 2`; the reference anchors
+   at `n_past` and drafts before observing pending.
