@@ -68,6 +68,11 @@ impl Value {
             Value::U64(v) => Some(*v),
             Value::I64(v) => Some(*v as u64),
             Value::U32(v) => Some(*v as u64),
+            Value::I32(v) => Some(*v as u64),
+            Value::U16(v) => Some(*v as u64),
+            Value::I16(v) => Some(*v as u64),
+            Value::U8(v) => Some(*v as u64),
+            Value::I8(v) => Some(*v as u64),
             _ => None,
         }
     }
