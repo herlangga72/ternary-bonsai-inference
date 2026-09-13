@@ -158,6 +158,24 @@ which removed ~768k allocations per token at 2K context.
 Re-checked on the current binaries (after the group3 repack): `planar4` code
 2.72e-2 / 2.73e-2 and `planar2` code 7.09e-2 / 6.70e-2, all greedy 8160.
 
+K-only modes keep V as f32, so they buy much less memory but track the f32
+baseline closer (qa, CPU). The acceptance-vs-size curve:
+
+| mode | K+V B/token/layer | vs f32 | logit rel | greedy |
+| --- | --- | --- | --- | --- |
+| f32 | 8192 | 1.0x | 4.03e-3 | 8160 |
+| f16 | 4096 | 2.0x | 4.02e-3 | 8160 |
+| planar4k | 4624 | 1.8x | 2.07e-2 | 8160 |
+| planar3k | 4496 | 1.8x | 3.13e-2 | 8160 |
+| planar2k | 4368 | 1.9x | 4.07e-2 | 8160 |
+| planar4 | 1056 | 7.8x | 4.14e-2 | 8160 |
+| planar3 | 800 | 10.2x | 4.68e-2 | 8160 |
+| planar2 | 544 | 15.1x | 7.29e-2 | 8160 |
+
+Only `f32` and `f16` stay under the harness's 1e-2 tolerance. K-only buys
+almost nothing here because f32 V dominates the row; symmetric is where the
+compression is.
+
 `planar2` also matches greedy on the code prompt (CPU 7.09e-2, GPU 6.70e-2).
 All symmetric planar modes exceed the harness's 1e-2 logit tolerance by design;
 the gate is the greedy id, which holds for every row. `planar2` is the smallest
