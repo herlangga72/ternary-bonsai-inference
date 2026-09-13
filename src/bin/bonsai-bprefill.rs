@@ -39,6 +39,8 @@ mod tokenizer;
 mod weights;
 #[path = "../vk.rs"]
 mod vk;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../forward.rs"]
 mod forward;
 #[path = "../gdev.rs"]

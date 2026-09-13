@@ -4,6 +4,7 @@
 //! in this crate.
 
 mod forward;
+mod kvquant;
 mod gguf;
 mod vk;
 mod gdn;

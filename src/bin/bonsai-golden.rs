@@ -17,6 +17,8 @@ mod rope;
 mod tokenizer;
 #[path = "../weights.rs"]
 mod weights;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../forward.rs"]
 mod forward;
 #[path = "../vk.rs"]

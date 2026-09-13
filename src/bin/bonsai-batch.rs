@@ -28,6 +28,8 @@ mod prefill;
 mod rope;
 #[path = "../weights.rs"]
 mod weights;
+#[path = "../kvquant.rs"]
+mod kvquant;
 #[path = "../forward.rs"]
 mod forward;
 #[path = "../vk.rs"]
