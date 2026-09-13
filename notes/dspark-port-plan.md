@@ -682,3 +682,13 @@ Summary of the two real engine bugs found and fixed:
 2. `src/spec.rs`: the draft block was anchored at `n_past + 1` with pending
    injected first, so `logits[0]` predicted `n_past + 2`; the reference anchors
    at `n_past` and drafts before observing pending.
+
+Confirmed on the qa prompt (templated, n=64): **52/56 = 92.9%** draft acceptance
+over 14 rounds, greedy IDENTICAL. So with the two engine fixes and a templated
+prompt: code 79.7%, qa 92.9%.
+
+Note the end-to-end time is still not a win yet (qa spec 2.06 s/tok vs plain
+1.70 s/tok) because verification is streaming - one target forward per draft
+token. Acceptance is now where it needs to be; the remaining work for a speedup
+is the batched verify pass (`pq2_matmul_n` is ready, the target layer functions
+still run per token), which is the note's long-standing item (2).
