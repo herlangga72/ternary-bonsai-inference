@@ -340,9 +340,14 @@ Remaining footprint idea, not done: an f16 target KV cache (`BONSAI_KV=f16`
 already exists for the target's full-attention layers, so this is mostly
 accounting).
 
-Bandwidth-vs-compute: the only lever that cuts the draft's *traffic* rather than
-its size is reading each weight once per block instead of once per block
-position (the head is 379 MiB x 4, the layer matrices ~470 MiB x 4). That needs
-the per-layer matvecs batched like `matvec_multi`/`pq2_matmul_n`; measured a
-wash on this CPU (compute-bound), so it is deliberately not wired - it is the
-first thing to enable on bandwidth-bound hardware.
+Bandwidth-vs-compute: every block-position matvec now goes through
+`matvec_multi`, so each weight row is fetched once per block instead of once per
+position. Draft weight traffic per block drops from ~2.4 GB to ~0.6 GB (LM head
+379 MiB x4, layer matrices ~211 MiB x4). It is neutral on this CPU - the draft is
+compute-bound, ~0.75 s per block either way - but it is the change that matters
+on bandwidth-bound hardware, and the logits are bit-identical either way.
+
+The remaining lever in the same direction is the *target* verify: it still
+forwards one token at a time, so the 6.8 GB weight stream is read once per
+draft token. `pq2_matmul_n` is ready for that; it needs the target's layer
+functions to take an N-wide activation tile.
