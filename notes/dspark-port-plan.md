@@ -272,7 +272,9 @@ two unrelated reasons, both patched locally (diff saved as
 | llama.cpp fork | 24 | 3 | 12.5% | 10 |
 | Rust (`bonsai-spec`, n_draft 4) | 24 | 1 | 4.2% | 8 |
 
-Both are low and the samples are tiny (3 vs 1 events), so the low acceptance is
+Both are low and the samples are tiny: across runs the Rust port accepted
+1/24, 2/28, 2/20 and 3/24 (4.2-12.5%) against the fork's 3/24, so the two are
+not distinguishable at this sample size. The low acceptance is
 a property of this drafter/prompt rather than an obvious port bug: the reference
 implementation with the real weights is not much better. A larger corpus is
 needed to say whether the Rust draft is systematically worse. Fork prompt eval
@@ -284,6 +286,11 @@ The drafter's cost is dominated by four tensors: `output.weight` 758 MiB (Q4_1),
 `token_embd` 322 MiB (PQ2_0), `fc` 78 MiB (Q4_1) and `markov_head_a` 121 MiB
 (BF16); the 42 block matrices are another ~468 MiB. Total 1856 MiB.
 
+Per-block weight traffic (computed from the PQ2_0 block size, not measured): the
+batched path moves 594 MiB - LM head 322 MiB, six layers 34.5 MiB each, markov
+table 16 MiB x4 positions - where fetching each weight once per block position
+moved 2181 MiB. So batching cuts the draft's traffic ~3.7x.
+
 `bonsai-dspark repack <in> <out>` requantizes every Q4_1/BF16 matrix to PQ2_0
 (ternary, per-128 absmax scale) and rewrites the GGUF:
 
@@ -291,7 +298,7 @@ The drafter's cost is dominated by four tensors: `output.weight` 758 MiB (Q4_1),
 | --- | --- | --- |
 | file / payload | 1856 MiB | 924 MiB (50%) |
 | draft block (warm) | 1.44 s | 0.52 s |
-| acceptance (qa, n_draft 4) | 2/28 (7.1%) | 3/24 (12.5%) |
+| acceptance (qa, n_draft 4) | 2/28 (7.1%) | 3/24 (12.5%) [one run] |
 
 Acceptance did not get worse (tiny samples; the fork reference is 3/24), so
 ternary packing halves the draft's memory and traffic and speeds the block up
@@ -342,8 +349,8 @@ accounting).
 
 Bandwidth-vs-compute: every block-position matvec now goes through
 `matvec_multi`, so each weight row is fetched once per block instead of once per
-position. Draft weight traffic per block drops from ~2.4 GB to ~0.6 GB (LM head
-379 MiB x4, layer matrices ~211 MiB x4). It is neutral on this CPU - the draft is
+position. Draft weight traffic per block drops from 2181 MiB to 594 MiB (~3.7x; computed
+from block sizes: head 322 MiB, layers 6x34.5 MiB). It is neutral on this CPU - the draft is
 compute-bound, ~0.75 s per block either way - but it is the change that matters
 on bandwidth-bound hardware, and the logits are bit-identical either way.
 
