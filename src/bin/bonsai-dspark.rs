@@ -6,6 +6,8 @@
 mod gguf;
 #[path = "../kernels.rs"]
 mod kernels;
+#[path = "../rope.rs"]
+mod rope;
 #[path = "../dspark.rs"]
 mod dspark;
 
@@ -118,6 +120,50 @@ fn main() {
         }
         Err(e) => {
             eprintln!("encode: {e}");
+            exit(1);
+        }
+    }
+    // --- draft block smoke (real weights, empty context) ------------------
+    let mut cache = dspark::DraftCache::new(c, 64);
+    // inject a little fake context so attention has non-block positions to read
+    let ctx_tok = 4;
+    let feats2 = vec![0.01f32; ctx_tok * c.n_embd_enc()];
+    let inp_g = d.encode(&feats2, ctx_tok).unwrap();
+    let positions: Vec<usize> = (0..ctx_tok).collect();
+    if let Err(e) = d.inject(&mut cache, &inp_g, &positions) {
+        eprintln!("inject: {e}");
+        exit(1);
+    }
+    let t0 = std::time::Instant::now();
+    match d.draft_block(&mut cache, 1, ctx_tok) {
+        Ok(b) => {
+            let finite = b.logits.iter().all(|v| v.is_finite());
+            let argmax: Vec<i64> = (0..c.block_size)
+                .map(|t| {
+                    let row = &b.logits[t * c.n_vocab..(t + 1) * c.n_vocab];
+                    let mut bi = 0usize;
+                    let mut bv = f32::NEG_INFINITY;
+                    for (i, v) in row.iter().enumerate() {
+                        if *v > bv {
+                            bv = *v;
+                            bi = i;
+                        }
+                    }
+                    bi as i64
+                })
+                .collect();
+            println!(
+                "draft block in {:.2}s: logits finite {finite}, conf {:?}, argmax {:?}",
+                t0.elapsed().as_secs_f32(),
+                b.conf.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+                argmax
+            );
+            if !finite {
+                exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("draft_block: {e}");
             exit(1);
         }
     }

@@ -20,6 +20,7 @@
 
 use crate::gguf::{half_to_f32, GGUF, TensorInfo, TYPE_BF16, TYPE_F32, TYPE_PQ2_0, TYPE_Q4_1};
 use crate::kernels;
+use crate::rope::rope_neox;
 
 /// Sidecar metadata resolved into the numbers the graph needs.
 #[derive(Debug, Clone)]
@@ -216,6 +217,130 @@ pub fn matvec_scalar(
     Ok(())
 }
 
+/// Dot one quantized row with `x` (length ne0).
+fn row_dot(ty: u32, raw: &[u8], ne0: usize, x: &[f32]) -> f32 {
+    match ty {
+        TYPE_F32 => {
+            let mut acc = 0.0f32;
+            for (i, xv) in x.iter().enumerate().take(ne0) {
+                let b = &raw[i * 4..i * 4 + 4];
+                acc += xv * f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+            acc
+        }
+        TYPE_BF16 => {
+            let mut acc = 0.0f32;
+            for (i, xv) in x.iter().enumerate().take(ne0) {
+                let b = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                acc += xv * bf16_to_f32(b);
+            }
+            acc
+        }
+        TYPE_Q4_1 => {
+            let mut acc = 0.0f32;
+            let nblk = ne0.div_ceil(Q4_1_QK);
+            for blk in 0..nblk {
+                let chunk = &raw[blk * Q4_1_BLOCK..(blk + 1) * Q4_1_BLOCK];
+                let d = half_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+                let m = half_to_f32(u16::from_le_bytes([chunk[2], chunk[3]]));
+                let qs = &chunk[4..4 + 16];
+                let base = blk * Q4_1_QK;
+                for j in 0..16 {
+                    if base + j < ne0 {
+                        acc += x[base + j] * (d * (qs[j] & 0x0f) as f32 + m);
+                    }
+                    if base + j + 16 < ne0 {
+                        acc += x[base + j + 16] * (d * (qs[j] >> 4) as f32 + m);
+                    }
+                }
+            }
+            acc
+        }
+        TYPE_PQ2_0 => {
+            let mut acc = 0.0f32;
+            let nblk = ne0.div_ceil(128);
+            for blk in 0..nblk {
+                let base = blk * 34;
+                let scale = half_to_f32(u16::from_le_bytes([raw[base], raw[base + 1]]));
+                let qs = &raw[base + 2..base + 34];
+                let off = blk * 128;
+                let mut bs = 0.0f32;
+                for j in 0..128 {
+                    let idx = off + j;
+                    if idx >= ne0 {
+                        break;
+                    }
+                    let code = (qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+                    bs += x[idx] * (code as i32 - 1) as f32;
+                }
+                acc += bs * scale;
+            }
+            acc
+        }
+        _ => 0.0,
+    }
+}
+
+/// Threaded `y[..n_rows] = W[base_row..base_row+n_rows] @ x`, matching the
+/// row-chunking strategy of `kernels::pq2_matvec_range`. PQ2_0 tensors are
+/// delegated to the AVX2 production kernel.
+pub fn matvec_par(
+    ty: u32,
+    payload: &[u8],
+    ne0: usize,
+    base_row: u64,
+    n_rows: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), String> {
+    if ty == TYPE_PQ2_0 {
+        return kernels::pq2_matvec_range(payload, ne0, base_row, n_rows, x, y);
+    }
+    if !type_supported(ty) {
+        return Err(format!("dspark matvec: unsupported tensor type {ty}"));
+    }
+    if x.len() != ne0 {
+        return Err(format!("dspark matvec: x len {} != ne0 {ne0}", x.len()));
+    }
+    let rb = row_bytes(ty, ne0);
+    let base = base_row as usize;
+    if payload.len() < (base + n_rows) * rb {
+        return Err("dspark matvec: payload too small".into());
+    }
+    let out = &mut y[..n_rows];
+    const MIN_PARALLEL: usize = 512;
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_cores = kernels::scaled_threads(avail);
+    if n_rows < MIN_PARALLEL || n_cores <= 1 {
+        for (r, o) in out.iter_mut().enumerate() {
+            *o = row_dot(ty, &payload[(base + r) * rb..(base + r + 1) * rb], ne0, x);
+        }
+        return Ok(());
+    }
+    let n_workers = n_cores.min(n_rows);
+    let chunk = n_rows.div_ceil(n_workers);
+    let ranges: Vec<std::ops::Range<usize>> = (0..n_workers)
+        .map(|w| {
+            let s = w * chunk;
+            s..(s + chunk).min(n_rows)
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        let mut rest = out;
+        for range in ranges {
+            let (head, tail) = rest.split_at_mut(range.len());
+            rest = tail;
+            scope.spawn(move || {
+                for (k, o) in head.iter_mut().enumerate() {
+                    let r = base + range.start + k;
+                    *o = row_dot(ty, &payload[r * rb..(r + 1) * rb], ne0, x);
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Draft weight context
 // ---------------------------------------------------------------------------
@@ -299,6 +424,405 @@ impl Dspark {
         }
         Ok(out)
     }
+
+    /// One tensor row (ne0 values) as f32.
+    pub fn row_f32(&self, name: &str, row: u64) -> Result<Vec<f32>, String> {
+        let t = self.tensor(name)?;
+        if !type_supported(t.ty) {
+            return Err(format!("dspark {name}: unsupported type {}", t.ty));
+        }
+        let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+        let rb = row_bytes(t.ty, ne0);
+        let payload = self.gguf.payload_slice(t)?;
+        let start = row as usize * rb;
+        if start + rb > payload.len() {
+            return Err(format!("dspark {name}: row {row} out of range"));
+        }
+        let mut out = vec![0.0f32; ne0];
+        dequant_row(t.ty, &payload[start..start + rb], ne0, &mut out);
+        Ok(out)
+    }
+
+    /// `y = W[base..base+n_rows] @ x` for a named tensor.
+    pub fn matvec_range(
+        &self,
+        name: &str,
+        base_row: u64,
+        n_rows: usize,
+        x: &[f32],
+        y: &mut [f32],
+    ) -> Result<(), String> {
+        let t = self.tensor(name)?;
+        let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+        let payload = self.gguf.payload_slice(t)?;
+        matvec_par(t.ty, payload, ne0, base_row, n_rows, x, y)
+    }
+
+    /// `y = W @ x` for a named tensor, allocating the output.
+    pub fn matvec2(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
+        let t = self.tensor(name)?;
+        let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+        let rows = (t.n_elem() as usize) / ne0.max(1);
+        let mut y = vec![0.0f32; rows];
+        self.matvec_range(name, 0, rows, x, &mut y)?;
+        Ok(y)
+    }
+
+    /// Project committed target features into the draft KV cache.
+    /// `inp_g` is `[n_tok, n_embd]` from `encode`, `positions[i]` the absolute
+    /// position of token `i`. Mirrors the reference's "embd batch" decoder pass.
+    pub fn inject(
+        &self,
+        cache: &mut DraftCache,
+        inp_g: &[f32],
+        positions: &[usize],
+    ) -> Result<(), String> {
+        let c = &self.cfg;
+        let n_tok = positions.len();
+        let n_kv_dim = c.n_head_kv * c.head_dim;
+        if inp_g.len() != n_tok * c.n_embd {
+            return Err("dspark inject: inp_g width mismatch".into());
+        }
+        for il in 0..c.n_layer {
+            let wk = format!("blk.{il}.attn_k.weight");
+            let wv = format!("blk.{il}.attn_v.weight");
+            let kn = format!("blk.{il}.attn_k_norm.weight");
+            let knorm = self.read_f32(&kn)?;
+            for (t, &pos) in positions.iter().enumerate() {
+                if pos >= cache.n_ctx {
+                    return Err(format!("dspark inject: pos {pos} >= ctx {}", cache.n_ctx));
+                }
+                let x = &inp_g[t * c.n_embd..(t + 1) * c.n_embd];
+                let mut k = vec![0.0f32; n_kv_dim];
+                let mut v = vec![0.0f32; n_kv_dim];
+                self.matvec_range(&wk, 0, n_kv_dim, x, &mut k)?;
+                self.matvec_range(&wv, 0, n_kv_dim, x, &mut v)?;
+                for h in 0..c.n_head_kv {
+                    let head = &mut k[h * c.head_dim..(h + 1) * c.head_dim];
+                    let n = kernels::rms_norm(head, &knorm, c.eps);
+                    head.copy_from_slice(&n);
+                    rope_neox(head, pos as f32, c.head_dim, c.rope_freq_base);
+                }
+                let dst = pos * n_kv_dim;
+                cache.k[il][dst..dst + n_kv_dim].copy_from_slice(&k);
+                cache.v[il][dst..dst + n_kv_dim].copy_from_slice(&v);
+            }
+        }
+        let end = positions.iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        cache.filled = cache.filled.max(end);
+        Ok(())
+    }
+
+    /// Log-SNR embedding for a block of `n_tok` tokens (anchor at offset 0 gets
+    /// `max_log_snr`, the rest `min_log_snr`), `[n_tok, n_embd]`.
+    pub fn logsnr_embed(&self, n_tok: usize) -> Result<Vec<f32>, String> {
+        let c = &self.cfg;
+        let (min_snr, max_snr) = c.log_snr.ok_or("dspark: log-SNR conditioning disabled")?;
+        let n_freq = 128usize;
+        let half = n_freq / 2;
+        let fc1 = self.read_f32("dspark.log_snr_fc1.weight")?; // [128, n_embd]
+        let b1 = self.read_f32("dspark.log_snr_fc1.bias")?;
+        let fc2 = self.read_f32("dspark.log_snr_fc2.weight")?; // [n_embd, n_embd]
+        let b2 = self.read_f32("dspark.log_snr_fc2.bias")?;
+        let ne = c.n_embd;
+        let mut out = vec![0.0f32; n_tok * ne];
+        for pos in 0..n_tok {
+            let log_snr = if pos % c.block_size == 0 { max_snr } else { min_snr };
+            let tt = (log_snr - min_snr) / (max_snr - min_snr) * 1000.0;
+            let mut feat = vec![0.0f32; n_freq];
+            for i in 0..half {
+                let freq = (-(10000.0f32).ln() * i as f32 / half as f32).exp();
+                let angle = tt * freq;
+                feat[i] = angle.sin();
+                feat[half + i] = angle.cos();
+            }
+            // fc1: [n_embd, n_freq] @ feat
+            let mut h = vec![0.0f32; ne];
+            for r in 0..ne {
+                let row = &fc1[r * n_freq..(r + 1) * n_freq];
+                let mut acc = 0.0f32;
+                for (a, b) in feat.iter().zip(row.iter()) {
+                    acc += a * b;
+                }
+                h[r] = kernels::silu(acc + b1[r]);
+            }
+            let mut e = vec![0.0f32; ne];
+            for r in 0..ne {
+                let row = &fc2[r * ne..(r + 1) * ne];
+                let mut acc = 0.0f32;
+                for (a, b) in h.iter().zip(row.iter()) {
+                    acc += a * b;
+                }
+                e[r] = acc + b2[r];
+            }
+            out[pos * ne..(pos + 1) * ne].copy_from_slice(&e);
+        }
+        Ok(out)
+    }
+
+    /// Draft one noise block: `[id_last, MASK x (block_size-1)]` at positions
+    /// `n_past..n_past+block_size`. Returns the markov-biased logits per block
+    /// position (`[block_size * n_vocab]`), the confidence per position, and the
+    /// normalized hidden states (`[block_size * n_embd]`, the confidence input).
+    pub fn draft_block(
+        &self,
+        cache: &mut DraftCache,
+        id_last: u32,
+        n_past: usize,
+    ) -> Result<DraftBlock, String> {
+        let c = &self.cfg;
+        let n_tok = c.block_size;
+        let ne = c.n_embd;
+        let hd = c.head_dim;
+        let n_kv_dim = c.n_head_kv * hd;
+        let group = c.n_head / c.n_head_kv;
+
+        // --- embeddings ---------------------------------------------------
+        let mut x = vec![0.0f32; n_tok * ne];
+        for t in 0..n_tok {
+            let tok = if t == 0 { id_last } else { c.mask_token_id };
+            let e = self.row_f32("token_embd.weight", tok as u64)?;
+            x[t * ne..(t + 1) * ne].copy_from_slice(&e);
+        }
+        if c.log_snr.is_some() {
+            let snr = self.logsnr_embed(n_tok)?;
+            for i in 0..n_tok * ne {
+                x[i] += snr[i];
+            }
+        }
+
+        let positions: Vec<usize> = (0..n_tok).map(|t| n_past + t).collect();
+        let max_pos = n_past + n_tok;
+        if max_pos > cache.n_ctx {
+            return Err(format!("dspark: block end {max_pos} > ctx {}", cache.n_ctx));
+        }
+
+        for il in 0..c.n_layer {
+            let an = self.read_f32(&format!("blk.{il}.attn_norm.weight"))?;
+            let qn = self.read_f32(&format!("blk.{il}.attn_q_norm.weight"))?;
+            let kn = self.read_f32(&format!("blk.{il}.attn_k_norm.weight"))?;
+            let fnorm = self.read_f32(&format!("blk.{il}.ffn_norm.weight"))?;
+
+            // q/k/v projections + norms + rope, appended to the cache
+            let mut q = vec![0.0f32; n_tok * c.n_head * hd];
+            let mut kk = vec![0.0f32; n_tok * n_kv_dim];
+            let mut vv = vec![0.0f32; n_tok * n_kv_dim];
+            for t in 0..n_tok {
+                let xt = kernels::rms_norm(&x[t * ne..(t + 1) * ne], &an, c.eps);
+                self.matvec_range(
+                    &format!("blk.{il}.attn_q.weight"),
+                    0,
+                    c.n_head * hd,
+                    &xt,
+                    &mut q[t * c.n_head * hd..(t + 1) * c.n_head * hd],
+                )?;
+                self.matvec_range(
+                    &format!("blk.{il}.attn_k.weight"),
+                    0,
+                    n_kv_dim,
+                    &xt,
+                    &mut kk[t * n_kv_dim..(t + 1) * n_kv_dim],
+                )?;
+                self.matvec_range(
+                    &format!("blk.{il}.attn_v.weight"),
+                    0,
+                    n_kv_dim,
+                    &xt,
+                    &mut vv[t * n_kv_dim..(t + 1) * n_kv_dim],
+                )?;
+                for h in 0..c.n_head {
+                    let head = &mut q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
+                    let n = kernels::rms_norm(head, &qn, c.eps);
+                    head.copy_from_slice(&n);
+                    rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
+                }
+                for h in 0..c.n_head_kv {
+                    let base = t * n_kv_dim + h * hd;
+                    let head = &mut kk[base..base + hd];
+                    let n = kernels::rms_norm(head, &kn, c.eps);
+                    head.copy_from_slice(&n);
+                    rope_neox(head, positions[t] as f32, hd, c.rope_freq_base);
+                }
+                let dst = positions[t] * n_kv_dim;
+                cache.k[il][dst..dst + n_kv_dim].copy_from_slice(&kk[t * n_kv_dim..(t + 1) * n_kv_dim]);
+                cache.v[il][dst..dst + n_kv_dim].copy_from_slice(&vv[t * n_kv_dim..(t + 1) * n_kv_dim]);
+            }
+            cache.filled = cache.filled.max(max_pos);
+
+            // non-causal attention over every filled position
+            let kcache = &cache.k[il];
+            let vcache = &cache.v[il];
+            let n_ctx_pos = cache.filled;
+            let scale = 1.0f32 / (hd as f32).sqrt();
+            let mut attn = vec![0.0f32; n_tok * c.n_head * hd];
+            let mut scores = vec![0.0f32; n_ctx_pos];
+            for t in 0..n_tok {
+                for h in 0..c.n_head {
+                    let hkv = h / group;
+                    let qh = &q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
+                    let mut maxs = f32::NEG_INFINITY;
+                    for p in 0..n_ctx_pos {
+                        let kb = p * n_kv_dim + hkv * hd;
+                        let mut dot = 0.0f32;
+                        for d in 0..hd {
+                            dot += qh[d] * kcache[kb + d];
+                        }
+                        let s = dot * scale;
+                        scores[p] = s;
+                        if s > maxs {
+                            maxs = s;
+                        }
+                    }
+                    let mut sum = 0.0f32;
+                    for s in scores.iter_mut().take(n_ctx_pos) {
+                        let e = (*s - maxs).exp();
+                        *s = e;
+                        sum += e;
+                    }
+                    let out =
+                        &mut attn[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
+                    for d in 0..hd {
+                        let mut acc = 0.0f32;
+                        for p in 0..n_ctx_pos {
+                            acc += scores[p] * vcache[p * n_kv_dim + hkv * hd + d];
+                        }
+                        out[d] = acc / sum;
+                    }
+                }
+            }
+
+            // output projection + residual, then FFN + residual
+            let mut y = vec![0.0f32; n_tok * ne];
+            for t in 0..n_tok {
+                let mut o = vec![0.0f32; ne];
+                self.matvec_range(
+                    &format!("blk.{il}.attn_output.weight"),
+                    0,
+                    ne,
+                    &attn[t * c.n_head * hd..(t + 1) * c.n_head * hd],
+                    &mut o,
+                )?;
+                for i in 0..ne {
+                    y[t * ne + i] = x[t * ne + i] + o[i];
+                }
+            }
+            for t in 0..n_tok {
+                let xt = kernels::rms_norm(&y[t * ne..(t + 1) * ne], &fnorm, c.eps);
+                let gate = self.matvec2(&format!("blk.{il}.ffn_gate.weight"), &xt)?;
+                let up = self.matvec2(&format!("blk.{il}.ffn_up.weight"), &xt)?;
+                let h: Vec<f32> = gate
+                    .iter()
+                    .zip(up.iter())
+                    .map(|(g, u)| kernels::silu(*g) * *u)
+                    .collect();
+                let down = self.matvec2(&format!("blk.{il}.ffn_down.weight"), &h)?;
+                for i in 0..ne {
+                    x[t * ne + i] = y[t * ne + i] + down[i];
+                }
+            }
+        }
+
+        // --- final norm + LM head ----------------------------------------
+        let on = self.read_f32("output_norm.weight")?;
+        let mut emb = vec![0.0f32; n_tok * ne];
+        let mut base = vec![0.0f32; n_tok * c.n_vocab];
+        for t in 0..n_tok {
+            emb[t * ne..(t + 1) * ne]
+                .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &on, c.eps));
+            self.matvec_range(
+                "output.weight",
+                0,
+                c.n_vocab,
+                &emb[t * ne..(t + 1) * ne],
+                &mut base[t * c.n_vocab..(t + 1) * c.n_vocab],
+            )?;
+        }
+
+        // --- markov + confidence heads -----------------------------------
+        let mw1 = self.tensor("dspark.markov_head_a.weight")?;
+        let mw1_ne0 = mw1.dims.first().copied().unwrap_or(0) as usize;
+        let mw1_rb = row_bytes(mw1.ty, mw1_ne0);
+        let mw1_payload = self.gguf.payload_slice(mw1)?;
+        let conf = self.read_f32("dspark.confidence_head.weight")?;
+        let conf_b = self.read_f32("dspark.confidence_head.bias")?;
+
+        let mut logits = vec![0.0f32; n_tok * c.n_vocab];
+        let mut conf_out = vec![0.0f32; n_tok];
+        let mut prev = id_last as u64;
+        for t in 0..n_tok {
+            // markov_w1 row `prev` -> [rank]
+            let start = prev as usize * mw1_rb;
+            let mut w1_prev = vec![0.0f32; mw1_ne0];
+            dequant_row(mw1.ty, &mw1_payload[start..start + mw1_rb], mw1_ne0, &mut w1_prev);
+            let mut bias = vec![0.0f32; c.n_vocab];
+            self.matvec_range("dspark.markov_head_b.weight", 0, c.n_vocab, &w1_prev, &mut bias)?;
+            let col = &mut logits[t * c.n_vocab..(t + 1) * c.n_vocab];
+            for i in 0..c.n_vocab {
+                col[i] = base[t * c.n_vocab + i] + bias[i];
+            }
+            // confidence: sigmoid(conf_proj . [emb ; w1_prev] + b)
+            let mut feat = vec![0.0f32; ne + mw1_ne0];
+            feat[..ne].copy_from_slice(&emb[t * ne..(t + 1) * ne]);
+            feat[ne..].copy_from_slice(&w1_prev);
+            let mut acc = conf_b[0];
+            for (a, b) in feat.iter().zip(conf.iter()) {
+                acc += a * b;
+            }
+            conf_out[t] = kernels::sigmoid(acc);
+            // next position is conditioned on this position's argmax
+            let mut best = 0usize;
+            let mut bv = f32::NEG_INFINITY;
+            for i in 0..c.n_vocab {
+                if col[i] > bv {
+                    bv = col[i];
+                    best = i;
+                }
+            }
+            prev = best as u64;
+        }
+
+        Ok(DraftBlock {
+            logits,
+            conf: conf_out,
+            emb,
+        })
+    }
+}
+
+/// Per-layer draft K/V caches plus the number of filled positions.
+pub struct DraftCache {
+    pub n_ctx: usize,
+    pub k: Vec<Vec<f32>>,
+    pub v: Vec<Vec<f32>>,
+    pub filled: usize,
+}
+
+impl DraftCache {
+    pub fn new(cfg: &DsparkCfg, n_ctx: usize) -> DraftCache {
+        let n_kv_dim = cfg.n_head_kv * cfg.head_dim;
+        let len = n_ctx * n_kv_dim;
+        DraftCache {
+            n_ctx,
+            k: (0..cfg.n_layer).map(|_| vec![0.0f32; len]).collect(),
+            v: (0..cfg.n_layer).map(|_| vec![0.0f32; len]).collect(),
+            filled: 0,
+        }
+    }
+
+    /// Drop every position `>= len` (rejected draft tail).
+    pub fn truncate(&mut self, len: usize) {
+        self.filled = self.filled.min(len);
+    }
+}
+
+/// Output of one draft block.
+pub struct DraftBlock {
+    /// markov-biased logits, `[block_size * n_vocab]`
+    pub logits: Vec<f32>,
+    /// confidence per block position
+    pub conf: Vec<f32>,
+    /// normalized hidden states `[block_size * n_embd]` (confidence input)
+    pub emb: Vec<f32>,
 }
 
 #[cfg(test)]

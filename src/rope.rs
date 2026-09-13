@@ -68,3 +68,48 @@ pub fn rope_imrope(
         head[j + half] = x0 * sin + x1 * cos;
     }
 }
+
+/// Plain NEOX RoPE (single position id), used by the dspark drafter's attention
+/// (`rope_type = NEOX` for a DFlash backbone without DSV4 hyper-connections).
+///
+/// Rotates the first `n_dims` components of one head vector in place, pairing
+/// `(j, j + n_dims/2)` with `theta_j = pos * freq_base^(-2j/n_dims)`.
+pub fn rope_neox(head: &mut [f32], pos: f32, n_dims: usize, freq_base: f32) {
+    debug_assert!(n_dims <= head.len() && n_dims % 2 == 0);
+    let half = n_dims / 2;
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f32);
+    let mut theta = pos;
+    for j in 0..half {
+        let (sin, cos) = theta.sin_cos();
+        let x0 = head[j];
+        let x1 = head[j + half];
+        head[j] = x0 * cos - x1 * sin;
+        head[j + half] = x0 * sin + x1 * cos;
+        theta *= theta_scale;
+    }
+}
+
+#[cfg(test)]
+mod neox_tests {
+    use super::rope_neox;
+
+    #[test]
+    fn neox_pos0_is_identity() {
+        let mut h = vec![1.0, 2.0, 3.0, 4.0];
+        let orig = h.clone();
+        rope_neox(&mut h, 0.0, 4, 10000.0);
+        for (a, b) in h.iter().zip(orig.iter()) {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn neox_preserves_pair_norm() {
+        let mut h = vec![0.7, -0.3, 1.1, 0.2];
+        let n0 = h[0] * h[0] + h[2] * h[2];
+        let n1 = h[1] * h[1] + h[3] * h[3];
+        rope_neox(&mut h, 3.5, 4, 10000.0);
+        assert!((h[0] * h[0] + h[2] * h[2] - n0).abs() < 1e-5);
+        assert!((h[1] * h[1] + h[3] * h[3] - n1).abs() < 1e-5);
+    }
+}
