@@ -4,11 +4,12 @@
 //!   bonsai-gguf inspect <file>
 //!   bonsai-gguf probe  <file> <tensor-name> [count] [start]
 //!   bonsai-gguf retag  <legacy-in.gguf> <out.gguf>
+//!   bonsai-gguf dspark-convert <sidecar-in.gguf> <out.gguf>
 
 #[path = "../gguf.rs"]
 mod gguf;
 
-use gguf::{retag_legacy_ternary, GGUF, Value};
+use gguf::{convert_dspark_sidecar, retag_legacy_ternary, GGUF, Value};
 use std::process::exit;
 
 fn type_name(t: u32) -> &'static str {
@@ -63,6 +64,22 @@ fn main() {
             }
             retag(&args[1], &args[2]);
         }
+        "dspark-convert" => {
+            if args.len() != 3 {
+                usage();
+                exit(1);
+            }
+            match convert_dspark_sidecar(&args[1], &args[2]) {
+                Ok((n_kv, n_ty)) => println!(
+                    "converted {}: {n_kv} metadata keys -> dflash naming, {n_ty} tensors renamed",
+                    args[1]
+                ),
+                Err(e) => {
+                    eprintln!("dspark-convert error: {e}");
+                    exit(1);
+                }
+            }
+        }
         _ => {
             usage();
             exit(1);
@@ -72,7 +89,7 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage:\n  bonsai-gguf inspect <file>\n  bonsai-gguf probe <file> <tensor-name> [count]\n  bonsai-gguf retag <legacy-in.gguf> <out.gguf>"
+        "usage:\n  bonsai-gguf inspect <file>\n  bonsai-gguf probe <file> <tensor-name> [count]\n  bonsai-gguf retag <legacy-in.gguf> <out.gguf>\n  bonsai-gguf dspark-convert <sidecar-in.gguf> <out.gguf>"
     );
 }
 

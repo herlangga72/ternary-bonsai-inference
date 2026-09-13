@@ -15,6 +15,7 @@ use memmap2::Mmap;
 pub const TYPE_F32: u32 = 0;
 pub const TYPE_F16: u32 = 1;
 pub const TYPE_Q4_1: u32 = 3;
+pub const TYPE_BF16: u32 = 30;
 pub const TYPE_TQ1_0: u32 = 34;
 pub const TYPE_Q2_0_LEGACY: u32 = 42; // legacy Prism group-128 under old id
 pub const TYPE_PQ2_0: u32 = 142; // Prism group-128 ternary, current id
@@ -162,6 +163,7 @@ impl GGUF {
         let (blk, type_size) = match info.ty {
             TYPE_F32 => (1u64, 4u64),
             TYPE_F16 => (1u64, 2u64),
+            TYPE_BF16 => (1u64, 2u64),
             TYPE_Q4_1 => (32u64, 20u64),   // 2x fp16 + 16 nibbles
             TYPE_PQ2_0 => (128u64, 34u64),  // fp16 + 32 bytes of 2-bit codes
             TYPE_TQ1_0 => (256u64, 54u64),  // fp16 + trit packing
@@ -327,6 +329,232 @@ impl GGUF {
 /// Round up to the GGUF alignment (32 bytes).
 pub fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) / a * a
+}
+
+// ---------------------------------------------------------------------------
+// dspark sidecar -> dflash naming (for the PrismML fork reference)
+// ---------------------------------------------------------------------------
+
+/// Map a sidecar metadata key to the name the PrismML fork expects.
+/// `None` drops the key (it is either renamed under a different key or derived
+/// by the loader from tensor shapes).
+fn dflash_kv_key(key: &str) -> Option<String> {
+    // dspark-specific keys are namespaced `dspark.dspark.<name>`
+    if let Some(rest) = key.strip_prefix("dspark.dspark.") {
+        return match rest {
+            "block_size" => Some("dflash.block_size".into()),
+            "target_layers" => Some("dflash.target_layers".into()),
+            "mask_token_id" => Some("tokenizer.ggml.mask_token_id".into()),
+            "confidence_head" => Some("dflash.confidence_head".into()),
+            "log_snr_conditioning" => Some("dflash.log_snr_conditioning".into()),
+            "min_log_snr" => Some("dflash.min_log_snr".into()),
+            "max_log_snr" => Some("dflash.max_log_snr".into()),
+            // derived from markov_w1's shape / implied by confidence_head
+            "markov_rank" | "confidence_head_with_markov" => None,
+            _ => Some(format!("dflash.{rest}")),
+        };
+    }
+    // standard arch keys: dspark.<name> -> dflash.<name>
+    if let Some(rest) = key.strip_prefix("dspark.") {
+        return Some(format!("dflash.{rest}"));
+    }
+    Some(key.to_string())
+}
+
+/// Map a sidecar tensor name to the fork's `dflash` tensor name.
+fn dflash_tensor_name(name: &str) -> String {
+    match name {
+        "dspark.markov_head_a.weight" => "markov_w1.weight".into(),
+        "dspark.markov_head_b.weight" => "markov_w2.weight".into(),
+        "dspark.confidence_head.weight" => "conf_proj.weight".into(),
+        "dspark.confidence_head.bias" => "conf_proj.bias".into(),
+        "dspark.hidden_norm.weight" => "enc.output_norm.weight".into(),
+        "dspark.fc.weight" => "fc.weight".into(),
+        _ => match name.strip_prefix("dspark.log_snr_") {
+            Some(rest) => format!("log_snr_{rest}"),
+            None => name.to_string(),
+        },
+    }
+}
+
+fn gguf_value_type(v: &Value) -> u32 {
+    match v {
+        Value::U8(_) => 0,
+        Value::I8(_) => 1,
+        Value::U16(_) => 2,
+        Value::I16(_) => 3,
+        Value::U32(_) => 4,
+        Value::I32(_) => 5,
+        Value::F32(_) => 6,
+        Value::Bool(_) => 7,
+        Value::Str(_) => 8,
+        Value::Array { .. } => 9,
+        Value::U64(_) => 10,
+        Value::I64(_) => 11,
+        Value::F64(_) => 12,
+    }
+}
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn put_value(out: &mut Vec<u8>, v: &Value) {
+    match v {
+        Value::U8(x) => out.push(*x),
+        Value::I8(x) => out.push(*x as u8),
+        Value::U16(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I16(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::U32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::F32(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::Bool(x) => out.push(*x as u8),
+        Value::Str(s) => put_str(out, s),
+        Value::U64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::I64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::F64(x) => out.extend_from_slice(&x.to_le_bytes()),
+        Value::Array { elem_type, items } => {
+            out.extend_from_slice(&elem_type.to_le_bytes());
+            out.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            for it in items {
+                put_value(out, it);
+            }
+        }
+    }
+}
+
+/// Rewrite a dspark speculator sidecar into the PrismML fork's `dflash` naming
+/// (architecture string, metadata keys, tensor names). Tensor payload bytes are
+/// copied verbatim; only the header is rebuilt, so data offsets are recomputed
+/// for the new header size. Returns `(kv_rewritten, tensors_renamed)`.
+pub fn convert_dspark_sidecar(src: &str, dst: &str) -> Result<(usize, usize), String> {
+    let g = GGUF::open(src)?;
+    if let Some(Value::Str(a)) = g.get("general.architecture") {
+        if a != "dspark" {
+            return Err(format!("{src}: expected dspark architecture, found '{a}'"));
+        }
+    } else {
+        return Err(format!("{src}: missing general.architecture"));
+    }
+
+    // --- metadata section -------------------------------------------------
+    let mut header = Vec::with_capacity(1 << 20);
+    header.extend_from_slice(b"GGUF");
+    header.extend_from_slice(&g.version.to_le_bytes());
+    header.extend_from_slice(&(g.tensors.len() as u64).to_le_bytes());
+
+    // deterministic key order; `general.architecture` value is rewritten
+    let mut keys: Vec<&String> = g.meta.keys().collect();
+    keys.sort();
+
+    let mut kv_out: Vec<(String, u32, Value)> = Vec::with_capacity(keys.len());
+    for k in keys {
+        let Some(new_key) = dflash_kv_key(k) else {
+            continue;
+        };
+        let mut v = g.meta[k].clone();
+        if k == "general.architecture" {
+            v = Value::Str("dflash".into());
+        }
+        kv_out.push((new_key, gguf_value_type(&v), v));
+    }
+
+    header.extend_from_slice(&(kv_out.len() as u64).to_le_bytes());
+    let mut n_kv = 0usize;
+    for (key, ty, val) in &kv_out {
+        put_str(&mut header, key);
+        header.extend_from_slice(&ty.to_le_bytes());
+        put_value(&mut header, val);
+        n_kv += 1;
+    }
+
+    // --- tensor infos -----------------------------------------------------
+    // llama.cpp's reader requires the tensor index to be in data order with
+    // each offset equal to the padded running sum of the previous tensor sizes
+    // (`gguf_init_from_reader`). The sidecar's index is not in data order, so
+    // re-sort by the original data offset and lay the payload out contiguously.
+    let meta_end = header.len() as u64;
+    let old_data_start = g.data_start;
+
+    struct NewTensor {
+        name: String,
+        dims: Vec<u64>,
+        ty: u32,
+        old_abs: u64,
+        nbytes: u64,
+        new_off: u64,
+        renamed: bool,
+    }
+
+    let mut order: Vec<usize> = (0..g.tensors.len()).collect();
+    order.sort_by_key(|&i| g.tensors[i].offset);
+
+    let mut items: Vec<NewTensor> = Vec::with_capacity(g.tensors.len());
+    let mut cursor = 0u64;
+    for &i in &order {
+        let t = &g.tensors[i];
+        let nbytes = g.tensor_nbytes(t);
+        let name = dflash_tensor_name(&t.name);
+        items.push(NewTensor {
+            renamed: name != t.name,
+            name,
+            dims: t.dims.clone(),
+            ty: t.ty,
+            old_abs: old_data_start + t.offset,
+            nbytes,
+            new_off: cursor,
+        });
+        cursor += align_up(nbytes, 32);
+    }
+    let data_size = cursor;
+
+    let mut info_len = 0u64;
+    for it in &items {
+        info_len += 8 + it.name.len() as u64 + 4 + 8 * it.dims.len() as u64 + 4 + 8;
+    }
+    let new_data_start = align_up(meta_end + info_len, 32);
+
+    let mut n_ty = 0usize;
+    for it in &items {
+        if it.renamed {
+            n_ty += 1;
+        }
+        put_str(&mut header, &it.name);
+        header.extend_from_slice(&(it.dims.len() as u32).to_le_bytes());
+        for d in &it.dims {
+            header.extend_from_slice(&d.to_le_bytes());
+        }
+        header.extend_from_slice(&it.ty.to_le_bytes());
+        header.extend_from_slice(&it.new_off.to_le_bytes());
+    }
+
+    if (header.len() as u64) > new_data_start {
+        return Err("internal: header exceeded computed data start".into());
+    }
+    header.resize(new_data_start as usize, 0);
+
+    // --- write the header, then each tensor payload at its new offset -----
+    use std::io::Write;
+    let mut out = File::create(dst).map_err(|e| format!("create {dst}: {e}"))?;
+    out.write_all(&header).map_err(|e| e.to_string())?;
+    for it in &items {
+        let begin = it.old_abs as usize;
+        let end = begin + it.nbytes as usize;
+        if end > g.map.len() {
+            return Err(format!(
+                "{src}: tensor '{}' data {}..{} past end of file {}",
+                it.name, begin, end, g.map.len()
+            ));
+        }
+        out.seek(SeekFrom::Start(new_data_start + it.new_off))
+            .map_err(|e| e.to_string())?;
+        out.write_all(&g.map[begin..end]).map_err(|e| e.to_string())?;
+    }
+    out.seek(SeekFrom::Start(new_data_start + data_size))
+        .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    Ok((n_kv, n_ty))
 }
 
 /// Header-only retag of legacy Prism group-128 ternary files: rewrite the ggml
