@@ -370,3 +370,46 @@ cost is flat on this CPU (compute-bound), so it cannot pay here, and it would
 touch the target path that every other bin depends on. Validate it by asserting
 batched logits equal N sequential `forward_hidden` calls. Do it first when the
 RX 7600 arrives.
+
+## Packed tighter, and why the compute is not starved (2026-09-13)
+
+### Sharing with the target
+
+The drafter's `token_embd.weight` is **byte-identical** to the target's (hashed
+both payloads; `output.weight` and `output_norm.weight` are not). So one of the
+two vocab-sized tensors was pure duplication. `bonsai-dspark repack <in> <out>
+[reference-target]` now drops any tensor identical to the reference's same-named
+tensor and records it in `dspark.shared_tensors`; `Dspark` resolves those from
+the target GGUF at load, and `Drafter::new` takes the target path.
+
+| sidecar | size |
+| --- | --- |
+| original Q4_1 | 1856 MiB |
+| + ternary repack | 924 MiB |
+| + ternary and shared token_embd | **602 MiB (32% of original)** |
+
+Logits, confidence and argmax are unchanged, and `bonsai-spec` is still
+IDENTICAL to plain greedy.
+
+### Compute is at the AVX2 ceiling, not starved
+
+The drafter was allocating a `Vec` per attention head (160 per layer) for its
+q/k RMSNorm and re-allocating all per-layer scratch every layer. Adding
+`kernels::rms_norm_inplace` and hoisting the scratch took the block to **0.36 s**
+with the machine quiet: layers 0.14 s, head 0.20 s, markov 0.02 s. That is
+26-33 GMAC/s in situ, matching (and for the big head exceeding) the kernel's
+standalone 18-30 GMAC/s, so the FMA units are fed.
+
+The remaining limit is the algorithm on this uarch: a 2-bit decode needs ~3
+loads per FMA (LUT gathers), which lands at ~2 MAC/cycle/core on Zen+ and is
+therefore ~28 GMAC/s over four cores - exactly what is measured. Moving past it
+needs VNNI/AVX-512 (not on Zen+) or a different inner loop, not a memory-layout
+change.
+
+### Remaining packing headroom
+
+The weights are at the PQ2_0 floor (2.125 bits/weight). A true ternary packing
+(log2(3) = 1.585 bits) would be ~25% smaller again but needs a custom format and
+kernel, and a base-3 decode would likely be slower. The draft KV cache (50 MiB
+f16) could go to int8 for another 25 MiB; both are marginal next to the 602 MiB
+of weights.
