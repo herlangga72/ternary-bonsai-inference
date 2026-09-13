@@ -1,38 +1,55 @@
 # Plan: RotorQuant-style KV cache quantization
 
-> ## Status (2026-09-13): R0-R3 done (CPU + GPU). R4/R5 pending.
+> ## Status (2026-09-13): R0-R4, R6 done. R5 closed as not worth it here.
 >
 > `src/kvquant.rs` implements the quantizer; `AttnCache`/`full_attention_layer`
-> use it on the CPU and `kv_store_q`/`attn_scores_q`/`attn_out_q` on the GPU.
-> Selected with `BONSAI_KV=f32|planarN|planarNk` (N = 1..8; `planarNk`
-> = K only, V f32). Default is `f32`, so nothing changes unless asked.
-> Batched prefill is not available with quantized KV (it writes f32 caches);
+> use it on the CPU and `kv_store_q`/`attn_scores_q`/`attn_out_q` (plus the f16
+> trio) on the GPU. Selected with `BONSAI_KV=f32|f16|planarN|planarNk`
+> (N = 1..8; `planarNk` = K only, V f32). Default is `f32`.
+> Batched prefill is not available with a non-f32 cache (it writes f32 caches);
 > `bonsai-grun` falls back to the token loop.
 >
-> **Measured logit rel diff vs the f32 baseline (4.03e-3 CPU / 4.41e-3 GPU),
-> greedy 8160 MATCH in every row:**
+> **Correctness (greedy 8160 MATCH in every row; f32 baseline 4.03e-3 CPU /
+> 4.41e-3 GPU):**
 >
-> | config | CPU | GPU |
+> | config | CPU rel | GPU rel |
 > | --- | --- | --- |
+> | f16 | 4.019e-3 | 4.397e-3 |
 > | planar3k | 3.13e-2 | 3.06e-2 |
 > | planar4k | 2.07e-2 | 2.07e-2 |
 > | planar8k | 1.07e-2 | 1.05e-2 |
 > | planar4 (symmetric) | 4.14e-2 | 4.43e-2 |
 >
-> CPU and GPU agree to within rounding at every width, and the quantizer is
-> textbook-exact (per-coordinate RMSE 18.58% of sigma at 3-bit, 9.25% at
-> 4-bit, against theory 18.58% / 9.75%). The error is monotone in bits, so it
-> is inherent quantization cost, not a bug.
+> **f16 is lossless within measurement** and gives 2x. The planar modes are
+> textbook-exact but 3-4 bit perturbs this model's logits 2-4% (5-10x baseline);
+> the error is monotone in bits, so it is inherent, not a bug.
 >
-> **Memory (ctx 2048, 16 full-attention layers):** f32 KV is 268 MB; 4-bit
-> K-only is 151 MB (1.8x, V dominates); 4-bit symmetric is ~35 MB (7.75x).
+> **Long context (R4), measured on this box (15 GB, host-visible buffers):**
 >
-> **Conclusion:** 3-4 bit KV perturbs this model's logits by 2-4% (5-10x the
-> f32 baseline). On a 20-token prompt greedy survives, but this is a real
-> quality cost and the 10.3x headline is not free. Defensible operating
-> points: f16 KV (not implemented), 8-bit K-only (~4x on K, 1.05e-2), or
-> 3-4 bit only when long context forces it. R4 should measure PPL/needle
-> before any of this becomes a default.
+> | ctx | f32 KV | f16 KV | planar4k | planar4 |
+> | --- | --- | --- | --- | --- |
+> | 16384 | 2147 MB (OOM) | 1074 MB (ok) | 1212 MB (ok) | 277 MB (ok) |
+> | 32768 | 4295 MB (OOM) | 2148 MB (OOM) | 2424 MB (OOM) | 554 MB (ok) |
+>
+> Only 4-bit symmetric makes 32K context fit here, and it was verified to
+> decode end-to-end at 32768 (golden MATCH, 1.38 s/token, coherent output).
+> `BONSAI_CTX` was clamped to 16384 and is now 262144, so long context is
+> reachable at all; the caches are still allocated for the full setting, so a
+> too-large value fails at allocation rather than silently.
+>
+> **What R4 could not measure here:** per-token time vs context depth, PPL, and
+> a needle test. At ~1.3 s/token a 4K-token prefill is ~1.5 hours, so depth
+> work is blocked on faster hardware (the RX 7600). Traffic arithmetic for
+> context: f32 KV reads are `n * 128 KB` per token against 7.14 GB of weights,
+> so KV is ~10% of traffic near 5.6K and ~29% at 16K; f16 halves and planar4
+> cuts that component ~7.8x.
+>
+> **R5 (deferred prefill quantization) closed:** it exists so a long prompt's
+> KV does not accumulate quantization error during prefill. It needs a second,
+> f16-sized scratch cache for the whole context, which is exactly the memory
+> the quantization was buying back (at 32K, 2.1 GB). Since f16 is already
+> lossless and the planar modes are opt-in, it is not worth that cost until
+> long-context quality can actually be measured.
 >
 
 

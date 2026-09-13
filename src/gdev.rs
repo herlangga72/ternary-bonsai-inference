@@ -40,7 +40,10 @@ fn n_ctx_env() -> usize {
     std::env::var("BONSAI_CTX")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 16 && n <= 16384)
+        // Upper bound is the model's 262144-token training context; the KV
+        // caches are allocated for the full value, so a too-large setting fails
+        // at allocation rather than silently.
+        .filter(|&n| n >= 16 && n <= 262_144)
         .unwrap_or(N_CTX_DEFAULT)
 }
 
