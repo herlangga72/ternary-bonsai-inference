@@ -70,19 +70,18 @@ void main() {
     barrier();
 
     if (bits == 3u) {
-        uint nlo = hd >> 2u;
-        if (lid < nlo) {
-            uint b = lid << 2u;
-            uint v = (idxs[b] & 3u) | ((idxs[b + 1u] & 3u) << 2u)
-                   | ((idxs[b + 2u] & 3u) << 4u) | ((idxs[b + 3u] & 3u) << 6u);
-            atomicOr(words[lid >> 2u], v << (8u * (lid & 3u)));
-        }
-        if (lid < (hd >> 3u)) {
+        // 8 coords -> 3 bytes (24-bit LE group); each lane owns one group.
+        uint ngroups = hd >> 3u;
+        if (lid < ngroups) {
             uint b = lid << 3u;
             uint v = 0u;
-            for (uint k = 0u; k < 8u; ++k) { v |= ((idxs[b + k] >> 2u) & 1u) << k; }
-            uint byte = nlo + lid;
-            atomicOr(words[byte >> 2u], v << (8u * (byte & 3u)));
+            for (uint k = 0u; k < 8u; ++k) { v |= (idxs[b + k] & 7u) << (3u * k); }
+            uint by = 3u * lid;
+            atomicOr(words[by >> 2u], (v & 0xffu) << (8u * (by & 3u)));
+            by++;
+            atomicOr(words[by >> 2u], ((v >> 8u) & 0xffu) << (8u * (by & 3u)));
+            by++;
+            atomicOr(words[by >> 2u], ((v >> 16u) & 0xffu) << (8u * (by & 3u)));
         }
     } else if (bits == 2u) {
         if (lid < (hd >> 2u)) {

@@ -115,23 +115,30 @@ remaining wins for **data moved through memory** are:
 Norm width (option 4) is a ~2% rounding error on top of these and is not worth
 its own format change unless it rides along with option 3.
 
-## 7. Implemented: grouped byte-aligned plane packing
+## 7. Implemented: grouped byte-aligned packing
 
-`kvquant::pack_planes` / `unpack_planes` and the three `*_q` shaders now use the
-upstream arrangement instead of the little-endian bitstream:
+`kvquant::pack_idx` / `unpack_idx` (and the three `*_q` shaders) pick the
+fastest byte-aligned layout per width, measured with `KVQ_BENCH=1` on the CPU
+unpack (2M iterations, n=256, three runs):
 
-| bits | planes |
-| --- | --- |
-| 2 | one 2-bit plane, 4 coords/byte |
-| 3 | 2-bit low plane (4 coords/byte) then 1-bit sign plane (8 coords/byte) |
-| 4 | one 4-bit plane, 2 coords/byte |
-| 5..8 | unchanged bitstream |
+| bits | layout | unpack vs bitstream |
+| --- | --- | --- |
+| 1 | 1-bit plane (8 coords/byte) | 1.53-1.58x faster |
+| 2 | 2-bit plane (4 coords/byte) | 1.15-1.35x faster |
+| 3 | **8 coords -> 3 bytes (24-bit LE group)** | **3.09-3.41x faster** |
+| 4 | 4-bit plane (2 coords/byte) | 1.08-1.10x faster |
+| 5..8 | little-endian bitstream | 1.0x (baseline) |
 
-The row size (`packed_len`) is unchanged, so strides and buffers do not move.
-The win is on the unpack side: no `off + bits > 8` straddle fix-up, and a
-coordinate's field is a single byte load plus a shift. 2-bit is a single clean
-plane. Verified byte-identical to the old bitstream packing (CPU planar3 qa rel
-4.6768e-2, the same as before), and CPU/GPU agree.
+The first attempt used the upstream `block_planar3_0` split (2-bit low plane
+then 1-bit sign plane) for 3-bit; that measured **0.75x** (slower), because it
+is two passes over the row. The 8-coords-into-3-bytes group is a single pass
+with one 24-bit load per group, so 3-bit now unpacks ~3x faster than the old
+bitstream. Row size (`packed_len`) is unchanged for every width, so strides and
+buffers do not move.
+
+This is a CPU-out-of-loop microbenchmark: at 2K context the KV read is ~0.3% of
+traffic, so it does not move decode wall-clock there; it matters at long context
+and it makes the dequant cheaper per element.
 
 ## 8. Measured: how low the bits can go
 
@@ -148,4 +155,5 @@ plane. Verified byte-identical to the old bitstream packing (CPU planar3 qa rel
 All symmetric planar modes exceed the harness's 1e-2 logit tolerance by design;
 the gate is the greedy id, which holds for every row. `planar2` is the smallest
 working mode (15x, 2-bit, one plane); `planar3` is the quality/size sweet spot.
+
 

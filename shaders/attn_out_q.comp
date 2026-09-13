@@ -31,12 +31,11 @@ void main() {
     uint mask = (1u << pc.bits) - 1u;
     uint row_words = pc.pwords + 1u;
     uint bits = pc.bits;
-    uint nlo = hd >> 2u;
-    // This lane owns coordinate `lid`; precompute its plane byte/shift.
-    uint b0 = 0u, s0 = 0u, b1 = 0u, s1 = 0u;
+    // This lane owns coordinate `lid`; precompute where its field lives.
+    uint b0 = 0u, s0 = 0u;
     if (bits == 3u) {
-        b0 = lid >> 2u; s0 = 2u * (lid & 3u);
-        b1 = nlo + (lid >> 3u); s1 = lid & 7u;
+        // 8 coords per 3-byte group; this lane's 3 bits start at bit 3*(lid%8).
+        b0 = 3u * (lid >> 3u); s0 = 3u * (lid & 7u);
     } else if (bits == 2u) {
         b0 = lid >> 2u; s0 = 2u * (lid & 3u);
     } else if (bits == 4u) {
@@ -60,9 +59,13 @@ void main() {
         uint base = (pos * pc.n_kv + kv) * row_words;
         uint v;
         if (bits == 3u) {
-            uint lo = (vc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + s0)) & 3u;
-            uint sg = (vc.data[base + (b1 >> 2u)] >> (8u * (b1 & 3u) + s1)) & 1u;
-            v = lo | (sg << 2u);
+            uint by = b0;
+            uint gv = (vc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu;
+            by++;
+            gv |= ((vc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu) << 8u;
+            by++;
+            gv |= ((vc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu) << 16u;
+            v = (gv >> s0) & 7u;
         } else if (bits == 2u) {
             v = (vc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + s0)) & 3u;
         } else if (bits == 4u) {

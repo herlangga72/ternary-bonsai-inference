@@ -45,18 +45,23 @@ void main() {
     uint mask = (1u << pc.bits) - 1u;
     uint row_words = pc.pwords + 1u;
     uint bits = pc.bits;
-    uint nlo = hd >> 2u; // 2-bit low-plane byte count (also sign-plane base)
 
     for (uint pos = lid; pos < pc.n_pos; pos += 256u) {
         uint base = (pos * pc.n_kv + kv) * row_words;
         float acc = 0.0;
         if (bits == 3u) {
-            for (uint i = 0u; i < hd; ++i) {
-                uint b0 = i >> 2u;
-                uint lo = (kc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + 2u * (i & 3u))) & 3u;
-                uint b1 = nlo + (i >> 3u);
-                uint sg = (kc.data[base + (b1 >> 2u)] >> (8u * (b1 & 3u) + (i & 7u))) & 1u;
-                acc += qr[i] * p.data[pc.cent_off + (lo | (sg << 2u))];
+            // 8 coords per 3-byte group: one 24-bit load then 8 extracts.
+            uint ngroups = hd >> 3u;
+            for (uint g = 0u; g < ngroups; ++g) {
+                uint by = 3u * g;
+                uint v = (kc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu;
+                by++;
+                v |= ((kc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu) << 8u;
+                by++;
+                v |= ((kc.data[base + (by >> 2u)] >> (8u * (by & 3u))) & 0xffu) << 16u;
+                for (uint k = 0u; k < 8u; ++k) {
+                    acc += qr[g * 8u + k] * p.data[pc.cent_off + ((v >> (3u * k)) & 7u)];
+                }
             }
         } else if (bits == 2u) {
             for (uint i = 0u; i < hd; ++i) {

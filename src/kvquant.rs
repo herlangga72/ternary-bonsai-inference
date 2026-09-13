@@ -185,17 +185,44 @@ pub fn packed_bytes(n: usize, bits: u32) -> usize {
     (n * bits as usize).div_ceil(8)
 }
 
+/// 3-bit "grouped" packing: 8 coordinates into 3 bytes (24 bits), so every
+/// group is byte-aligned and the extract is a 24-bit load plus shifts with no
+/// cross-group straddle. `n` must be a multiple of 8.
+pub fn pack_groups3(idx: &[u8], n: usize, out: &mut [u8]) {
+    let groups = n / 8;
+    for g in 0..groups {
+        let mut v = 0u32;
+        for k in 0..8 {
+            v |= (idx[g * 8 + k] as u32 & 0x7) << (3 * k);
+        }
+        out[3 * g] = v as u8;
+        out[3 * g + 1] = (v >> 8) as u8;
+        out[3 * g + 2] = (v >> 16) as u8;
+    }
+}
+
+/// Inverse of `pack_groups3`.
+pub fn unpack_groups3(packed: &[u8], n: usize, out: &mut [u8]) {
+    let groups = n / 8;
+    for g in 0..groups {
+        let v = packed[3 * g] as u32
+            | (packed[3 * g + 1] as u32) << 8
+            | (packed[3 * g + 2] as u32) << 16;
+        for k in 0..8 {
+            out[g * 8 + k] = ((v >> (3 * k)) & 0x7) as u8;
+        }
+    }
+}
+
 /// Byte-aligned "grouped" plane layout: each plane holds one contiguous
-/// bit-field across all `n` coordinates, so a coordinate's field is never
-/// split across planes and, for the widths below, never straddles a byte.
-/// Returns `(field_bits, plane_bytes)` in order, or `None` for widths that
-/// stay on the little-endian bitstream (5..8).
+/// bit-field across all `n` coordinates, so a coordinate's field never straddles
+/// a byte. Used for the widths where it measured faster than the bitstream.
+/// Returns `(field_bits, plane_bytes)` in order, or `None` otherwise.
 pub fn plane_layout(n: usize, bits: u32) -> Option<Vec<(u32, usize)>> {
     let total = packed_bytes(n, bits);
     let layout = match bits {
         1 => vec![(1u32, n.div_ceil(8))],
         2 => vec![(2, n.div_ceil(4))],
-        3 => vec![(2, n.div_ceil(4)), (1, n.div_ceil(8))],
         4 => vec![(4, n.div_ceil(2))],
         _ => return None,
     };
@@ -208,10 +235,35 @@ pub fn plane_layout(n: usize, bits: u32) -> Option<Vec<(u32, usize)>> {
     }
 }
 
+/// Pack `n` `bits`-wide indices with the fastest byte-aligned layout for that
+/// width (measured, see `plane_vs_bitstream_unpack_cost`): groups of 8 into 3
+/// bytes for 3-bit, planes for 1/2/4-bit, bitstream for 5..8 and odd lengths.
+pub fn pack_idx(idx: &[u8], n: usize, bits: u32, out: &mut [u8]) {
+    if bits == 3 && n % 8 == 0 {
+        pack_groups3(idx, n, out);
+    } else if plane_layout(n, bits).is_some() {
+        pack_planes(idx, n, bits, out);
+    } else {
+        pack_bits(&idx[..n], bits, out);
+    }
+}
+
+/// Inverse of `pack_idx`.
+pub fn unpack_idx(packed: &[u8], n: usize, bits: u32, out: &mut [u8]) {
+    if bits == 3 && n % 8 == 0 {
+        unpack_groups3(packed, n, out);
+    } else if plane_layout(n, bits).is_some() {
+        unpack_planes(packed, n, bits, out);
+    } else {
+        unpack_bits(packed, bits, n, out);
+    }
+}
+
 /// Pack `n` indices using the plane layout; falls back to `pack_bits`.
 ///
 /// 3-bit is split into a 2-bit low plane then a 1-bit sign plane, so the
-/// unpack side never needs the `off + bits > 8` straddle fix-up.
+/// unpack side never needs the `off + bits > 8` straddle fix-up. Each output
+/// byte is assembled from its whole group of coordinates at once.
 pub fn pack_planes(idx: &[u8], n: usize, bits: u32, out: &mut [u8]) {
     let Some(layout) = plane_layout(n, bits) else {
         return pack_bits(&idx[..n], bits, out);
@@ -221,15 +273,17 @@ pub fn pack_planes(idx: &[u8], n: usize, bits: u32, out: &mut [u8]) {
     let mut fshift = 0u32;
     for (fb, pbytes) in layout {
         let mask = (1u32 << fb) - 1;
-        for i in 0..n {
-            let v = ((idx[i] as u32) >> fshift) & mask;
-            let bit = i * fb as usize;
-            let byte = poff + (bit >> 3);
-            let off = (bit & 7) as u32;
-            out[byte] |= ((v << off) & 0xff) as u8;
-            if off + fb > 8 {
-                out[byte + 1] |= (v >> (8 - off)) as u8;
+        let cpb = (8 / fb) as usize; // coords per byte in this plane
+        for b in 0..pbytes {
+            let mut byte = 0u32;
+            for k in 0..cpb {
+                let i = b * cpb + k;
+                if i >= n {
+                    break;
+                }
+                byte |= (((idx[i] as u32) >> fshift) & mask) << (fb * k as u32);
             }
+            out[poff + b] = byte as u8;
         }
         poff += pbytes;
         fshift += fb;
@@ -248,15 +302,16 @@ pub fn unpack_planes(packed: &[u8], n: usize, bits: u32, out: &mut [u8]) {
     let mut fshift = 0u32;
     for (fb, pbytes) in layout {
         let mask = (1u32 << fb) - 1;
-        for (i, o) in out[..n].iter_mut().enumerate() {
-            let bit = i * fb as usize;
-            let byte = poff + (bit >> 3);
-            let off = (bit & 7) as u32;
-            let mut v = (packed[byte] as u32) >> off;
-            if off + fb > 8 {
-                v |= (packed[byte + 1] as u32) << (8 - off);
+        let cpb = (8 / fb) as usize;
+        for b in 0..pbytes {
+            let byte = packed[poff + b] as u32;
+            for k in 0..cpb {
+                let i = b * cpb + k;
+                if i >= n {
+                    break;
+                }
+                out[i] |= (((byte >> (fb * k as u32)) & mask) as u8) << fshift;
             }
-            *o |= ((v & mask) as u8) << fshift;
         }
         poff += pbytes;
         fshift += fb;
@@ -353,14 +408,14 @@ impl PlanarQuant {
         for (i, &v) in rot.iter().enumerate() {
             idx[i] = self.nearest(v);
         }
-        pack_planes(&idx, self.hd_padded, self.bits, packed);
+        pack_idx(&idx, self.hd_padded, self.bits, packed);
     }
 
     /// Reconstruct `xhat` from packed indices and the stored norm.
     pub fn dequantize(&self, packed: &[u8], norm: f32, out: &mut [f32]) {
         let c = self.centroids();
         let mut idx = vec![0u8; self.hd_padded];
-        unpack_planes(packed, self.hd_padded, self.bits, &mut idx);
+        unpack_idx(packed, self.hd_padded, self.bits, &mut idx);
         let mut rot = vec![0.0f32; self.hd_padded];
         for (i, &j) in idx.iter().enumerate() {
             rot[i] = c[j as usize];
@@ -375,7 +430,7 @@ impl PlanarQuant {
     /// Unpack packed indices into centroid values, using caller scratch.
     pub fn unpack_centroids_into(&self, packed: &[u8], idx: &mut [u8], out: &mut [f32]) {
         let c = self.centroids();
-        unpack_planes(packed, self.hd_padded, self.bits, idx);
+        unpack_idx(packed, self.hd_padded, self.bits, idx);
         for i in 0..self.hd_padded {
             out[i] = c[idx[i] as usize];
         }
@@ -400,7 +455,7 @@ impl PlanarQuant {
     pub fn dot_rotated(&self, q_rot: &[f32], packed: &[u8], norm: f32) -> f32 {
         let c = self.centroids();
         let mut idx = vec![0u8; self.hd_padded];
-        unpack_planes(packed, self.hd_padded, self.bits, &mut idx);
+        unpack_idx(packed, self.hd_padded, self.bits, &mut idx);
         let mut acc = 0.0f32;
         for i in 0..self.hd {
             acc += q_rot[i] * c[idx[i] as usize];
@@ -708,43 +763,80 @@ mod tests {
     }
 
     #[test]
-    fn plane_packing_roundtrips_1_to_4_and_fits_row() {
-        for bits in 1u32..=4 {
+    fn row_packing_roundtrips_every_width_and_fits_row() {
+        // `pack_idx` picks the fastest layout per width; all must roundtrip and
+        // fit the canonical row size so `packed_len` (buffer stride) stays valid.
+        for bits in 1u32..=8 {
             let n = 256usize;
             let mut next = rng(17 + bits as u64);
             let idx: Vec<u8> = (0..n)
                 .map(|_| ((next().abs() * 1000.0) as u32 % (1 << bits)) as u8)
                 .collect();
             let mut packed = vec![0u8; packed_bytes(n, bits)];
-            pack_planes(&idx, n, bits, &mut packed);
+            pack_idx(&idx, n, bits, &mut packed);
             let mut back = vec![0u8; n];
-            unpack_planes(&packed, n, bits, &mut back);
+            unpack_idx(&packed, n, bits, &mut back);
             assert_eq!(idx, back, "bits={bits}");
-            // The plane layout must fit exactly in the canonical row size so
-            // `packed_len` (used for buffer strides) stays valid.
-            let used: usize = plane_layout(n, bits).unwrap().iter().map(|(_, b)| *b).sum();
-            assert!(used <= packed.len(), "bits={bits} used {used} > {}", packed.len());
         }
     }
 
     #[test]
-    fn plane_packing_matches_reference_3bit_layout() {
-        // 2-bit low plane then a 1-bit sign plane, byte aligned (the upstream
-        // `block_planar3_0` arrangement): coord i -> qs byte i/4 bits 2*(i%4),
-        // sign byte i/8 bit i%8.
+    fn groups3_matches_reference_3bit_layout() {
+        // 3-bit is 8 coordinates per 3-byte group, little-endian 24-bit value:
+        // coord k of the group sits at bits 3k.
         let n = 256usize;
         let mut next = rng(23);
         let idx: Vec<u8> = (0..n).map(|_| ((next().abs() * 800.0) as u32 % 8) as u8).collect();
         let mut packed = vec![0u8; packed_bytes(n, 3)];
-        pack_planes(&idx, n, 3, &mut packed);
-        for i in 0..n {
-            let want = idx[i] as u32;
-            let qs = (packed[i / 4] as u32 >> (2 * (i % 4))) & 0x3;
-            let sign = (packed[n / 4 + i / 8] as u32 >> (i % 8)) & 0x1;
-            assert_eq!(qs | (sign << 2), want, "coord {i}");
+        pack_idx(&idx, n, 3, &mut packed);
+        for g in 0..n / 8 {
+            let v = packed[3 * g] as u32
+                | (packed[3 * g + 1] as u32) << 8
+                | (packed[3 * g + 2] as u32) << 16;
+            for k in 0..8 {
+                assert_eq!(((v >> (3 * k)) & 0x7) as u8, idx[g * 8 + k], "group {g} coord {k}");
+            }
         }
     }
 
+    #[test]
+    fn plane_vs_bitstream_unpack_cost() {
+        if std::env::var("KVQ_BENCH").is_err() {
+            return;
+        }
+        use std::hint::black_box;
+        use std::time::Instant;
+        let n = 256usize;
+        let iters = 2_000_000usize;
+        let mut next = rng(31);
+        let idx: Vec<u8> = (0..n)
+            .map(|_| ((next().abs() * 800.0) as u32 % 8) as u8)
+            .collect();
+        let mut out = vec![0u8; n];
+        for bits in [1u32, 2u32, 3u32, 4u32, 5u32, 8u32] {
+            let mut packed = vec![0u8; packed_bytes(n, bits)];
+            pack_bits(&idx, bits, &mut packed);
+            let mut acc = 0u64;
+            let t = Instant::now();
+            for _ in 0..iters {
+                unpack_bits(&packed, bits, n, &mut out);
+                acc += out[0] as u64;
+            }
+            let tb = t.elapsed();
+            pack_idx(&idx, n, bits, &mut packed);
+            let t = Instant::now();
+            for _ in 0..iters {
+                unpack_idx(&packed, n, bits, &mut out);
+                acc += out[0] as u64;
+            }
+            let tp = t.elapsed();
+            black_box(acc);
+            println!(
+                "KVQ_BENCH bits={bits} unpack_bits={tb:?} unpack_idx={tp:?} speedup={:.2}x",
+                tb.as_secs_f64() / tp.as_secs_f64()
+            );
+        }
+    }
 }
 
 /// Expected per-coordinate MSE of the Lloyd-Max codebook (test/diagnostic).
