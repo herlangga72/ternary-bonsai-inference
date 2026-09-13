@@ -516,6 +516,12 @@ a remaining port bug worth chasing.
 
 ### Where 75% acceptance actually comes from (2026-09-13)
 
+> **SUPERSEDED - see "Goal reached: 79.7%" below.** The analysis in this section
+> was based on the converted sidecars, which the legacy-type-42 parse had
+> corrupted. With the canonical drafter loaded correctly and the block ordering
+> fixed, no training is needed: the port reaches 79.7% / 92.9%. Kept for the
+> record of the (wrong) intermediate conclusion.
+
 DSpark is DeepSeek's published drafter family; published results are ~60-85%
 speedup / high accepted length, which requires a *trained* drafter. Our sidecar
 behaves like an untrained or mismatched checkpoint: its own reference scores
