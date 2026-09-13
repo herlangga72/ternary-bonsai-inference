@@ -585,9 +585,39 @@ pub fn half_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
+/// Round-to-nearest f32 -> f16 (used by the f16 KV cache).
+pub fn f32_to_half(v: f32) -> u16 {
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    if exp == 0xff {
+        // inf / nan
+        let m = if man != 0 { 0x200 } else { 0 };
+        return sign | 0x7c00 | m;
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // overflow -> inf
+    }
+    if e <= 0 {
+        // subnormal or zero
+        if e < -10 {
+            return sign;
+        }
+        let m = (man | 0x80_0000) >> (1 - e) as u32;
+        // round to nearest even on the 13 dropped bits
+        let half = (m >> 13) as u16;
+        let rem = m & 0x1fff;
+        let out = half + if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) { 1 } else { 0 };
+        return sign | out;
+    }
+    let half = ((e as u32) << 10) as u16 | (man >> 13) as u16;
+    let rem = man & 0x1fff;
+    let out = half.wrapping_add(if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) { 1 } else { 0 });
+    sign | out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +635,27 @@ mod tests {
         // inf / nan round-trips as inf / nan
         assert_eq!(half_to_f32(0x7C00).to_bits(), f32::INFINITY.to_bits());
         assert!(half_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn f32_to_half_roundtrips_and_rounds() {
+        assert_eq!(f32_to_half(1.0), 0x3C00);
+        assert_eq!(f32_to_half(-2.0), 0xC000);
+        assert_eq!(f32_to_half(0.5), 0x3800);
+        assert_eq!(f32_to_half(0.0), 0x0000);
+        assert_eq!(f32_to_half(f32::INFINITY), 0x7C00);
+        assert_eq!(f32_to_half(-f32::INFINITY), 0xFC00);
+        // round-trip within f16 precision
+        let mut s: u64 = 0x1234_5678;
+        for _ in 0..2000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            let v = ((s >> 40) as f32 / (1u64 << 24) as f32) * 20.0 - 10.0;
+            let back = half_to_f32(f32_to_half(v));
+            let tol = v.abs().max(1e-3) * 1e-3;
+            assert!((back - v).abs() <= tol, "{v} -> {back}");
+        }
     }
 
     #[test]

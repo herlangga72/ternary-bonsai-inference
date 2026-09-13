@@ -370,6 +370,73 @@ pub fn from_env(hd: usize) -> (Option<PlanarQuant>, Option<PlanarQuant>) {
 }
 
 // ---------------------------------------------------------------------------
+// Mode selection
+// ---------------------------------------------------------------------------
+
+/// KV cache storage mode selected by `BONSAI_KV`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvMode {
+    /// Full precision (default).
+    F32,
+    /// f16 per coordinate: 2x smaller, ~1e-3 error, no rotation.
+    F16,
+    /// Rotated + Lloyd-Max scalar quantization.
+    Planar { bits: u32, v_quant: bool },
+}
+
+impl KvMode {
+    /// Bytes per coordinate (for reporting/allocating).
+    pub fn bytes_per_coord(self) -> f32 {
+        match self {
+            KvMode::F32 => 4.0,
+            KvMode::F16 => 2.0,
+            KvMode::Planar { bits, .. } => bits as f32 / 8.0,
+        }
+    }
+    pub fn is_f32(self) -> bool {
+        self == KvMode::F32
+    }
+}
+
+/// Parse `BONSAI_KV`:
+///   unset/`f32`        -> F32
+///   `f16`/`fp16`/`half`-> F16
+///   `planarN`/`isoN`   -> Planar { bits: N, v_quant: true }
+///   `planarNk`/`isoNk` -> Planar { bits: N, v_quant: false }
+pub fn mode_from_env() -> KvMode {
+    let Ok(v) = std::env::var("BONSAI_KV") else {
+        return KvMode::F32;
+    };
+    match v.as_str() {
+        "" | "f32" => KvMode::F32,
+        "f16" | "fp16" | "half" => KvMode::F16,
+        other => {
+            let (name, k_only) = match other.strip_suffix('k') {
+                Some(base) => (base, true),
+                None => (other, false),
+            };
+            let bits = match name {
+                "planar3" | "iso3" => 3,
+                "planar4" | "iso4" => 4,
+                _ => match name
+                    .strip_prefix("planar")
+                    .or_else(|| name.strip_prefix("iso"))
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|b| (1..=8).contains(b))
+                {
+                    Some(b) => b,
+                    None => return KvMode::F32,
+                },
+            };
+            KvMode::Planar {
+                bits,
+                v_quant: !k_only,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]

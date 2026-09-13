@@ -1,0 +1,37 @@
+#version 450
+// f16-V attention output: unpack cached f16 values and form the weighted sum.
+// One workgroup per query head; lane d owns output dimension d.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Pr { float data[]; } prob;
+layout(set = 0, binding = 1, std430) readonly buffer V { uint data[]; } vc;
+layout(set = 0, binding = 2, std430) buffer O { float data[]; } o;
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint n_kv;
+    uint row_words;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint d = gl_LocalInvocationID.x;
+    uint kvheads = pc.n_kv;
+    uint kv = h / (pc.nheads / kvheads);
+    uint word = d >> 1u;
+    bool odd = (d & 1u) == 1u;
+
+    float acc = 0.0f;
+    for (uint pos = 0u; pos < pc.n_pos; ++pos) {
+        float pr = prob.data[h * pc.n_pos + pos];
+        if (pr == 0.0f) { continue; }
+        uint base = (pos * pc.n_kv + kv) * pc.row_words;
+        vec2 h2 = unpackHalf2x16(vc.data[base + word]);
+        float vv = odd ? h2.y : h2.x;
+        acc = fma(pr, vv, acc);
+    }
+    o.data[h * pc.hd + d] = acc;
+}

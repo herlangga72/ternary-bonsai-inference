@@ -44,12 +44,17 @@ pub struct AttnCache {
     /// Packed rotated V indices and norms (symmetric mode).
     pub vq: Vec<Vec<u8>>,
     pub vn: Vec<Vec<f32>>,
+    /// f16 storage (`BONSAI_KV=f16`), same layout as `k`/`v` but 16-bit.
+    pub f16_kv: bool,
+    pub k16: Vec<Vec<u16>>,
+    pub v16: Vec<Vec<u16>>,
 }
 
 impl AttnCache {
     pub fn new(cfg: &Qwen35) -> AttnCache {
         let n_kv_elems = cfg.n_head_kv * cfg.n_embd_head;
         let (pq, pqv) = crate::kvquant::from_env(cfg.n_embd_head);
+        let f16_kv = crate::kvquant::mode_from_env() == crate::kvquant::KvMode::F16;
         AttnCache {
             n_kv_elems,
             n_kv: cfg.n_head_kv,
@@ -62,6 +67,9 @@ impl AttnCache {
             kn: vec![Vec::new(); cfg.n_layer],
             vq: vec![Vec::new(); cfg.n_layer],
             vn: vec![Vec::new(); cfg.n_layer],
+            f16_kv,
+            k16: vec![Vec::new(); cfg.n_layer],
+            v16: vec![Vec::new(); cfg.n_layer],
         }
     }
 
@@ -69,6 +77,8 @@ impl AttnCache {
     pub fn n_pos(&self, il: usize) -> usize {
         if self.pq.is_some() {
             self.kn[il].len() / self.n_kv
+        } else if self.f16_kv {
+            self.k16[il].len() / self.n_kv_elems
         } else {
             self.k[il].len() / self.n_kv_elems
         }
@@ -103,6 +113,14 @@ impl AttnCache {
     pub fn append_v(&mut self, il: usize, vrow: &[f32]) {
         debug_assert_eq!(vrow.len(), self.n_kv_elems);
         self.v[il].extend_from_slice(vrow);
+    }
+
+    /// f16 append for K and V (`BONSAI_KV=f16`).
+    pub fn append_f16(&mut self, il: usize, krow: &[f32], vrow: &[f32]) {
+        debug_assert_eq!(krow.len(), self.n_kv_elems);
+        debug_assert_eq!(vrow.len(), self.n_kv_elems);
+        self.k16[il].extend(krow.iter().map(|&v| crate::gguf::f32_to_half(v)));
+        self.v16[il].extend(vrow.iter().map(|&v| crate::gguf::f32_to_half(v)));
     }
 
     /// Quantized V append (symmetric mode).
@@ -161,6 +179,14 @@ impl AttnScratch {
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Dot of f32 query with an f16 cache row, converting on the fly.
+fn dot_f16(a: &[f32], b: &[u16]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x * crate::gguf::half_to_f32(*y))
+        .sum()
 }
 
 /// One full-attention layer for a single token.
@@ -250,6 +276,8 @@ pub fn full_attention_layer(
         } else {
             cache.append_v(il, &s.vrow);
         }
+    } else if cache.f16_kv {
+        cache.append_f16(il, &k, &s.vrow);
     } else {
         cache.append(il, &k, &s.vrow);
     }
@@ -282,6 +310,12 @@ pub fn full_attention_layer(
                 let norm = kn[j * cache.n_kv + kv];
                 s.scores[j] = pq.dot_rotated(&s.qrot, row, norm) * scale;
             }
+        } else if cache.f16_kv {
+            let k16 = &cache.k16[il];
+            for j in 0..n_pos {
+                let kj = &k16[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
+                s.scores[j] = dot_f16(qh, kj) * scale;
+            }
         } else {
             for j in 0..n_pos {
                 let kj = &k_cache[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
@@ -312,6 +346,18 @@ pub fn full_attention_layer(
                 }
             }
             pqv.rotate_inv_inplace(&mut s.head_out[..pqv.hd_padded]);
+        } else if cache.f16_kv {
+            let v16 = &cache.v16[il];
+            for j in 0..n_pos {
+                let pj = s.probs[j];
+                if pj == 0.0 {
+                    continue;
+                }
+                let vj = &v16[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
+                for d in 0..hd {
+                    s.head_out[d] += pj * crate::gguf::half_to_f32(vj[d]);
+                }
+            }
         } else {
             for j in 0..n_pos {
                 let pj = s.probs[j];

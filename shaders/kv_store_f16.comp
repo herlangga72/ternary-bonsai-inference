@@ -1,0 +1,26 @@
+#version 450
+// f16 KV append: pack one kv head's float vector into f16 words.
+// One workgroup per kv head; lane i packs coordinates 2i and 2i+1.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer R { float data[]; } r;
+layout(set = 0, binding = 1, std430) buffer C { uint data[]; } c;
+layout(push_constant) uniform PC {
+    uint pos;
+    uint hd;
+    uint n_kv;
+    uint row_words;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+} pc;
+
+void main() {
+    uint kv = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint half_hd = pc.hd >> 1u;
+    if (lid >= half_hd) { return; }
+    float a = r.data[kv * pc.hd + 2u * lid];
+    float b = r.data[kv * pc.hd + 2u * lid + 1u];
+    c.data[(pc.pos * pc.n_kv + kv) * pc.row_words + lid] = packHalf2x16(vec2(a, b));
+}

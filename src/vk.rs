@@ -77,6 +77,14 @@ pub const ATTN_SCORES_Q_SPV: &[u8] =
 pub const ATTN_OUT_Q_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/attn_out_q.spv"));
 
+/// SPIR-V for the f16 KV path (`BONSAI_KV=f16`).
+pub const KV_STORE_F16_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/kv_store_f16.spv"));
+pub const ATTN_SCORES_F16_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_scores_f16.spv"));
+pub const ATTN_OUT_F16_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/attn_out_f16.spv"));
+
 /// SPIR-V for the N-column (batched) two-pass PQ2_0 GEMM
 /// (`shaders/pq2_partial_n.comp`, `shaders/pq2_rowsum_n.comp`), P2 of
 /// notes/prefill-plan.md. One weight block is read once and reused across N

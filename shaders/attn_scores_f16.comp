@@ -1,0 +1,42 @@
+#version 450
+// f16-K attention scores: unpack cached f16 keys and dot with the query.
+// One workgroup per query head, as in the f32 kernel.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer Q { float data[]; } q;
+layout(set = 0, binding = 1, std430) readonly buffer K { uint data[]; } kc;
+layout(set = 0, binding = 2, std430) buffer S { float data[]; } scores;
+layout(push_constant) uniform PC {
+    uint nheads;
+    uint n_pos;
+    uint hd;
+    uint n_kv;
+    uint row_words;
+    uint scale_bits;
+    uint pad0;
+    uint pad1;
+} pc;
+
+shared float qh[256];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (lid < pc.hd) { qh[lid] = q.data[h * pc.hd + lid]; }
+    barrier();
+
+    uint kvheads = pc.n_kv;
+    uint kv = h / (pc.nheads / kvheads);
+    float scale = uintBitsToFloat(pc.scale_bits);
+    bool odd = (lid & 1u) == 1u;
+
+    for (uint pos = lid; pos < pc.n_pos; pos += 256u) {
+        uint base = (pos * pc.n_kv + kv) * pc.row_words;
+        float acc = 0.0f;
+        for (uint i = 0u; i < pc.hd; ++i) {
+            vec2 h2 = unpackHalf2x16(kc.data[base + (i >> 1u)]);
+            float kk = ((i & 1u) == 0u) ? h2.x : h2.y;
+            acc = fma(qh[i], kk, acc);
+        }
+        scores.data[h * pc.n_pos + pos] = acc * scale;
+    }
+}
