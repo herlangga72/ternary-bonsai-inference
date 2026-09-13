@@ -351,13 +351,20 @@ pub fn matvec_par(
 pub struct Dspark {
     pub cfg: DsparkCfg,
     pub gguf: GGUF,
+    /// Memoized small f32 tensors (norms, biases). Dequantizing them on every
+    /// draft call is pure waste; they never change.
+    f32_memo: std::cell::RefCell<std::collections::HashMap<String, Vec<f32>>>,
 }
 
 impl Dspark {
     pub fn open(path: &str) -> Result<Dspark, String> {
         let gguf = GGUF::open(path)?;
         let cfg = DsparkCfg::from_gguf(&gguf)?;
-        Ok(Dspark { cfg, gguf })
+        Ok(Dspark {
+            cfg,
+            gguf,
+            f32_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
+        })
     }
 
     pub fn tensor(&self, name: &str) -> Result<&TensorInfo, String> {
@@ -385,6 +392,16 @@ impl Dspark {
         Ok(out)
     }
 
+    /// Dequantize a small f32 tensor once and keep it (norms, biases).
+    pub fn cached_f32(&self, name: &str) -> Result<Vec<f32>, String> {
+        if let Some(v) = self.f32_memo.borrow().get(name) {
+            return Ok(v.clone());
+        }
+        let v = self.read_f32(name)?;
+        self.f32_memo.borrow_mut().insert(name.to_string(), v.clone());
+        Ok(v)
+    }
+
     /// `y = W @ x` for a named matrix tensor. `x.len()` must equal `ne0`.
     pub fn matvec(&self, name: &str, x: &[f32]) -> Result<Vec<f32>, String> {
         let t = self.tensor(name)?.clone();
@@ -407,21 +424,14 @@ impl Dspark {
                 features.len()
             ));
         }
-        let fc = self.read_f32("dspark.fc.weight")?; // [n_embd, n_embd_enc] as ne0=n_enc rows=n_embd
-        let hidden_norm = self.read_f32("dspark.hidden_norm.weight")?;
+        // Matvec row by row: never materialize fc (25600 x 5120 f32 = 524 MiB).
+        let hidden_norm = self.cached_f32("dspark.hidden_norm.weight")?;
         let n_embd = self.cfg.n_embd;
         let mut out = vec![0.0f32; n_tok * n_embd];
+        let mut y = vec![0.0f32; n_embd];
         for t in 0..n_tok {
             let x = &features[t * n_enc..(t + 1) * n_enc];
-            let mut y = vec![0.0f32; n_embd];
-            for r in 0..n_embd {
-                let row = &fc[r * n_enc..(r + 1) * n_enc];
-                let mut acc = 0.0f32;
-                for (a, b) in x.iter().zip(row.iter()) {
-                    acc += a * b;
-                }
-                y[r] = acc;
-            }
+            self.matvec_range("dspark.fc.weight", 0, n_embd, x, &mut y)?;
             out[t * n_embd..(t + 1) * n_embd]
                 .copy_from_slice(&kernels::rms_norm(&y, &hidden_norm, self.cfg.eps));
         }
@@ -490,7 +500,7 @@ impl Dspark {
             let wk = format!("blk.{il}.attn_k.weight");
             let wv = format!("blk.{il}.attn_v.weight");
             let kn = format!("blk.{il}.attn_k_norm.weight");
-            let knorm = self.read_f32(&kn)?;
+            let knorm = self.cached_f32(&kn)?;
             for (t, &pos) in positions.iter().enumerate() {
                 if pos >= cache.n_ctx {
                     return Err(format!("dspark inject: pos {pos} >= ctx {}", cache.n_ctx));
@@ -523,40 +533,30 @@ impl Dspark {
         let (min_snr, max_snr) = c.log_snr.ok_or("dspark: log-SNR conditioning disabled")?;
         let n_freq = 128usize;
         let half = n_freq / 2;
-        let fc1 = self.read_f32("dspark.log_snr_fc1.weight")?; // [128, n_embd]
-        let b1 = self.read_f32("dspark.log_snr_fc1.bias")?;
-        let fc2 = self.read_f32("dspark.log_snr_fc2.weight")?; // [n_embd, n_embd]
-        let b2 = self.read_f32("dspark.log_snr_fc2.bias")?;
+        let b1 = self.cached_f32("dspark.log_snr_fc1.bias")?;
+        let b2 = self.cached_f32("dspark.log_snr_fc2.bias")?;
         let ne = c.n_embd;
         let mut out = vec![0.0f32; n_tok * ne];
+        let mut feat = vec![0.0f32; n_freq];
+        let mut h = vec![0.0f32; ne];
+        let mut e = vec![0.0f32; ne];
         for pos in 0..n_tok {
             let log_snr = if pos % c.block_size == 0 { max_snr } else { min_snr };
             let tt = (log_snr - min_snr) / (max_snr - min_snr) * 1000.0;
-            let mut feat = vec![0.0f32; n_freq];
             for i in 0..half {
                 let freq = (-(10000.0f32).ln() * i as f32 / half as f32).exp();
                 let angle = tt * freq;
                 feat[i] = angle.sin();
                 feat[half + i] = angle.cos();
             }
-            // fc1: [n_embd, n_freq] @ feat
-            let mut h = vec![0.0f32; ne];
+            // row-by-row matvecs; nothing large is materialized
+            self.matvec_range("dspark.log_snr_fc1.weight", 0, ne, &feat, &mut h)?;
             for r in 0..ne {
-                let row = &fc1[r * n_freq..(r + 1) * n_freq];
-                let mut acc = 0.0f32;
-                for (a, b) in feat.iter().zip(row.iter()) {
-                    acc += a * b;
-                }
-                h[r] = kernels::silu(acc + b1[r]);
+                h[r] = kernels::silu(h[r] + b1[r]);
             }
-            let mut e = vec![0.0f32; ne];
+            self.matvec_range("dspark.log_snr_fc2.weight", 0, ne, &h, &mut e)?;
             for r in 0..ne {
-                let row = &fc2[r * ne..(r + 1) * ne];
-                let mut acc = 0.0f32;
-                for (a, b) in h.iter().zip(row.iter()) {
-                    acc += a * b;
-                }
-                e[r] = acc + b2[r];
+                e[r] += b2[r];
             }
             out[pos * ne..(pos + 1) * ne].copy_from_slice(&e);
         }
@@ -602,10 +602,10 @@ impl Dspark {
         }
 
         for il in 0..c.n_layer {
-            let an = self.read_f32(&format!("blk.{il}.attn_norm.weight"))?;
-            let qn = self.read_f32(&format!("blk.{il}.attn_q_norm.weight"))?;
-            let kn = self.read_f32(&format!("blk.{il}.attn_k_norm.weight"))?;
-            let fnorm = self.read_f32(&format!("blk.{il}.ffn_norm.weight"))?;
+            let an = self.cached_f32(&format!("blk.{il}.attn_norm.weight"))?;
+            let qn = self.cached_f32(&format!("blk.{il}.attn_q_norm.weight"))?;
+            let kn = self.cached_f32(&format!("blk.{il}.attn_k_norm.weight"))?;
+            let fnorm = self.cached_f32(&format!("blk.{il}.ffn_norm.weight"))?;
 
             // q/k/v projections + norms + rope, appended to the cache
             let mut q = vec![0.0f32; n_tok * c.n_head * hd];
@@ -730,7 +730,7 @@ impl Dspark {
         }
 
         // --- final norm + LM head ----------------------------------------
-        let on = self.read_f32("output_norm.weight")?;
+        let on = self.cached_f32("output_norm.weight")?;
         let mut emb = vec![0.0f32; n_tok * ne];
         let mut base = vec![0.0f32; n_tok * c.n_vocab];
         for t in 0..n_tok {
@@ -750,8 +750,8 @@ impl Dspark {
         let mw1_ne0 = mw1.dims.first().copied().unwrap_or(0) as usize;
         let mw1_rb = row_bytes(mw1.ty, mw1_ne0);
         let mw1_payload = self.gguf.payload_slice(mw1)?;
-        let conf = self.read_f32("dspark.confidence_head.weight")?;
-        let conf_b = self.read_f32("dspark.confidence_head.bias")?;
+        let conf = self.cached_f32("dspark.confidence_head.weight")?;
+        let conf_b = self.cached_f32("dspark.confidence_head.bias")?;
 
         let mut logits = vec![0.0f32; n_tok * c.n_vocab];
         let mut conf_out = vec![0.0f32; n_tok];
