@@ -14,6 +14,8 @@ mod rope;
 mod sampler;
 mod tokenizer;
 mod weights;
+mod dspark;
+mod spec;
 
 use forward::Decoder;
 use sampler::{Sampler, SamplerConfig};
@@ -236,12 +238,48 @@ fn main() {
         cli.temp, cli.top_k, cli.top_p, cli.min_p
     );
 
+    // ---- optional dspark speculative decode (BONSAI_DSPARK=<sidecar path>) --
+    // Greedy only: the sampling path would need the residual-distribution
+    // acceptance test from the reference. Falls back silently when the sidecar
+    // cannot load.
+    let dspark_path = std::env::var("BONSAI_DSPARK").ok().filter(|s| !s.is_empty());
+    let n_draft: usize = std::env::var("BONSAI_DSPARK_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+    let mut drafter: Option<spec::Drafter> = None;
+    if let Some(p) = &dspark_path {
+        if cli.temp > 0.0 {
+            eprintln!("[dspark] disabled: speculative decode requires greedy (--temp 0)");
+        } else {
+            match spec::Drafter::new(p, 8192, 0.0) {
+                Ok(d) => {
+                    eprintln!("[dspark] speculative decode active (n_draft={n_draft})");
+                    drafter = Some(d);
+                }
+                Err(e) => eprintln!("[dspark] disabled: {e}"),
+            }
+        }
+    }
+
     // ---- prefill (forward each prompt token, cache the final hidden) ---------
     eprintln!("prefill ...");
     let t_gen0 = Instant::now();
     let mut last_h = Vec::new();
+    let mut taps: Vec<Vec<f32>> = match &drafter {
+        Some(d) => vec![Vec::new(); d.taps_want.len()],
+        None => Vec::new(),
+    };
     for (pos, &tok) in toks.iter().enumerate() {
-        last_h = match dec.forward_hidden(tok, pos) {
+        let r = match drafter.as_mut() {
+            Some(d) => {
+                let want = d.taps_want.clone();
+                dec.forward_hidden_taps(tok, pos, &want, &mut taps)
+                    .and_then(|h| d.observe(&taps, pos).map(|_| h))
+            }
+            None => dec.forward_hidden(tok, pos),
+        };
+        last_h = match r {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("error at prefill pos {pos}: {e}");
@@ -269,40 +307,94 @@ fn main() {
         }
     };
 
-    loop {
-        let id = sampler.sample(&logits, &sampler_cfg) as u32;
-        if stop_ids.contains(&id) {
-            break;
-        }
-        let piece = rvocab.piece_bytes(id as i32);
-        let _ = stdout.write_all(&piece);
-        let _ = stdout.flush();
-        n_gen += 1;
-        if n_gen >= cli.n_predict as u64 {
-            break;
-        }
+    if let Some(d) = drafter.as_mut() {
+        // ---- speculative greedy decode (dspark) ------------------------------
+        let mut pending = sampler.sample(&logits, &sampler_cfg) as u32;
+        let mut n_past = toks.len();
+        let mut stop = false;
+        while !stop {
+            // emit the pending token (the target's own, confirmed last round)
+            if stop_ids.contains(&pending) {
+                break;
+            }
+            let piece = rvocab.piece_bytes(pending as i32);
+            let _ = stdout.write_all(&piece);
+            let _ = stdout.flush();
+            n_gen += 1;
+            if n_gen >= cli.n_predict as u64 {
+                break;
+            }
 
-        let pos = toks.len() + n_gen as usize - 1;
-        let tk = Instant::now();
-        let h = match dec.forward_hidden(id, pos) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("\nerror: decode failed at pos {pos}: {e}");
-                exit(1);
+            let tk = Instant::now();
+            let out = match spec::round(&mut dec, d, pending, n_past, n_draft) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("\nerror: {e}");
+                    exit(1);
+                }
+            };
+            n_past += out.accepted + 1;
+            // emitted = accepted drafts + the target token; the last one becomes
+            // the next pending and is emitted at the top of the loop
+            let last = out.emitted.len() - 1;
+            for &t in &out.emitted[..last] {
+                if stop_ids.contains(&t) {
+                    stop = true;
+                    break;
+                }
+                let piece = rvocab.piece_bytes(t as i32);
+                let _ = stdout.write_all(&piece);
+                let _ = stdout.flush();
+                n_gen += 1;
+                if n_gen >= cli.n_predict as u64 {
+                    stop = true;
+                    break;
+                }
             }
-        };
-        logits = match dec.head_logits(&h) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("\nerror: head failed: {e}");
-                exit(1);
+            pending = out.pending;
+            let el = tk.elapsed().as_secs_f32();
+            if let Some(b) = baseline {
+                kernels::pause_for_budget(el, b);
+            } else {
+                baseline = Some(el);
             }
-        };
-        let el = tk.elapsed().as_secs_f32();
-        if let Some(b) = baseline {
-            kernels::pause_for_budget(el, b);
-        } else {
-            baseline = Some(el);
+        }
+    } else {
+        loop {
+            let id = sampler.sample(&logits, &sampler_cfg) as u32;
+            if stop_ids.contains(&id) {
+                break;
+            }
+            let piece = rvocab.piece_bytes(id as i32);
+            let _ = stdout.write_all(&piece);
+            let _ = stdout.flush();
+            n_gen += 1;
+            if n_gen >= cli.n_predict as u64 {
+                break;
+            }
+
+            let pos = toks.len() + n_gen as usize - 1;
+            let tk = Instant::now();
+            let h = match dec.forward_hidden(id, pos) {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("\nerror: decode failed at pos {pos}: {e}");
+                    exit(1);
+                }
+            };
+            logits = match dec.head_logits(&h) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("\nerror: head failed: {e}");
+                    exit(1);
+                }
+            };
+            let el = tk.elapsed().as_secs_f32();
+            if let Some(b) = baseline {
+                kernels::pause_for_budget(el, b);
+            } else {
+                baseline = Some(el);
+            }
         }
     }
 
