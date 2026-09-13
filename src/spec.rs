@@ -90,7 +90,11 @@ impl Drafter {
             ));
         }
         let block = self.ds.draft_block(&mut self.dcache, id_last, block_start)?;
-        self.dcache.truncate(block_start);
+        // The reference anchors the block at `n_past` (id_last re-placed at the
+        // position it was consumed at); our default anchors at `n_past + 1`.
+        // Keep the anchor slot when the reference convention is selected.
+        let keep = block_start + if std::env::var("BONSAI_DSPARK_ANCHOR_NPAST").is_ok() { 1 } else { 0 };
+        self.dcache.truncate(keep);
         let n_vocab = self.ds.cfg.n_vocab;
         // anchor-first drafts read block positions 0..; the anchorless convention
         // treats position 0 as a bonus anchor and reads 1..
@@ -163,8 +167,14 @@ pub fn round(
     let mut lg = dec.head_logits(&h)?;
     let mut forwards = 1usize;
 
-    // draft the block (positions n_past+1 ..)
-    let drafts = drafter.propose(pending, n_past + 1, n_draft)?;
+    // draft the block (positions n_past+1 ..), or at n_past for the reference
+    // anchor convention
+    let block_start = if std::env::var("BONSAI_DSPARK_ANCHOR_NPAST").is_ok() {
+        n_past
+    } else {
+        n_past + 1
+    };
+    let drafts = drafter.propose(pending, block_start, n_draft)?;
 
     // streaming verify: forward accepted drafts, stop at the first mismatch
     let mut a = 0usize;
