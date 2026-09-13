@@ -60,21 +60,59 @@ void main() {
     idxs[lid] = best;
     barrier();
 
-    if (lid == 0u) {
-        uint nwords = pc.pwords;
-        for (uint w = 0u; w < nwords + 1u; ++w) { words[w] = 0u; }
+    // ---- grouped plane packing -------------------------------------------
+    // 2/3/4-bit indices are written as byte-aligned planes (2-bit low plane
+    // then a 1-bit sign plane for 3-bit), matching `kvquant::pack_planes`.
+    // Wider widths keep the little-endian bitstream.
+    uint nwords = pc.pwords;
+    uint bits = pc.bits;
+    for (uint w = lid; w < nwords; w += 256u) { words[w] = 0u; }
+    barrier();
+
+    if (bits == 3u) {
+        uint nlo = hd >> 2u;
+        if (lid < nlo) {
+            uint b = lid << 2u;
+            uint v = (idxs[b] & 3u) | ((idxs[b + 1u] & 3u) << 2u)
+                   | ((idxs[b + 2u] & 3u) << 4u) | ((idxs[b + 3u] & 3u) << 6u);
+            atomicOr(words[lid >> 2u], v << (8u * (lid & 3u)));
+        }
+        if (lid < (hd >> 3u)) {
+            uint b = lid << 3u;
+            uint v = 0u;
+            for (uint k = 0u; k < 8u; ++k) { v |= ((idxs[b + k] >> 2u) & 1u) << k; }
+            uint byte = nlo + lid;
+            atomicOr(words[byte >> 2u], v << (8u * (byte & 3u)));
+        }
+    } else if (bits == 2u) {
+        if (lid < (hd >> 2u)) {
+            uint b = lid << 2u;
+            uint v = (idxs[b] & 3u) | ((idxs[b + 1u] & 3u) << 2u)
+                   | ((idxs[b + 2u] & 3u) << 4u) | ((idxs[b + 3u] & 3u) << 6u);
+            atomicOr(words[lid >> 2u], v << (8u * (lid & 3u)));
+        }
+    } else if (bits == 4u) {
+        if (lid < (hd >> 1u)) {
+            uint b = lid << 1u;
+            uint v = (idxs[b] & 0xfu) | ((idxs[b + 1u] & 0xfu) << 4u);
+            atomicOr(words[lid >> 2u], v << (8u * (lid & 3u)));
+        }
+    } else if (lid == 0u) {
         uint bitpos = 0u;
         for (uint i = 0u; i < hd; ++i) {
             uint v = idxs[i];
             uint byte = bitpos >> 3u;
             uint off = bitpos & 7u;
             words[byte >> 2u] |= v << (8u * (byte & 3u) + off);
-            if (off + pc.bits > 8u) {
+            if (off + bits > 8u) {
                 uint byte2 = byte + 1u;
                 words[byte2 >> 2u] |= (v >> (8u - off)) << (8u * (byte2 & 3u));
             }
-            bitpos += pc.bits;
+            bitpos += bits;
         }
+    }
+    barrier();
+    if (lid == 0u) {
         words[nwords] = floatBitsToUint(n); // norm word
     }
     barrier();

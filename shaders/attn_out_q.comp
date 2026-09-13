@@ -30,25 +30,48 @@ void main() {
 
     uint mask = (1u << pc.bits) - 1u;
     uint row_words = pc.pwords + 1u;
-    // pre-extract this lane's bit position within a packed row
-    uint bitpos = lid * pc.bits;
-    uint byte = bitpos >> 3u;
-    uint off = bitpos & 7u;
-    uint wi0 = byte >> 2u;
-    uint sh0 = 8u * (byte & 3u) + off;
-    bool need2 = (off + pc.bits) > 8u;
-    uint wi1 = (byte + 1u) >> 2u;
-    uint sh1 = 8u * ((byte + 1u) & 3u);
-    uint himask = (1u << (off + pc.bits - 8u)) - 1u;
+    uint bits = pc.bits;
+    uint nlo = hd >> 2u;
+    // This lane owns coordinate `lid`; precompute its plane byte/shift.
+    uint b0 = 0u, s0 = 0u, b1 = 0u, s1 = 0u;
+    if (bits == 3u) {
+        b0 = lid >> 2u; s0 = 2u * (lid & 3u);
+        b1 = nlo + (lid >> 3u); s1 = lid & 7u;
+    } else if (bits == 2u) {
+        b0 = lid >> 2u; s0 = 2u * (lid & 3u);
+    } else if (bits == 4u) {
+        b0 = lid >> 1u; s0 = 4u * (lid & 1u);
+    }
+    // Bitstream fallback (widths 5..8) precomputed once for this lane.
+    uint fbitpos = lid * bits;
+    uint fbyte = fbitpos >> 3u;
+    uint foff = fbitpos & 7u;
+    uint fwi0 = fbyte >> 2u;
+    uint fsh0 = 8u * (fbyte & 3u) + foff;
+    bool fneed2 = (foff + bits) > 8u;
+    uint fwi1 = (fbyte + 1u) >> 2u;
+    uint fsh1 = 8u * ((fbyte + 1u) & 3u);
+    uint fhimask = (fneed2 ? (1u << (foff + bits - 8u)) : 0u) - 1u;
 
     float a = 0.0;
     for (uint pos = 0u; pos < pc.n_pos; ++pos) {
         float pr = prob.data[h * pc.n_pos + pos];
         if (pr == 0.0) { continue; }
         uint base = (pos * pc.n_kv + kv) * row_words;
-        uint v = (vc.data[base + wi0] >> sh0) & mask;
-        if (need2) {
-            v |= ((vc.data[base + wi1] >> sh1) & himask) << (8u - off);
+        uint v;
+        if (bits == 3u) {
+            uint lo = (vc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + s0)) & 3u;
+            uint sg = (vc.data[base + (b1 >> 2u)] >> (8u * (b1 & 3u) + s1)) & 1u;
+            v = lo | (sg << 2u);
+        } else if (bits == 2u) {
+            v = (vc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + s0)) & 3u;
+        } else if (bits == 4u) {
+            v = (vc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + s0)) & 0xfu;
+        } else {
+            v = (vc.data[base + fwi0] >> fsh0) & mask;
+            if (fneed2) {
+                v |= ((vc.data[base + fwi1] >> fsh1) & fhimask) << (8u - foff);
+            }
         }
         float nrm = uintBitsToFloat(vc.data[base + pc.pwords]);
         a += pr * nrm * p.data[pc.cent_off + v];

@@ -185,6 +185,84 @@ pub fn packed_bytes(n: usize, bits: u32) -> usize {
     (n * bits as usize).div_ceil(8)
 }
 
+/// Byte-aligned "grouped" plane layout: each plane holds one contiguous
+/// bit-field across all `n` coordinates, so a coordinate's field is never
+/// split across planes and, for the widths below, never straddles a byte.
+/// Returns `(field_bits, plane_bytes)` in order, or `None` for widths that
+/// stay on the little-endian bitstream (5..8).
+pub fn plane_layout(n: usize, bits: u32) -> Option<Vec<(u32, usize)>> {
+    let total = packed_bytes(n, bits);
+    let layout = match bits {
+        1 => vec![(1u32, n.div_ceil(8))],
+        2 => vec![(2, n.div_ceil(4))],
+        3 => vec![(2, n.div_ceil(4)), (1, n.div_ceil(8))],
+        4 => vec![(4, n.div_ceil(2))],
+        _ => return None,
+    };
+    // Only use planes when they fit the canonical row size, so `packed_len`
+    // stays valid for every width.
+    if layout.iter().map(|(_, b)| *b).sum::<usize>() > total {
+        None
+    } else {
+        Some(layout)
+    }
+}
+
+/// Pack `n` indices using the plane layout; falls back to `pack_bits`.
+///
+/// 3-bit is split into a 2-bit low plane then a 1-bit sign plane, so the
+/// unpack side never needs the `off + bits > 8` straddle fix-up.
+pub fn pack_planes(idx: &[u8], n: usize, bits: u32, out: &mut [u8]) {
+    let Some(layout) = plane_layout(n, bits) else {
+        return pack_bits(&idx[..n], bits, out);
+    };
+    out.fill(0);
+    let mut poff = 0usize;
+    let mut fshift = 0u32;
+    for (fb, pbytes) in layout {
+        let mask = (1u32 << fb) - 1;
+        for i in 0..n {
+            let v = ((idx[i] as u32) >> fshift) & mask;
+            let bit = i * fb as usize;
+            let byte = poff + (bit >> 3);
+            let off = (bit & 7) as u32;
+            out[byte] |= ((v << off) & 0xff) as u8;
+            if off + fb > 8 {
+                out[byte + 1] |= (v >> (8 - off)) as u8;
+            }
+        }
+        poff += pbytes;
+        fshift += fb;
+    }
+}
+
+/// Inverse of `pack_planes`; falls back to `unpack_bits`.
+pub fn unpack_planes(packed: &[u8], n: usize, bits: u32, out: &mut [u8]) {
+    let Some(layout) = plane_layout(n, bits) else {
+        return unpack_bits(packed, bits, n, out);
+    };
+    for o in out[..n].iter_mut() {
+        *o = 0;
+    }
+    let mut poff = 0usize;
+    let mut fshift = 0u32;
+    for (fb, pbytes) in layout {
+        let mask = (1u32 << fb) - 1;
+        for (i, o) in out[..n].iter_mut().enumerate() {
+            let bit = i * fb as usize;
+            let byte = poff + (bit >> 3);
+            let off = (bit & 7) as u32;
+            let mut v = (packed[byte] as u32) >> off;
+            if off + fb > 8 {
+                v |= (packed[byte + 1] as u32) << (8 - off);
+            }
+            *o |= ((v & mask) as u8) << fshift;
+        }
+        poff += pbytes;
+        fshift += fb;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The quantizer
 // ---------------------------------------------------------------------------
@@ -275,14 +353,14 @@ impl PlanarQuant {
         for (i, &v) in rot.iter().enumerate() {
             idx[i] = self.nearest(v);
         }
-        pack_bits(&idx, self.bits, packed);
+        pack_planes(&idx, self.hd_padded, self.bits, packed);
     }
 
     /// Reconstruct `xhat` from packed indices and the stored norm.
     pub fn dequantize(&self, packed: &[u8], norm: f32, out: &mut [f32]) {
         let c = self.centroids();
         let mut idx = vec![0u8; self.hd_padded];
-        unpack_bits(packed, self.bits, self.hd_padded, &mut idx);
+        unpack_planes(packed, self.hd_padded, self.bits, &mut idx);
         let mut rot = vec![0.0f32; self.hd_padded];
         for (i, &j) in idx.iter().enumerate() {
             rot[i] = c[j as usize];
@@ -297,7 +375,7 @@ impl PlanarQuant {
     /// Unpack packed indices into centroid values, using caller scratch.
     pub fn unpack_centroids_into(&self, packed: &[u8], idx: &mut [u8], out: &mut [f32]) {
         let c = self.centroids();
-        unpack_bits(packed, self.bits, self.hd_padded, idx);
+        unpack_planes(packed, self.hd_padded, self.bits, idx);
         for i in 0..self.hd_padded {
             out[i] = c[idx[i] as usize];
         }
@@ -322,7 +400,7 @@ impl PlanarQuant {
     pub fn dot_rotated(&self, q_rot: &[f32], packed: &[u8], norm: f32) -> f32 {
         let c = self.centroids();
         let mut idx = vec![0u8; self.hd_padded];
-        unpack_bits(packed, self.bits, self.hd_padded, &mut idx);
+        unpack_planes(packed, self.hd_padded, self.bits, &mut idx);
         let mut acc = 0.0f32;
         for i in 0..self.hd {
             acc += q_rot[i] * c[idx[i] as usize];
@@ -628,6 +706,45 @@ mod tests {
             assert_eq!(idx, back, "bits={bits}");
         }
     }
+
+    #[test]
+    fn plane_packing_roundtrips_1_to_4_and_fits_row() {
+        for bits in 1u32..=4 {
+            let n = 256usize;
+            let mut next = rng(17 + bits as u64);
+            let idx: Vec<u8> = (0..n)
+                .map(|_| ((next().abs() * 1000.0) as u32 % (1 << bits)) as u8)
+                .collect();
+            let mut packed = vec![0u8; packed_bytes(n, bits)];
+            pack_planes(&idx, n, bits, &mut packed);
+            let mut back = vec![0u8; n];
+            unpack_planes(&packed, n, bits, &mut back);
+            assert_eq!(idx, back, "bits={bits}");
+            // The plane layout must fit exactly in the canonical row size so
+            // `packed_len` (used for buffer strides) stays valid.
+            let used: usize = plane_layout(n, bits).unwrap().iter().map(|(_, b)| *b).sum();
+            assert!(used <= packed.len(), "bits={bits} used {used} > {}", packed.len());
+        }
+    }
+
+    #[test]
+    fn plane_packing_matches_reference_3bit_layout() {
+        // 2-bit low plane then a 1-bit sign plane, byte aligned (the upstream
+        // `block_planar3_0` arrangement): coord i -> qs byte i/4 bits 2*(i%4),
+        // sign byte i/8 bit i%8.
+        let n = 256usize;
+        let mut next = rng(23);
+        let idx: Vec<u8> = (0..n).map(|_| ((next().abs() * 800.0) as u32 % 8) as u8).collect();
+        let mut packed = vec![0u8; packed_bytes(n, 3)];
+        pack_planes(&idx, n, 3, &mut packed);
+        for i in 0..n {
+            let want = idx[i] as u32;
+            let qs = (packed[i / 4] as u32 >> (2 * (i % 4))) & 0x3;
+            let sign = (packed[n / 4 + i / 8] as u32 >> (i % 8)) & 0x1;
+            assert_eq!(qs | (sign << 2), want, "coord {i}");
+        }
+    }
+
 }
 
 /// Expected per-coordinate MSE of the Lloyd-Max codebook (test/diagnostic).

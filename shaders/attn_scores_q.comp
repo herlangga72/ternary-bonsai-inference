@@ -44,23 +44,47 @@ void main() {
     float scale = uintBitsToFloat(pc.scale_bits);
     uint mask = (1u << pc.bits) - 1u;
     uint row_words = pc.pwords + 1u;
+    uint bits = pc.bits;
+    uint nlo = hd >> 2u; // 2-bit low-plane byte count (also sign-plane base)
 
     for (uint pos = lid; pos < pc.n_pos; pos += 256u) {
         uint base = (pos * pc.n_kv + kv) * row_words;
         float acc = 0.0;
-        uint bitpos = 0u;
-        for (uint i = 0u; i < hd; ++i) {
-            uint byte = bitpos >> 3u;
-            uint off = bitpos & 7u;
-            uint v = (kc.data[base + (byte >> 2u)] >> (8u * (byte & 3u) + off)) & mask;
-            if (off + pc.bits > 8u) {
-                uint byte2 = byte + 1u;
-                uint hi = (kc.data[base + (byte2 >> 2u)] >> (8u * (byte2 & 3u)))
-                    & ((1u << (off + pc.bits - 8u)) - 1u);
-                v |= hi << (8u - off);
+        if (bits == 3u) {
+            for (uint i = 0u; i < hd; ++i) {
+                uint b0 = i >> 2u;
+                uint lo = (kc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + 2u * (i & 3u))) & 3u;
+                uint b1 = nlo + (i >> 3u);
+                uint sg = (kc.data[base + (b1 >> 2u)] >> (8u * (b1 & 3u) + (i & 7u))) & 1u;
+                acc += qr[i] * p.data[pc.cent_off + (lo | (sg << 2u))];
             }
-            acc += qr[i] * p.data[pc.cent_off + v];
-            bitpos += pc.bits;
+        } else if (bits == 2u) {
+            for (uint i = 0u; i < hd; ++i) {
+                uint b0 = i >> 2u;
+                uint lo = (kc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + 2u * (i & 3u))) & 3u;
+                acc += qr[i] * p.data[pc.cent_off + lo];
+            }
+        } else if (bits == 4u) {
+            for (uint i = 0u; i < hd; ++i) {
+                uint b0 = i >> 1u;
+                uint v = (kc.data[base + (b0 >> 2u)] >> (8u * (b0 & 3u) + 4u * (i & 1u))) & 0xfu;
+                acc += qr[i] * p.data[pc.cent_off + v];
+            }
+        } else {
+            uint bitpos = 0u;
+            for (uint i = 0u; i < hd; ++i) {
+                uint byte = bitpos >> 3u;
+                uint off = bitpos & 7u;
+                uint v = (kc.data[base + (byte >> 2u)] >> (8u * (byte & 3u) + off)) & mask;
+                if (off + bits > 8u) {
+                    uint byte2 = byte + 1u;
+                    uint hi = (kc.data[base + (byte2 >> 2u)] >> (8u * (byte2 & 3u)))
+                        & ((1u << (off + bits - 8u)) - 1u);
+                    v |= hi << (8u - off);
+                }
+                acc += qr[i] * p.data[pc.cent_off + v];
+                bitpos += bits;
+            }
         }
         float nrm = uintBitsToFloat(kc.data[base + pc.pwords]);
         scores.data[h * pc.n_pos + pos] = acc * nrm * scale;
