@@ -451,3 +451,31 @@ drafts over 28 rounds = 2.7%**, spec 2.61 s/tok vs plain 2.20 s/tok. So the
 shared-ternary sidecar did not change acceptance and spec decode is still a net
 loss at this rate. Unchanged from the prior ~4-12% band; the numeric-reference
 work in "Next steps" is still the blocker.
+
+### Acceptance bisect round 2 (2026-09-13): build and convention knobs exhausted
+
+All on `bonsai-spec`, target PQ2_0, code prompt, greedy, n_draft 4 (all
+greedy-IDENTICAL to plain):
+
+| arm | accepted | rate |
+| --- | --- | --- |
+| shared sidecar (default) | 3/112 | 2.7% |
+| ternary sidecar | 3/112 | 2.7% |
+| original Q4_1 sidecar | - | does not load (`slice_at ... past mmap end`) |
+| `BONSAI_DSPARK_NONCAUSAL` | 5/104 | 4.8% |
+| `BONSAI_DSPARK_ROPE=neox64` | (no change) | ~3% |
+| `BONSAI_DSPARK_ROPE=imrope64` | (no change) | ~3% |
+| `BONSAI_DSPARK_ANCHOR_NPAST` (reference placement) | 4/108 | 3.7% |
+
+The reference (llama.cpp fork, `common/speculative.cpp`) places the anchor at
+`n_past` (`common_batch_add(..., n + i)`) and reads `i_draft_beg = 0` for
+anchor-first dspark; our port anchors at `n_past + 1`. Matching the reference
+placement does **not** move acceptance, so the position convention is not the
+cause.
+
+Conclusion: the drafter's next-token top-1 agrees with the target roughly 10%
+of the time (acceptance ~3-5%), and the fork reference is likewise low (~12.5%).
+No engine-side knob (sidecar precision/build, rope dims, causal mask, markov,
+anchor convention) moves it. Reaching ~75% requires a drafter that actually
+predicts this target, or a numeric draft-logit diff against the reference to
+find a remaining port bug if one exists.
