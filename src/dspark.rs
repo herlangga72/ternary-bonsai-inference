@@ -653,14 +653,17 @@ impl Dspark {
             }
             cache.filled = cache.filled.max(max_pos);
 
-            // non-causal attention over every filled position
+            // attention over the filled positions, causal like the reference
+            // (`build_attn_inp_kq_mask` with hparams.causal_attn = true):
+            // query at position p attends to cache positions <= p.
             let kcache = &cache.k[il];
             let vcache = &cache.v[il];
-            let n_ctx_pos = cache.filled;
+            let noncausal = std::env::var("BONSAI_DSPARK_NONCAUSAL").is_ok();
             let scale = 1.0f32 / (hd as f32).sqrt();
             let mut attn = vec![0.0f32; n_tok * c.n_head * hd];
-            let mut scores = vec![0.0f32; n_ctx_pos];
+            let mut scores = vec![0.0f32; cache.filled];
             for t in 0..n_tok {
+                let n_ctx_pos = if noncausal { cache.filled } else { positions[t] + 1 };
                 for h in 0..c.n_head {
                     let hkv = h / group;
                     let qh = &q[t * c.n_head * hd + h * hd..t * c.n_head * hd + (h + 1) * hd];
