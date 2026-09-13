@@ -513,3 +513,20 @@ per-position diff needs both sides fed identical token ids; the aggregate
 numbers (reference 0.806%, port 2.7%) already establish that the drafter is the
 limit, and the port is not worse than the reference, so there is no evidence of
 a remaining port bug worth chasing.
+
+### Where 75% acceptance actually comes from (2026-09-13)
+
+DSpark is DeepSeek's published drafter family; published results are ~60-85%
+speedup / high accepted length, which requires a *trained* drafter. Our sidecar
+behaves like an untrained or mismatched checkpoint: its own reference scores
+0.806% and our port 2.7%, so no serving-side change reaches 75%.
+
+The route to ~75% is therefore to train a DSpark drafter for this target, not to
+tune the engine. Public tooling exists:
+- SpecForge (SGLang) — trains EAGLE3 / DFlash / DSpark / Domino drafters.
+- DeepSpec (deepseek-ai) — data prep, draft model implementations, training.
+- NeMo AutoModel — DSpark recipe, 2-GPU FSDP2.
+
+Requirements: an existing trained dspark checkpoint matched to
+Ternary-Bonsai-27B, or GPUs + data to train one. Neither is available on this
+4-core APU box, so this is blocked here and out of scope for the engine port.
