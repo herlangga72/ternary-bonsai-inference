@@ -39,6 +39,8 @@ impl Drafter {
     pub fn new(dspark_path: &str, n_ctx: usize, p_min: f32) -> Result<Drafter, String> {
         let ds = Dspark::open(dspark_path)?;
         let taps_want = ds.cfg.target_layers.clone();
+        // the draft cache only needs the sidecar's trained context length
+        let n_ctx = n_ctx.min(ds.cfg.context_length);
         let dcache = DraftCache::new(&ds.cfg, n_ctx);
         Ok(Drafter {
             ds,

@@ -35,6 +35,7 @@ pub struct DsparkCfg {
     pub eps: f32,
     pub rope_freq_base: f32,
     pub block_size: usize,
+    pub context_length: usize,
     pub mask_token_id: u32,
     pub target_layers: Vec<u32>,
     pub markov_rank: usize,
@@ -97,6 +98,7 @@ impl DsparkCfg {
             eps: f32v("dspark.attention.layer_norm_rms_epsilon")?,
             rope_freq_base: f32v("dspark.rope.freq_base")?,
             block_size: u32v("dspark.dspark.block_size")? as usize,
+            context_length: u32v("dspark.context_length")? as usize,
             mask_token_id: u32v("dspark.dspark.mask_token_id")?,
             target_layers,
             markov_rank: u32v("dspark.dspark.markov_rank")? as usize,
@@ -481,6 +483,40 @@ impl Dspark {
         Ok(y)
     }
 
+    /// `y[t] = W @ x[t]` for all `n_tok` rows of `xmat`. PQ2_0 uses the
+    /// N-column GEMM (each weight row fetched once); other types fall back to
+    /// per-token matvecs.
+    pub fn matvec_multi(
+        &self,
+        name: &str,
+        xmat: &[f32],
+        n_tok: usize,
+        y: &mut [f32],
+    ) -> Result<(), String> {
+        let t = self.tensor(name)?;
+        let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+        let rows = (t.n_elem() as usize) / ne0.max(1);
+        if xmat.len() != n_tok * ne0 || y.len() < n_tok * rows {
+            return Err(format!("matvec_multi {name}: shape mismatch"));
+        }
+        let payload = self.gguf.payload_slice(t)?;
+        if t.ty == TYPE_PQ2_0 {
+            return kernels::pq2_matmul_n(payload, ne0, 0, rows, xmat, n_tok, y);
+        }
+        for tok in 0..n_tok {
+            matvec_par(
+                t.ty,
+                payload,
+                ne0,
+                0,
+                rows,
+                &xmat[tok * ne0..(tok + 1) * ne0],
+                &mut y[tok * rows..(tok + 1) * rows],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Project committed target features into the draft KV cache.
     /// `inp_g` is `[n_tok, n_embd]` from `encode`, `positions[i]` the absolute
     /// position of token `i`. Mirrors the reference's "embd batch" decoder pass.
@@ -574,6 +610,10 @@ impl Dspark {
         n_past: usize,
     ) -> Result<DraftBlock, String> {
         let anchorless = std::env::var("BONSAI_DSPARK_ANCHORLESS").is_ok();
+        let timeit = std::env::var("BONSAI_DSPARK_TIME").is_ok();
+        let mut t_layers = 0.0f64;
+        let mut t_head = 0.0f64;
+        let mut t_markov = 0.0f64;
         let c = &self.cfg;
         let n_tok = c.block_size + if anchorless { 1 } else { 0 };
         let ne = c.n_embd;
@@ -601,6 +641,7 @@ impl Dspark {
             return Err(format!("dspark: block end {max_pos} > ctx {}", cache.n_ctx));
         }
 
+        let t_lay = std::time::Instant::now();
         for il in 0..c.n_layer {
             let an = self.cached_f32(&format!("blk.{il}.attn_norm.weight"))?;
             let qn = self.cached_f32(&format!("blk.{il}.attn_q_norm.weight"))?;
@@ -729,6 +770,8 @@ impl Dspark {
             }
         }
 
+        t_layers += t_lay.elapsed().as_secs_f64();
+        let t_hd = std::time::Instant::now();
         // --- final norm + LM head ----------------------------------------
         let on = self.cached_f32("output_norm.weight")?;
         let mut emb = vec![0.0f32; n_tok * ne];
@@ -736,6 +779,9 @@ impl Dspark {
         for t in 0..n_tok {
             emb[t * ne..(t + 1) * ne]
                 .copy_from_slice(&kernels::rms_norm(&x[t * ne..(t + 1) * ne], &on, c.eps));
+            // per-position matvec: the PQ2_0 path is threaded row-wise and beats
+            // the batched GEMM here because the block is compute-bound (the
+            // batched form is the right call on bandwidth-bound hardware).
             self.matvec_range(
                 "output.weight",
                 0,
@@ -745,6 +791,8 @@ impl Dspark {
             )?;
         }
 
+        t_head += t_hd.elapsed().as_secs_f64();
+        let t_mk = std::time::Instant::now();
         // --- markov + confidence heads -----------------------------------
         let mw1 = self.tensor("dspark.markov_head_a.weight")?;
         let mw1_ne0 = mw1.dims.first().copied().unwrap_or(0) as usize;
@@ -792,6 +840,13 @@ impl Dspark {
             prev = best as u64;
         }
 
+        t_markov += t_mk.elapsed().as_secs_f64();
+        if timeit {
+            eprintln!(
+                "[dspark] layers {:.3}s  head {:.3}s  markov {:.3}s",
+                t_layers, t_head, t_markov
+            );
+        }
         Ok(DraftBlock {
             logits,
             conf: conf_out,

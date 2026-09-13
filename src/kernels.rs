@@ -349,15 +349,16 @@ pub fn pq2_matmul_n(
     }
 
     let base = base_row as usize;
+    #[cfg(target_arch = "x86_64")]
+    let use_simd = std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+        && ne0 % PQ2_QK == 0;
     let row_dot = |r: usize, t: usize| -> f32 {
         let raw = &payload[(base + r) * row_bytes..(base + r + 1) * row_bytes];
         let xr = &x[t * ne0..(t + 1) * ne0];
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2")
-                && std::arch::is_x86_feature_detected!("fma")
-                && ne0 % PQ2_QK == 0
-            {
+            if use_simd {
                 return unsafe { row_dot_avx2(raw, ne0, xr) };
             }
         }
