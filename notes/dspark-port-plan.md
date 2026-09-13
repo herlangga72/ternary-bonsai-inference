@@ -479,3 +479,23 @@ No engine-side knob (sidecar precision/build, rope dims, causal mask, markov,
 anchor convention) moves it. Reaching ~75% requires a drafter that actually
 predicts this target, or a numeric draft-logit diff against the reference to
 find a remaining port bug if one exists.
+
+### Reference acceptance measured (2026-09-13, decisive)
+
+Rebuilt the patched fork (`cmake --build build --target llama-speculative`; the
+old binary predated the warmup patch and dumped core). It now runs:
+
+```
+./build/bin/llama-speculative -m Ternary-Bonsai-27B-PQ2_0.gguf \
+  -md Ternary-Bonsai-27B-dspark-dflash.gguf --spec-type draft-dspark \
+  --spec-draft-n-max 4 -p "Write a Rust function..." -n 32 --temp 0
+n_drafted = 124   n_accept = 1   accept = 0.806%
+```
+
+**The reference is 0.8%, our port is 2.7%.** Our engine already accepts more
+draft tokens than the reference implementation with the same sidecar and
+prompt. So the low acceptance is a property of the shipped drafter, not a port
+bug: there is no engine-side change that reaches 75%, because the drafter's own
+reference cannot. Reaching ~75% requires a drafter that actually predicts this
+target (retrain/fine-tune or a matched checkpoint), which is outside "how we
+build the drafter" in this engine.
