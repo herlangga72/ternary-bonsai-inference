@@ -159,3 +159,54 @@ and needs no fork.
 Remaining: multi-token target verify forward + GDN/conv/attn rollback, the
 `BONSAI_DSPARK` driver, then optimization (the draft block's 7 s is dominated by
 the scalar Q4_1 row-dot).
+
+## End-to-end result (2026-09-13)
+
+`bonsai-spec <target> <sidecar> <tokens> [n] [k]` runs the whole loop against a
+fresh greedy decoder:
+
+```
+prefill 8 tokens in 15.1s
+spec : [271, 248068, 198, 8160, 579, 264]
+plain: [271, 248068, 198, 8160, 579, 264]
+IDENTICAL (6 tokens compared)  accepted 1/16 drafts over 4 rounds
+spec 24.6s (4.09 s/tok, 6 forwards)  plain 7.8s (1.30 s/tok)
+```
+
+So the loop is **correct** (speculative output == plain greedy; the token 248068
+is the same id the prefill plan's qa prompt produced). It is currently 3x
+*slower*, for two independent reasons:
+
+1. **Low acceptance: 1 of 16 drafts.** The draft graph is shape-correct and
+   finite but is clearly not producing the reference distribution. Debugging
+   this needs a numeric reference (fork draft logits), which the fork currently
+   cannot provide (below).
+2. **Slow draft: ~7 s/block**, dominated by the scalar Q4_1 row-dot. The block
+   weights are 42 x 5120x5120; an optimized Q4_1 kernel is needed.
+
+And one fundamental caveat, measured this session: the PQ2_0 kernel is
+**compute-bound**, not weight-bandwidth bound, on this CPU. `bonsai-matbench`
+shows the N-column GEMM costs the same per token as the single-token matvec
+(~24-30 GMAC/s 4-thread), so batching the verify pass buys no kernel throughput
+here. Speculative decoding only wins where the extra verify positions are cheap
+relative to the weight stream - i.e. the RX 7600, not this box.
+
+## Fork reference status
+
+Still blocked: `llama-cli`/`llama-speculative` from `build-static` spin at ~100%
+CPU for 9+ minutes loading the 7 GB target (and the earlier dspark run segfaulted
+after ~45 s) and never reach generation, so no reference logits can be captured
+from it on this machine. The converter and the greedy-identity oracle do not
+depend on it.
+
+## Next steps
+
+1. Draft acceptance: build a fork-independent reference, or bisect the draft
+   graph (taps choice, rope dims/type, non-causal vs causal attention, log-SNR
+   convention, markov `prev` seeding) against a debug dump of the target's own
+   next-token distribution.
+2. Draft speed: an AVX2 Q4_1 row kernel (mirror `row_dot_avx2`) to get the block
+   under ~1 s.
+3. Batched verify: implement `pq2_matmul_n` into the target layer functions so
+   the verify reads weights once; keep the streaming path as the correctness
+   oracle. Only worth measuring on bandwidth-bound hardware.
