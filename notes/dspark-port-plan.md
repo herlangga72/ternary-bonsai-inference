@@ -348,6 +348,18 @@ compute-bound, ~0.75 s per block either way - but it is the change that matters
 on bandwidth-bound hardware, and the logits are bit-identical either way.
 
 The remaining lever in the same direction is the *target* verify: it still
-forwards one token at a time, so the 6.8 GB weight stream is read once per
-draft token. `pq2_matmul_n` is ready for that; it needs the target's layer
-functions to take an N-wide activation tile.
+forwards one token per draft token, so the 6.8 GB target weight stream is read
+once per drafted token. The primitive is in place
+(`kernels::pq2_matmul_n`, wrapped as `Weights::matvec_batch_into`); what is left
+is a `Decoder::verify_batch(tokens, start_pos)` that
+
+1. runs the N-wide projections (`wq/wk/wv/wo`, FFN) through `matvec_batch_into`,
+2. keeps the per-token pieces per token: per-head RMSNorm + rope, the causal
+   attention over the KV cache, and the GDN recurrence (order-dependent),
+3. returns per-position logits and leaves the caches at the accepted prefix.
+
+It is deliberately not built yet: the `pq2_matmul_n` benchmark shows the per-token
+cost is flat on this CPU (compute-bound), so it cannot pay here, and it would
+touch the target path that every other bin depends on. Validate it by asserting
+batched logits equal N sequential `forward_hidden` calls. Do it first when the
+RX 7600 arrives.

@@ -431,6 +431,51 @@ impl Weights {
         kernels::pq2_matvec_range(&payload, ne0, base_row as u64, n_rows, x, y)
     }
 
+    /// `y[t] = W[base_row..][..n_rows] @ xmat[t]` for all `n_tok` activation
+    /// rows: one weight pass for the whole batch. This is the primitive a
+    /// batched target verify (or prefill) needs; the single-token path is
+    /// `matvec_into`.
+    pub fn matvec_batch_into(
+        &mut self,
+        t: &TensorInfo,
+        base_row: usize,
+        n_rows: usize,
+        xmat: &[f32],
+        n_tok: usize,
+        y: &mut [f32],
+    ) -> Result<(), String> {
+        let t_name = t.name.clone();
+        if t.ty != TYPE_PQ2_0 {
+            return Err(format!(
+                "Weights: batched matvec on '{t_name}': tensor type {} is not PQ2_0",
+                t.ty
+            ));
+        }
+        let ne0 = t.dims[0] as usize;
+        if xmat.len() != n_tok * ne0 {
+            return Err(format!(
+                "Weights: batched matvec {t_name}: x length {} != n_tok {n_tok} * ne0 {ne0}",
+                xmat.len()
+            ));
+        }
+        let total_rows = kernels::n_rows(t) as usize;
+        if base_row + n_rows > total_rows || y.len() < n_tok * n_rows {
+            return Err(format!(
+                "Weights: batched matvec {t_name}: range/shape out of bounds"
+            ));
+        }
+        let payload = self.gguf.payload_slice(t)?;
+        kernels::pq2_matmul_n(
+            &payload,
+            ne0,
+            base_row as u64,
+            n_rows,
+            xmat,
+            n_tok,
+            y,
+        )
+    }
+
     /// Name-based `matvec_into`: fetch, validate, and run a row slice.
     pub fn matvec_named_into(
         &mut self,
