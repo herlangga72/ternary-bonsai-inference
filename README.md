@@ -206,16 +206,19 @@ only, i.e. exactly the surface an agent uses.
 
 Behaviour worth knowing:
 
-- **Reasoning is stripped.** The model emits a `<think>...</think>` block even
-  without being asked; the server removes it so `content` is just the answer.
-  `--keep-think` disables that, `--think` adds the `<think>` scaffold for a long
-  reasoning trace.
+- **Reasoning** is returned separately: the model's `<think>...</think>` block
+  goes to `message.reasoning_content` (streamed as `delta.reasoning_content`)
+  and the answer to `content`. `--keep-think` inlines it in `content` instead,
+  `--think` adds the `<think>` scaffold for a long trace.
+- **Tool calling** follows the model's own `tokenizer.chat_template`: `tools`
+  are rendered into the system preamble, and a call comes back as
+  `message.tool_calls` with `finish_reason: "tool_calls"` (streamed as
+  `delta.tool_calls`). Send results back as `{"role":"tool","tool_call_id":...}`
+  messages. `tool_choice: "none"` suppresses the definitions.
 - **Requests are serialized.** The engine is single-stream: one generation at a
   time behind a mutex, and each request rebuilds the context from scratch (no
   prompt cache across turns yet), so a long agent conversation costs a full
   prefill per turn.
-- **No function/tool calling.** `tools` in the request is ignored; the model
-  answers in plain text.
 - **It is slow on this box** (~1 s/token). Use `stream: true` so an agent shows
   tokens as they come, and `BONSAI_DSPARK=<sidecar.gguf>` to enable speculative
   greedy decoding.

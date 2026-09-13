@@ -413,3 +413,32 @@ The weights are at the PQ2_0 floor (2.125 bits/weight). A true ternary packing
 kernel, and a base-3 decode would likely be slower. The draft KV cache (50 MiB
 f16) could go to int8 for another 25 MiB; both are marginal next to the 602 MiB
 of weights.
+
+## Throughput projection on a P100 / RX 7600 (2026-09-13)
+
+Decode reads the weights once per token: 7.14 GB of PQ2_0 payload, plus ~0.27 GB
+of KV (4096 ctx, f32) and ~0.15 GB of GDN recurrent state, so ~7.6 GB/token.
+Both cards are memory-bound for this shape:
+
+| | bandwidth | one pass (7.6 GB) | at 100% | at 60-75% (realistic) |
+| --- | --- | --- | --- | --- |
+| Tesla P100 16 GB (HBM2) | 732 GB/s | 10.4 ms | 96 tok/s | 58-72 tok/s |
+| RX 7600 (GDDR6, 128-bit) | 288 GB/s | 26.4 ms | 38 tok/s | 23-29 tok/s |
+
+Compute is not the limit on either: 13.45 GMAC/token is 2.9 ms on the P100's
+9.3 TFLOPS fp32 and 1.24 ms on the 7600's 21.7 TFLOPS, both far under the memory
+time. (The current CPU is the opposite - ~28 GMAC/s - which is why it is stuck
+near 1 s/token.)
+
+Speculative decoding changes the arithmetic: with the 602 MiB draft the per-round
+traffic is ~8.2 GB for A accepted tokens instead of 7.6 GB for one, so it pays
+from A > 1.1. At the ~12% acceptance measured here it is a loss; at 3 accepted
+of 4 it is ~2.2x.
+
+Caveats: the repo has no CUDA backend, so the P100 route is either the Vulkan
+engine (vendor-neutral ash; NVIDIA's Vulkan driver covers Pascal, and 7.16 GB
+uploads once over PCIe) or llama.cpp's CUDA backend. The 7600 fits 7.16 GB of
+weights in 8 GB only with a small KV/workspace. And these are bandwidth
+arithmetic, not measurements: the gfx902 iGPU currently reaches ~5 GB/s of its
+18 GB/s shared bus because the single-submit engine is launch-bound, so hitting
+60-75% of peak needs the batched/fused path.
