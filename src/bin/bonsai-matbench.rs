@@ -116,4 +116,23 @@ fn main() {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
     );
     println!("kernel {n_threads}-thread: {best:.3}s -> {:.2} GMAC/s", gmac(best));
+
+    // ---- N-column GEMM: weight read once for N tokens ----
+    let one_tok = best;
+    for n_tok in [1usize, 2, 4, 8] {
+        let xs = rand_floats(7 + n_tok as u64, n_tok * ne0);
+        let mut ys = vec![0.0f32; n_tok * n_rows as usize];
+        let mut best = f64::INFINITY;
+        for _ in 0..reps {
+            let t0 = Instant::now();
+            kernels::pq2_matmul_n(&data, ne0, 0, n_rows as usize, &xs, n_tok, &mut ys).unwrap();
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        let per_tok = best / n_tok as f64;
+        println!(
+            "gemm n_tok={n_tok}: {best:.3}s ({per_tok:.3}s/token, {:.2} GMAC/s)  vs {:.2}x per-token matvec",
+            gmac(best),
+            one_tok / per_tok
+        );
+    }
 }

@@ -312,6 +312,97 @@ pub fn pq2_matvec_range(
     Ok(())
 }
 
+/// N-column PQ2_0 GEMM: `Y[t][r] = sum_j X[t][j] * W[base_row + r][j]`.
+///
+/// `x` is row-major `[n_tok, ne0]`, `y` row-major `[n_tok, n_rows]`. Each weight
+/// row is fetched and decoded once and reused for all `n_tok` activations, so
+/// the weight stream is read once per pass instead of once per token - the
+/// primitive that makes batched target verification (and prefill) worth doing.
+/// An `n_tok` of 1 is identical to `pq2_matvec_range`.
+pub fn pq2_matmul_n(
+    payload: &[u8],
+    ne0: usize,
+    base_row: u64,
+    n_rows: usize,
+    x: &[f32],
+    n_tok: usize,
+    y: &mut [f32],
+) -> Result<(), String> {
+    if x.len() != n_tok * ne0 {
+        return Err(format!(
+            "pq2_matmul_n: x length {} != n_tok {n_tok} * ne0 {ne0}",
+            x.len()
+        ));
+    }
+    if y.len() < n_tok * n_rows {
+        return Err("pq2_matmul_n: y too small".into());
+    }
+    let row_bytes = pq2_row_bytes(ne0);
+    let need = (base_row as usize + n_rows)
+        .checked_mul(row_bytes)
+        .ok_or("pq2_matmul_n: overflow")?;
+    if need > payload.len() {
+        return Err("pq2_matmul_n: row range exceeds payload".into());
+    }
+    if n_tok == 1 {
+        return pq2_matvec_range(payload, ne0, base_row, n_rows, x, &mut y[..n_rows]);
+    }
+
+    let base = base_row as usize;
+    let row_dot = |r: usize, t: usize| -> f32 {
+        let raw = &payload[(base + r) * row_bytes..(base + r + 1) * row_bytes];
+        let xr = &x[t * ne0..(t + 1) * ne0];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+                && ne0 % PQ2_QK == 0
+            {
+                return unsafe { row_dot_avx2(raw, ne0, xr) };
+            }
+        }
+        row_dot_scalar(raw, ne0, xr)
+    };
+
+    const MIN_PARALLEL_ROWS: usize = 1024;
+    let avail = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_cores = scaled_threads(avail);
+    if n_rows < MIN_PARALLEL_ROWS || n_cores <= 1 {
+        for k in 0..n_rows {
+            for t in 0..n_tok {
+                y[t * n_rows + k] = row_dot(k, t);
+            }
+        }
+        return Ok(());
+    }
+    let n_workers = n_cores.min(n_rows);
+    let chunk = n_rows.div_ceil(n_workers);
+    let ranges: Vec<std::ops::Range<usize>> = (0..n_workers)
+        .map(|w| {
+            let s = w * chunk;
+            s..(s + chunk).min(n_rows)
+        })
+        .collect();
+    // rows are disjoint per worker, so the strided writes into the token-major
+    // output never alias; the pointer is sent as usize because *mut is !Send.
+    let yp = y.as_mut_ptr() as usize;
+    std::thread::scope(|scope| {
+        for range in ranges {
+            let rd = &row_dot;
+            scope.spawn(move || {
+                let yp = yp as *mut f32;
+                for r in range {
+                    for t in 0..n_tok {
+                        let v = rd(r, t);
+                        unsafe { *yp.add(t * n_rows + r) = v };
+                    }
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
 /// Single-threaded variant of `pq2_matvec_range` using the production row
 /// kernel (AVX2 when available). Used by microbenchmarks so kernel throughput
 /// can be measured without thread-scheduling noise.
@@ -644,6 +735,45 @@ mod tests {
                 (scalar - simd).abs() / scale < 1e-4,
                 "row {r}: scalar {scalar} simd {simd}"
             );
+        }
+    }
+
+    #[test]
+    fn pq2_matmul_n_matches_per_token_matvec() {
+        let ne0 = 256usize;
+        let n_rows = 12usize;
+        let n_tok = 3usize;
+        let rb = pq2_row_bytes(ne0);
+        let mut seed = 0x1234_5678u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let mut payload = vec![0u8; n_rows * rb];
+        for r in 0..n_rows {
+            for blk in 0..ne0 / PQ2_QK {
+                let base = r * rb + blk * PQ2_BLOCK;
+                let h = crate::gguf::f32_to_half(((next() % 500) as f32) / 250.0 + 0.01);
+                payload[base] = (h & 0xff) as u8;
+                payload[base + 1] = (h >> 8) as u8;
+                for k in 0..32 {
+                    payload[base + 2 + k] = (next() % 256) as u8;
+                }
+            }
+        }
+        let x: Vec<f32> = (0..n_tok * ne0)
+            .map(|_| ((next() % 2001) as f32 - 1000.0) / 500.0)
+            .collect();
+        let mut y_n = vec![0.0f32; n_tok * n_rows];
+        pq2_matmul_n(&payload, ne0, 0, n_rows, &x, n_tok, &mut y_n).unwrap();
+        for t in 0..n_tok {
+            let mut y1 = vec![0.0f32; n_rows];
+            pq2_matvec_range(&payload, ne0, 0, n_rows, &x[t * ne0..(t + 1) * ne0], &mut y1).unwrap();
+            for r in 0..n_rows {
+                assert_eq!(y_n[t * n_rows + r], y1[r], "t {t} row {r}");
+            }
         }
     }
 }
