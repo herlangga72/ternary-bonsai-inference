@@ -162,21 +162,15 @@ impl GGUF {
         self.meta.get(key)
     }
 
+    /// Whole-file read-only mapping (payloads live at `data_start + offset`).
+    pub fn file_bytes(&self) -> &[u8] {
+        &self.map
+    }
+
     /// Number of bytes occupied by `info` in the data section, per llama.cpp
     /// block-size rules (rows padded to the quant block size).
     pub fn tensor_nbytes(&self, info: &TensorInfo) -> u64 {
-        let (blk, type_size) = match info.ty {
-            TYPE_F32 => (1u64, 4u64),
-            TYPE_F16 => (1u64, 2u64),
-            TYPE_BF16 => (1u64, 2u64),
-            TYPE_Q4_1 => (32u64, 20u64),   // 2x fp16 + 16 nibbles
-            TYPE_PQ2_0 => (128u64, 34u64),  // fp16 + 32 bytes of 2-bit codes
-            TYPE_TQ1_0 => (256u64, 54u64),  // fp16 + trit packing
-            _ => (1u64, 4u64),
-        };
-        let ne = info.n_elem();
-        let nblocks = ne.div_ceil(blk);
-        nblocks * type_size
+        tensor_nbytes_for(info.ty, info.n_elem())
     }
 
     /// Absolute file offset of a tensor's data. GGUF stores tensor offsets
@@ -334,6 +328,96 @@ impl GGUF {
 /// Round up to the GGUF alignment (32 bytes).
 pub fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) / a * a
+}
+
+/// Bytes one tensor occupies for its type, per llama.cpp's block rules.
+pub fn tensor_nbytes_for(ty: u32, n_elem: u64) -> u64 {
+    let (blk, type_size) = match ty {
+        TYPE_F32 => (1u64, 4u64),
+        TYPE_F16 => (1u64, 2u64),
+        TYPE_BF16 => (1u64, 2u64),
+        TYPE_Q4_1 => (32u64, 20u64),   // 2x fp16 + 16 nibbles
+        TYPE_PQ2_0 => (128u64, 34u64), // fp16 + 32 bytes of 2-bit codes
+        TYPE_TQ1_0 => (256u64, 54u64), // fp16 + trit packing
+        _ => (1u64, 4u64),
+    };
+    n_elem.div_ceil(blk) * type_size
+}
+
+/// Write a GGUF, streaming each tensor's payload from `payload(i, out)`.
+///
+/// Tensors are laid out contiguously in the given order (each padded to the
+/// 32-byte alignment), which is exactly what llama.cpp's `gguf_init_from_reader`
+/// requires: `offset == padded running sum` in index order.
+pub fn write_gguf<F>(
+    dst: &str,
+    version: u32,
+    meta: &[(String, Value)],
+    tensors: &[(String, Vec<u64>, u32)],
+    mut payload: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, &mut Vec<u8>) -> Result<(), String>,
+{
+    use std::io::Write;
+    let mut header = Vec::with_capacity(1 << 16);
+    header.extend_from_slice(b"GGUF");
+    header.extend_from_slice(&version.to_le_bytes());
+    header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    header.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+    for (k, v) in meta {
+        put_str(&mut header, k);
+        header.extend_from_slice(&gguf_value_type(v).to_le_bytes());
+        put_value(&mut header, v);
+    }
+
+    let mut offs = Vec::with_capacity(tensors.len());
+    let mut cursor = 0u64;
+    let mut info_len = 0u64;
+    for (name, dims, ty) in tensors {
+        offs.push(cursor);
+        let ne: u64 = dims.iter().product();
+        cursor += align_up(tensor_nbytes_for(*ty, ne), 32);
+        info_len += 8 + name.len() as u64 + 4 + 8 * dims.len() as u64 + 4 + 8;
+    }
+    let data_start = align_up(header.len() as u64 + info_len, 32);
+    for ((name, dims, ty), off) in tensors.iter().zip(&offs) {
+        put_str(&mut header, name);
+        header.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            header.extend_from_slice(&d.to_le_bytes());
+        }
+        header.extend_from_slice(&ty.to_le_bytes());
+        header.extend_from_slice(&off.to_le_bytes());
+    }
+    if (header.len() as u64) > data_start {
+        return Err("write_gguf: header exceeded computed data start".into());
+    }
+    header.resize(data_start as usize, 0);
+
+    let mut out = File::create(dst).map_err(|e| format!("create {dst}: {e}"))?;
+    out.write_all(&header).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    for i in 0..tensors.len() {
+        buf.clear();
+        payload(i, &mut buf)?;
+        let want = tensor_nbytes_for(tensors[i].2, tensors[i].1.iter().product());
+        if buf.len() as u64 != want {
+            return Err(format!(
+                "write_gguf: tensor '{}' payload {} != expected {}",
+                tensors[i].0,
+                buf.len(),
+                want
+            ));
+        }
+        out.seek(SeekFrom::Start(data_start + offs[i]))
+            .map_err(|e| e.to_string())?;
+        out.write_all(&buf).map_err(|e| e.to_string())?;
+    }
+    out.seek(SeekFrom::Start(data_start + cursor))
+        .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

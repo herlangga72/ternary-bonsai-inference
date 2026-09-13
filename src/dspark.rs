@@ -836,9 +836,153 @@ pub struct DraftBlock {
     pub emb: Vec<f32>,
 }
 
+/// Quantize one row (`len % 128 == 0`) to PQ2_0 blocks: fp16 scale + 32 code
+/// bytes per 128 weights. Codes are ternary {-1,0,1} * scale with the scale set
+/// to the block absmax (matching how the target model's weights are stored).
+pub fn quantize_pq2_0_row(x: &[f32], out: &mut Vec<u8>) {
+    debug_assert_eq!(x.len() % 128, 0);
+    for blk in x.chunks_exact(128) {
+        let absmax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = absmax;
+        let bytes_at = out.len();
+        out.extend_from_slice(&crate::gguf::f32_to_half(scale).to_le_bytes());
+        out.extend_from_slice(&[0u8; 32]);
+        if scale == 0.0 {
+            for b in &mut out[bytes_at + 2..bytes_at + 34] {
+                *b = 0x55; // all codes 1 -> value 0
+            }
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for j in 0..128 {
+            if j % 4 == 0 {
+                out[bytes_at + 2 + j / 4] = 0;
+            }
+            let q = (blk[j] * inv).round() as i32 + 1;
+            let code = q.clamp(0, 2) as u8; // ternary: use -1, 0, 1
+            out[bytes_at + 2 + j / 4] |= code << ((j % 4) * 2);
+        }
+    }
+}
+
+/// Requantize a sidecar's Q4_1 and BF16 matrices to PQ2_0 (ternary) and write
+/// the result as a new GGUF. This trades drafter fidelity for roughly half the
+/// bytes per draft pass, so the draft's memory traffic drops with it.
+///
+/// F32 norms and any tensor whose row width is not a multiple of 128 are kept
+/// verbatim. Returns `(converted, bytes_in, bytes_out)`.
+pub fn repack_ternary(src: &str, dst: &str) -> Result<(usize, u64, u64), String> {
+    use crate::gguf::{tensor_nbytes_for, write_gguf, TYPE_BF16, TYPE_PQ2_0, TYPE_Q4_1};
+    let g = GGUF::open(src)?;
+    let mut bytes_in = 0u64;
+    for t in &g.tensors {
+        bytes_in += g.tensor_nbytes(t);
+    }
+
+    // data order (the writer lays payloads out contiguously, and llama.cpp
+    // requires index order == data order)
+    let mut order: Vec<usize> = (0..g.tensors.len()).collect();
+    order.sort_by_key(|&i| g.tensors[i].offset);
+
+    struct Item {
+        name: String,
+        dims: Vec<u64>,
+        ty: u32,
+        src_ty: u32,
+        src_off: u64,
+        src_nbytes: u64,
+        ne0: usize,
+        rows: usize,
+    }
+    let mut items: Vec<Item> = Vec::with_capacity(order.len());
+    let mut converted = 0usize;
+    for &i in &order {
+        let t = &g.tensors[i];
+        let ne0 = t.dims.first().copied().unwrap_or(0) as usize;
+        let rows = (t.n_elem() as usize) / ne0.max(1);
+        let convertible = (t.ty == TYPE_Q4_1 || t.ty == TYPE_BF16)
+            && ne0 % 128 == 0
+            && ne0 > 0
+            && t.n_elem() as usize % 128 == 0;
+        let ty = if convertible { TYPE_PQ2_0 } else { t.ty };
+        if convertible {
+            converted += 1;
+        }
+        items.push(Item {
+            name: t.name.clone(),
+            dims: t.dims.clone(),
+            ty,
+            src_ty: t.ty,
+            src_off: g.data_start + t.offset,
+            src_nbytes: g.tensor_nbytes(t),
+            ne0,
+            rows,
+        });
+    }
+
+    let mut meta: Vec<(String, crate::gguf::Value)> =
+        g.meta.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    meta.sort_by(|a, b| a.0.cmp(&b.0));
+    let descs: Vec<(String, Vec<u64>, u32)> = items
+        .iter()
+        .map(|it| (it.name.clone(), it.dims.clone(), it.ty))
+        .collect();
+
+    let map = g.file_bytes();
+    let mut row_buf: Vec<f32> = Vec::new();
+    write_gguf(dst, g.version, &meta, &descs, |i, out| {
+        let it = &items[i];
+        if it.ty != TYPE_PQ2_0 || it.src_ty == TYPE_PQ2_0 {
+            // verbatim copy
+            let begin = it.src_off as usize;
+            let end = begin + it.src_nbytes as usize;
+            if end > map.len() {
+                return Err(format!("{}: source data out of range", it.name));
+            }
+            out.extend_from_slice(&map[begin..end]);
+            return Ok(());
+        }
+        row_buf.resize(it.ne0, 0.0);
+        let src_rb = row_bytes(it.src_ty, it.ne0);
+        for r in 0..it.rows {
+            let begin = it.src_off as usize + r * src_rb;
+            dequant_row(it.src_ty, &map[begin..begin + src_rb], it.ne0, &mut row_buf);
+            quantize_pq2_0_row(&row_buf, out);
+        }
+        Ok(())
+    })?;
+
+    let bytes_out: u64 = items
+        .iter()
+        .map(|it| tensor_nbytes_for(it.ty, it.dims.iter().product()))
+        .sum();
+    Ok((converted, bytes_in, bytes_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ternary_quantizer_roundtrips_within_scale() {
+        let x: Vec<f32> = (0..256)
+            .map(|i| ((i as f32) / 256.0) * 2.0 - 1.0 + (i % 7) as f32 * 0.01)
+            .collect();
+        let mut packed = Vec::new();
+        quantize_pq2_0_row(&x, &mut packed);
+        assert_eq!(packed.len(), 2 * 34);
+        let back = kernels::decode_pq2_0_row(&packed, 256);
+        // ternary with the block absmax as scale: error is bounded by 0.5*scale
+        for blk in 0..2 {
+            let absmax = x[blk * 128..(blk + 1) * 128]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()));
+            for j in 0..128 {
+                let e = (back[blk * 128 + j] - x[blk * 128 + j]).abs();
+                assert!(e <= 0.5 * absmax + 1e-5, "blk {blk} j {j}: err {e}");
+            }
+        }
+    }
 
     #[test]
     fn bf16_decode_roundtrip() {
