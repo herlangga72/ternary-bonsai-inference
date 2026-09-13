@@ -210,3 +210,18 @@ depend on it.
 3. Batched verify: implement `pq2_matmul_n` into the target layer functions so
    the verify reads weights once; keep the streaming path as the correctness
    oracle. Only worth measuring on bandwidth-bound hardware.
+
+### Draft-acceptance bisect (2026-09-13)
+
+Acceptance is ~1/24 on both a degenerate and a real prompt (qa), so it is not a
+prompt artifact. Ruled out by ablation (both still ~1/24 or, anchorless, 2/20):
+
+- `BONSAI_DSPARK_NO_MARKOV` (drop the markov bias): unchanged, so the markov head
+  and its `prev` chain are not the cause.
+- `BONSAI_DSPARK_ANCHORLESS` (5-token block, drafts read from position 1, i.e.
+  the bonus-anchor convention): 2/20 - marginal, not the cause.
+
+The suspected remaining causes, in order, are the taps semantics, the rope dims
+(`n_rot` may be < 128; the sidecar omits `rope.dimension_count`), and the
+strictly non-causal attention in the block. All three need a numeric reference
+(fork draft logits) to resolve, which this box cannot currently produce.
