@@ -1,7 +1,7 @@
 //! bonsai-server: OpenAI-compatible HTTP endpoint for the pure-Rust engine.
 //!
 //!   bonsai-server --model <target.gguf> [--host 127.0.0.1] [--port 8080]
-//!                 [--no-think] [--id <model-name>]
+//!                 [--think] [--keep-think] [--id <model-name>]
 //!
 //! Env: BONSAI_DSPARK=<sidecar.gguf> enables speculative greedy decoding,
 //! BONSAI_DSPARK_N=<n> the draft length. Nothing else is required.
@@ -44,6 +44,7 @@ struct Cli {
     host: String,
     port: u16,
     think: bool,
+    strip: bool,
     id: Option<String>,
 }
 
@@ -52,7 +53,8 @@ fn parse(args: &[String]) -> Result<Cli, String> {
         model: String::new(),
         host: "127.0.0.1".into(),
         port: 8080,
-        think: true,
+        think: false,
+        strip: true,
         id: None,
     };
     let mut i = 0;
@@ -65,7 +67,8 @@ fn parse(args: &[String]) -> Result<Cli, String> {
             "-m" | "--model" => c.model = need(&mut i, "--model")?,
             "--host" => c.host = need(&mut i, "--host")?,
             "--port" => c.port = need(&mut i, "--port")?.parse().map_err(|_| "--port must be an int")?,
-            "--no-think" => c.think = false,
+            "--think" => c.think = true,
+            "--keep-think" => c.strip = false,
             "--id" => c.id = Some(need(&mut i, "--id")?),
             "-h" | "--help" => {
                 println!(
@@ -73,7 +76,7 @@ fn parse(args: &[String]) -> Result<Cli, String> {
                      \n  --host <ip>     bind address (default 127.0.0.1)\n\
                      \x20 --port <n>      port (default 8080)\n\
                      \x20 --id <name>     model id reported to clients\n\
-                     \x20 --no-think      omit <think> from the chat prompt\n\
+                     \x20 --no-think      omit <think> from the chat prompt\n                     \x20 --keep-think    keep the <think>...</think> block in the reply\n\
                      \n  env BONSAI_DSPARK=<sidecar.gguf>  speculative greedy decode\n\
                      \x20     BONSAI_DSPARK_N=<n>            draft length (default 4)"
                 );
@@ -180,6 +183,7 @@ fn main() {
         stop,
         model_id: model_id.clone(),
         think: cli.think,
+        strip_think: cli.strip,
     };
 
     eprintln!("model: {model_id}  ({} layers)", engine.dec.cfg.n_layer);

@@ -169,6 +169,57 @@ recommend `--temp 0.5 --top-p 0.85 --top-k 20 --min-p 0`. On a 4-core Ryzen
 3200G a token takes ~1.1-1.4 s (AVX2 PQ2_0 dot, 4 threads), so start with
 `-n 1..4` and a short prompt.
 
+## OpenAI-compatible server (use it from an agent)
+
+`bonsai-server` exposes the pure-Rust engine over HTTP with the OpenAI wire
+format, so any agent that speaks **OpenAI** can talk to it:
+
+```sh
+./target/release/bonsai-server --model Ternary-Bonsai-27B-PQ2_0.gguf --port 8080
+```
+
+| endpoint | |
+| --- | --- |
+| `GET /v1/models` | model list |
+| `GET /health` | liveness |
+| `POST /v1/chat/completions` | chat, `stream: true` (SSE) or not |
+| `POST /v1/completions` | legacy text completion |
+
+```sh
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":16,"temperature":0}'
+# {"choices":[{"index":0,"message":{"role":"assistant","content":"Paris"},"finish_reason":"stop"}], ...}
+```
+
+Point an agent framework at it by setting the base URL (and any dummy key):
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+export OPENAI_API_KEY=local
+```
+
+In Python: `openai.OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")`;
+in Node's `openai` client the same (`baseURL`). `scripts/openai_smoke.py` checks
+`/v1/models`, a non-streaming and a streaming call with the standard library
+only, i.e. exactly the surface an agent uses.
+
+Behaviour worth knowing:
+
+- **Reasoning is stripped.** The model emits a `<think>...</think>` block even
+  without being asked; the server removes it so `content` is just the answer.
+  `--keep-think` disables that, `--think` adds the `<think>` scaffold for a long
+  reasoning trace.
+- **Requests are serialized.** The engine is single-stream: one generation at a
+  time behind a mutex, and each request rebuilds the context from scratch (no
+  prompt cache across turns yet), so a long agent conversation costs a full
+  prefill per turn.
+- **No function/tool calling.** `tools` in the request is ignored; the model
+  answers in plain text.
+- **It is slow on this box** (~1 s/token). Use `stream: true` so an agent shows
+  tokens as they come, and `BONSAI_DSPARK=<sidecar.gguf>` to enable speculative
+  greedy decoding.
+
 ## Performance expectations
 
 27B ternary weights stream from RAM every token. Measured on a 4-core Ryzen

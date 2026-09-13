@@ -30,6 +30,57 @@ pub struct Engine {
     pub model_id: String,
     /// emit `<think>` (qwen35 thinking mode) before the answer
     pub think: bool,
+    /// strip a leading `<think>...</think>` block from the reply so agents get
+    /// the answer (the model emits the block itself even without the scaffold)
+    pub strip_think: bool,
+}
+
+/// Removes a leading reasoning block from streamed text. Until `</think>` is
+/// seen the text is buffered; then the remainder flows (and is streamed live if
+/// enough of it is already buffered).
+struct ThinkFilter {
+    strip: bool,
+    seen_end: bool,
+    buf: String,
+}
+
+impl ThinkFilter {
+    fn new(strip: bool) -> ThinkFilter {
+        ThinkFilter { strip, seen_end: !strip, buf: String::new() }
+    }
+    fn feed(&mut self, text: &str) -> Option<String> {
+        if self.seen_end {
+            return Some(text.to_string());
+        }
+        self.buf.push_str(text);
+        if let Some(i) = self.buf.find("</think>") {
+            self.seen_end = true;
+            let rest = self.buf[i + "</think>".len()..].to_string();
+            self.buf.clear();
+            return Some(rest);
+        }
+        // Not (yet) a reasoning block: `think` off plus a model that does not
+        // prefix one. Once enough text has arrived without a leading <think we
+        // stream it rather than buffering the whole reply.
+        if self.buf.len() >= 8 && !self.buf.starts_with("<think") {
+            self.seen_end = true;
+            // keep a short prefix in case "</think>" straddles the boundary
+            return Some(std::mem::take(&mut self.buf));
+        }
+        if self.buf.len() > 8192 {
+            self.seen_end = true;
+            return Some(std::mem::take(&mut self.buf));
+        }
+        None
+    }
+    /// Whatever is left if the model never closed its reasoning block.
+    fn flush(&mut self) -> Option<String> {
+        if self.seen_end || self.buf.is_empty() {
+            return None;
+        }
+        self.seen_end = true;
+        Some(std::mem::take(&mut self.buf))
+    }
 }
 
 impl Engine {
@@ -448,7 +499,8 @@ fn run_completion(
         let model2 = model_id.clone();
         let mut buf: Vec<u8> = Vec::new();
         let mut pending_bytes: Vec<u8> = Vec::new();
-        let mut first = true;
+        let strip = e.strip_think;
+        let mut filt = ThinkFilter::new(strip);
         // Buffer pieces so multi-byte UTF-8 is not split across SSE frames.
         let res = e.generate(prompt, opts.max_tokens, &cfg, &mut |piece| {
             buf.extend_from_slice(piece);
@@ -463,6 +515,13 @@ fn run_completion(
             let text = String::from_utf8_lossy(&buf[..valid]).to_string();
             pending_bytes.extend_from_slice(&buf[..valid]);
             buf.drain(..valid);
+            let text = match filt.feed(&text) {
+                Some(t) => t,
+                None => return true,
+            };
+            if text.is_empty() {
+                return true;
+            }
             let delta = if chat {
                 format!(
                     "{{\"id\":\"{id2}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\
@@ -479,9 +538,29 @@ fn run_completion(
                     escape(&text)
                 )
             };
-            first = false;
             sse_chunk(stream, &delta)
         });
+        if let Some(tail) = filt.flush() {
+            if !tail.is_empty() {
+                let d = if chat {
+                    format!(
+                        "{{\"id\":\"{id2}\",\"object\":\"chat.completion.chunk\",\"created\":{created},\
+                         \"model\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}},\
+                         \"finish_reason\":null}}]}}",
+                        escape(&model2),
+                        escape(&tail)
+                    )
+                } else {
+                    format!(
+                        "{{\"id\":\"{id2}\",\"object\":\"text_completion\",\"created\":{created},\
+                         \"model\":\"{}\",\"choices\":[{{\"index\":0,\"text\":\"{}\",\"finish_reason\":null}}]}}",
+                        escape(&model2),
+                        escape(&tail)
+                    )
+                };
+                sse_chunk(stream, &d);
+            }
+        }
         let (pt, ct, finish) = res.unwrap_or((0, 0, "error".into()));
         let last = if chat {
             format!(
@@ -498,7 +577,6 @@ fn run_completion(
                 escape(&model2)
             )
         };
-        let _ = first;
         sse_chunk(stream, &last);
         sse_chunk(stream, "[DONE]");
         sse_end(stream);
@@ -513,7 +591,15 @@ fn run_completion(
     });
     let body = match res {
         Ok((pt, ct, finish)) => {
-            let content = String::from_utf8_lossy(&text).to_string();
+            let raw = String::from_utf8_lossy(&text).to_string();
+            let content = if e.strip_think {
+                match raw.find("</think>") {
+                    Some(i) => raw[i + "</think>".len()..].trim_start().to_string(),
+                    None => raw,
+                }
+            } else {
+                raw
+            };
             if chat {
                 format!(
                     "{{\"id\":\"{id}\",\"object\":\"chat.completion\",\"created\":{created},\
@@ -538,6 +624,34 @@ fn run_completion(
         Err(err) => err_json(&err),
     };
     respond_json(stream, "200 OK", &body);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn think_filter_strips_leading_reasoning() {
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(f.feed("<think>\nreasoning"), None);
+        assert_eq!(f.feed("\n</think>\nParis"), Some("\nParis".to_string()));
+        assert_eq!(f.feed(" is nice"), Some(" is nice".to_string()));
+    }
+
+    #[test]
+    fn think_filter_passes_plain_text() {
+        // no leading <think: stream it once a few bytes have arrived
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(f.feed("hello world"), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn think_filter_flushes_unclosed_block() {
+        let mut f = ThinkFilter::new(true);
+        assert_eq!(f.feed("<think>still thinking"), None);
+        assert_eq!(f.flush(), Some("<think>still thinking".to_string()));
+        assert_eq!(f.flush(), None);
+    }
 }
 
 /// Serve until the process is killed.
