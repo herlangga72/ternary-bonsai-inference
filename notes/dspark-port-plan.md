@@ -311,3 +311,25 @@ Draft-only peak RSS is now 575 MiB (was dominated by the 524 MiB fc spike).
 Still open for footprint: store the draft KV cache as f16 (halves the remaining
 ~100 MiB and its read traffic), and the same f16 option for the target's
 full-attention KV.
+
+### Follow-up: where the draft time goes (BONSAI_DSPARK_TIME)
+
+On the ternary sidecar a draft block splits as layers ~0.37 s, LM head ~0.34 s,
+markov ~0.03 s. That is 9.5 GMAC in ~0.75 s, i.e. ~13 GMAC/s against the 24-30
+GMAC/s the PQ2_0 kernel reaches on a large matvec, and the weights moved are
+under 1 GB in 0.75 s. **The draft is compute-bound, not bandwidth-bound**, so
+packing helps RAM and modestly helps time (through the smaller kernels), but
+batching the block positions through `pq2_matmul_n` measured a wash here and is
+kept only for bandwidth-bound hardware.
+
+Total draft footprint after this work:
+
+| | before | now |
+| --- | --- | --- |
+| sidecar payload | 1856 MiB | 924 MiB (ternary) |
+| draft KV cache (ctx 4096) | 201 MiB (ctx 8192) | 100 MiB |
+| transient f32 during encode | 524 MiB / token | 0 |
+| draft-only peak RSS (smoke) | - | 575 MiB |
+| draft block (warm) | 7.2 s (Q4_1, first cut) | ~0.5-0.8 s |
+
+Remaining footprint idea, not done: f16 draft/target KV caches.
