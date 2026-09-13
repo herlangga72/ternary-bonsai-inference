@@ -442,3 +442,12 @@ weights in 8 GB only with a small KV/workspace. And these are bandwidth
 arithmetic, not measurements: the gfx902 iGPU currently reaches ~5 GB/s of its
 18 GB/s shared bus because the single-submit engine is launch-bound, so hitting
 60-75% of peak needs the batched/fused path.
+
+### Acceptance re-measured (2026-09-13, shared sidecar)
+
+`bonsai-spec Ternary-Bonsai-27B-PQ2_0.gguf Ternary-Bonsai-27B-dspark-shared.gguf
+"text:Write a Rust function..." 32 4`: IDENTICAL (32 tokens), **accepted 3/112
+drafts over 28 rounds = 2.7%**, spec 2.61 s/tok vs plain 2.20 s/tok. So the
+shared-ternary sidecar did not change acceptance and spec decode is still a net
+loss at this rate. Unchanged from the prior ~4-12% band; the numeric-reference
+work in "Next steps" is still the blocker.
