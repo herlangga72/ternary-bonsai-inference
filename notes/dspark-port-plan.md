@@ -140,3 +140,22 @@ loader can read the sidecar's native names directly and skip the conversion.
   so a rejected suffix needs a snapshot restore (or recompute).
 - **Markov head is greedy in-graph** (`argmax` chain), matching the reference;
   sampling params affect only the final pick.
+
+## Implementation status (2026-09-13)
+
+| step | commit | what landed | verified |
+| --- | --- | --- | --- |
+| converter | `3271d5c` | `bonsai-gguf dspark-convert` + BF16 sizing in `tensor_nbytes` | converted sidecar passes `inspect` with `layout ok` |
+| draft loader/dequant/encoder | `10e1e93` | `src/dspark.rs` cfg, manifest check, F32/BF16/Q4_1/PQ2_0 dequant, threaded matvec, `encode` | all 79 tensors present, correct dims; `bonsai-dspark` smoke |
+| draft decoder | `67588aa` | NEOX rope, `DraftCache`+`inject`, log-SNR embed, `draft_block` (6 layers, non-causal attention, LM head, markov + confidence) | real draft block: finite logits, conf 0.76-0.99; ~7 s/block |
+| taps | `3835586` | `Decoder::forward_hidden_taps` captures layer-input residual at the tapped layers | builds, full test suite green |
+
+Fork reference (below) is blocked: `llama-cli`/`llama-speculative` on this box
+spins at ~100% CPU for 9+ min just loading the 7 GB target and never reaches
+generation, so no fork-side acceptance/logit numbers yet. The greedy
+`BONSAI_DSPARK` == `BONSAI_DSPARK=off` identity is the planned primary oracle
+and needs no fork.
+
+Remaining: multi-token target verify forward + GDN/conv/attn rollback, the
+`BONSAI_DSPARK` driver, then optimization (the draft block's 7 s is dominated by
+the scalar Q4_1 row-dot).
