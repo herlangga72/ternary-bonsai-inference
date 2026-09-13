@@ -155,8 +155,15 @@ fn main() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("greedy: rust {argmax} vs golden {greedy_golden} -> {}", if argmax as i32 == greedy_golden { "MATCH" } else { "DIFFER" });
-    println!("logits: max abs diff {max_abs:.4e} (rel {:.4e})", max_abs / scale);
-    if argmax as i32 != greedy_golden || max_abs / scale > 1e-2 {
+    // Default tolerance is the f32-engine band. Quantized-KV runs legitimately
+    // shift logits more (see notes/kv-rotorquant-plan.md); override with
+    // BONSAI_GOLDEN_TOL to gate those separately, but greedy must always match.
+    let tol: f32 = std::env::var("BONSAI_GOLDEN_TOL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1e-2);
+    println!("logits: max abs diff {max_abs:.4e} (rel {:.4e}, tol {tol:.1e})", max_abs / scale);
+    if argmax as i32 != greedy_golden || max_abs / scale > tol {
         eprintln!("GOLDEN VALIDATION FAILED");
         exit(1);
     }

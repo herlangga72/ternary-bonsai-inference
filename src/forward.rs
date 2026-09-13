@@ -29,8 +29,16 @@ use crate::weights::{Qwen35, Weights};
 /// out as `[kv_head 0 head vector][kv_head 1 head vector]...`.
 pub struct AttnCache {
     pub n_kv_elems: usize,
+    pub n_kv: usize,
+    pub hd: usize,
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
+    /// Some when the K cache is rotation-quantized (`BONSAI_KV=planar3|planar4`).
+    pub pq: Option<crate::kvquant::PlanarQuant>,
+    /// Packed rotated K indices: `n_pos` rows of `pq.packed_len()` bytes each.
+    pub kq: Vec<Vec<u8>>,
+    /// K norms: `n_pos * n_kv` floats per layer.
+    pub kn: Vec<Vec<f32>>,
 }
 
 impl AttnCache {
@@ -38,14 +46,23 @@ impl AttnCache {
         let n_kv_elems = cfg.n_head_kv * cfg.n_embd_head;
         AttnCache {
             n_kv_elems,
+            n_kv: cfg.n_head_kv,
+            hd: cfg.n_embd_head,
             k: vec![Vec::new(); cfg.n_layer],
             v: vec![Vec::new(); cfg.n_layer],
+            pq: crate::kvquant::from_env(cfg.n_embd_head),
+            kq: vec![Vec::new(); cfg.n_layer],
+            kn: vec![Vec::new(); cfg.n_layer],
         }
     }
 
     /// Number of cached tokens for one full-attention layer.
     pub fn n_pos(&self, il: usize) -> usize {
-        self.k[il].len() / self.n_kv_elems
+        if self.pq.is_some() {
+            self.kn[il].len() / self.n_kv
+        } else {
+            self.k[il].len() / self.n_kv_elems
+        }
     }
 
     /// Append the current token's k/v rows (each n_kv_elems floats, kv-head
@@ -54,6 +71,28 @@ impl AttnCache {
         debug_assert_eq!(krow.len(), self.n_kv_elems);
         debug_assert_eq!(vrow.len(), self.n_kv_elems);
         self.k[il].extend_from_slice(krow);
+        self.v[il].extend_from_slice(vrow);
+    }
+
+    /// Quantized append: store each kv head's k rotated + Lloyd-Max packed,
+    /// with the separate norm. V still goes through `append_v`.
+    pub fn append_k_quantized(&mut self, il: usize, krow: &[f32]) {
+        let (n_kv, hd) = (self.n_kv, self.hd);
+        debug_assert_eq!(krow.len(), n_kv * hd);
+        let pq = self.pq.as_ref().expect("quantized append without quantizer");
+        let plen = pq.packed_len();
+        let mut packed = vec![0u8; plen];
+        for kv in 0..n_kv {
+            let mut norm = 0.0f32;
+            pq.quantize(&krow[kv * hd..(kv + 1) * hd], &mut packed, &mut norm);
+            self.kq[il].extend_from_slice(&packed);
+            self.kn[il].push(norm);
+        }
+    }
+
+    /// Append a v row to the (still f32) V cache.
+    pub fn append_v(&mut self, il: usize, vrow: &[f32]) {
+        debug_assert_eq!(vrow.len(), self.n_kv_elems);
         self.v[il].extend_from_slice(vrow);
     }
 }
@@ -69,6 +108,8 @@ pub struct AttnScratch {
     pub probs: Vec<f32>,
     pub out: Vec<f32>,
     pub head_out: Vec<f32>,
+    /// Rotated query scratch (quantized-K path), sized to an even pair count.
+    pub qrot: Vec<f32>,
 }
 
 impl AttnScratch {
@@ -85,6 +126,7 @@ impl AttnScratch {
             probs: Vec::new(),
             out: vec![0.0; nh * hd],
             head_out: vec![0.0; hd],
+            qrot: vec![0.0; hd.div_ceil(2) * 2],
         }
     }
 }
@@ -173,7 +215,12 @@ pub fn full_attention_layer(
     }
 
     // ---- store in KV cache (token index == pos) ----------------------------
-    cache.append(il, &k, &s.vrow);
+    if cache.pq.is_some() {
+        cache.append_k_quantized(il, &k);
+        cache.append_v(il, &s.vrow);
+    } else {
+        cache.append(il, &k, &s.vrow);
+    }
     debug_assert_eq!(cache.n_pos(il), pos + 1);
 
     // ---- GQA attention ------------------------------------------------------
@@ -190,9 +237,24 @@ pub fn full_attention_layer(
         let qh = &q[hq * hd..(hq + 1) * hd];
         let kv = hq / n_rep; // grouped GQA, matches ggml mul_mat broadcast
         let kv_off = kv * hd;
-        for j in 0..n_pos {
-            let kj = &k_cache[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
-            s.scores[j] = dot(qh, kj) * scale;
+        if let Some(pq) = cache.pq.as_ref() {
+            // K is cached rotated; score = ||k_j|| * (R q) . centroids
+            let plen = pq.packed_len();
+            pq.rotate(qh, &mut s.qrot);
+            let kq = &cache.kq[il];
+            let kn = &cache.kn[il];
+            for j in 0..n_pos {
+                // n_kv packed head-rows per token
+                let r0 = (j * cache.n_kv + kv) * plen;
+                let row = &kq[r0..r0 + plen];
+                let norm = kn[j * cache.n_kv + kv];
+                s.scores[j] = pq.dot_rotated(&s.qrot, row, norm) * scale;
+            }
+        } else {
+            for j in 0..n_pos {
+                let kj = &k_cache[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
+                s.scores[j] = dot(qh, kj) * scale;
+            }
         }
         let probs = kernels::softmax_rows(&s.scores, n_pos)?;
         s.probs.copy_from_slice(&probs);

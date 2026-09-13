@@ -104,15 +104,11 @@ pub fn codebook(d: usize, bits: u32) -> &'static [f32] {
     static CB: OnceLock<Vec<((usize, u32), Vec<f32>)>> = OnceLock::new();
     let all = CB.get_or_init(|| {
         let sigma = 1.0 / (d as f64).sqrt();
-        vec![
-            ((d, 3), solve_lloyd_max(sigma, 3)),
-            ((d, 4), solve_lloyd_max(sigma, 4)),
-        ]
+        (1u32..=8).map(|b| ((d, b), solve_lloyd_max(sigma, b))).collect()
     });
-    let key = (d, if bits == 3 { 3 } else { 4 });
     &all
         .iter()
-        .find(|(k, _)| *k == key)
+        .find(|(k, _)| *k == (d, bits))
         .expect("codebook not precomputed for this (d, bits)")
         .1
 }
@@ -194,6 +190,7 @@ pub fn packed_bytes(n: usize, bits: u32) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Planar (2D Givens + Lloyd-Max) quantizer for one vector length.
+#[derive(Clone)]
 pub struct PlanarQuant {
     pub hd: usize,
     pub bits: u32,
@@ -204,7 +201,7 @@ pub struct PlanarQuant {
 
 impl PlanarQuant {
     pub fn new(hd: usize, bits: u32) -> PlanarQuant {
-        assert!(bits == 3 || bits == 4, "bits must be 3 or 4");
+        assert!((1..=8).contains(&bits), "bits must be 1..8");
         let n_groups = hd.div_ceil(2);
         PlanarQuant {
             hd,
@@ -312,10 +309,28 @@ impl PlanarQuant {
     }
 }
 
+/// KV quantization selected by `BONSAI_KV`:
+///   unset / `f32`  -> None (full-precision cache, the anchor)
+///   `planar4`/`iso4` -> 4-bit planar
+///   `planar3`/`iso3` -> 3-bit planar
+pub fn from_env(hd: usize) -> Option<PlanarQuant> {
+    let v = std::env::var("BONSAI_KV").ok()?;
+    let bits = match v.as_str() {
+        "f32" | "" => return None,
+        "planar3" | "iso3" => 3,
+        "planar4" | "iso4" => 4,
+        other => other
+            .strip_prefix("planar")
+            .or_else(|| other.strip_prefix("iso"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|b| (1..=8).contains(b))?,
+    };
+    Some(PlanarQuant::new(hd, bits))
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +439,28 @@ mod tests {
         let a = p.dot_rotated(&qrot, &packed, norm);
         let b: f32 = q.iter().zip(&khat).map(|(a, b)| a * b).sum();
         assert!((a - b).abs() < 1e-4, "dot {a} vs {b}");
+    }
+
+    #[test]
+    fn print_relative_error_per_bits() {
+        if std::env::var("KVQ_BITS_DIAG").is_err() { return; }
+        let mut next = rng(99);
+        for bits in 1..=8u32 {
+            let p = PlanarQuant::new(DEFAULT_HD, bits);
+            let mut worst = 0.0f32;
+            for _ in 0..32 {
+                let x: Vec<f32> = (0..p.hd).map(|_| next()).collect();
+                let xn: f32 = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let mut packed = vec![0u8; p.packed_len()];
+                let mut norm = 0.0;
+                p.quantize(&x, &mut packed, &mut norm);
+                let mut y = vec![0.0f32; p.hd];
+                p.dequantize(&packed, norm, &mut y);
+                let err: f32 = x.iter().zip(&y).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                worst = worst.max(err / xn.max(1e-9));
+            }
+            println!("KVQ_BITS_DIAG bits={bits} worst_rel_l2={worst:.6}");
+        }
     }
 
     #[test]
