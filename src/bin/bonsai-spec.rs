@@ -41,6 +41,15 @@ fn main() {
     let target = args[0].clone();
     let sidecar = args[1].clone();
     let prompt: Vec<u32> = if let Some(text) = args[2].strip_prefix("text:") {
+        // The drafter is trained on templated chat; an untemplated prompt is out
+        // of distribution and roughly halves acceptance. `BONSAI_SPEC_TEMPLATE=1`
+        // wraps the prompt in the qwen35 chat template (same as the golden
+        // harness) so acceptance is measured the way the engine runs.
+        let text = if std::env::var("BONSAI_SPEC_TEMPLATE").is_ok() {
+            format!("<|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        } else {
+            text.to_string()
+        };
         let gf = match gguf::GGUF::open(&target) {
             Ok(g) => g,
             Err(e) => {
@@ -56,7 +65,7 @@ fn main() {
             }
         };
         tokenizer::encode(
-            text,
+            &text,
             &vocab,
             &tokenizer::TokenizeOptions {
                 add_special: false,
