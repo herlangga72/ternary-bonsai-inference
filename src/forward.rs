@@ -33,26 +33,35 @@ pub struct AttnCache {
     pub hd: usize,
     pub k: Vec<Vec<f32>>,
     pub v: Vec<Vec<f32>>,
-    /// Some when the K cache is rotation-quantized (`BONSAI_KV=planar3|planar4`).
+    /// Some when the K cache is rotation-quantized (`BONSAI_KV=planarN[k]`).
     pub pq: Option<crate::kvquant::PlanarQuant>,
-    /// Packed rotated K indices: `n_pos` rows of `pq.packed_len()` bytes each.
+    /// Some when the V cache is rotation-quantized (symmetric mode).
+    pub pqv: Option<crate::kvquant::PlanarQuant>,
+    /// Packed rotated K indices: `n_pos * n_kv` rows of `pq.packed_len()` bytes.
     pub kq: Vec<Vec<u8>>,
     /// K norms: `n_pos * n_kv` floats per layer.
     pub kn: Vec<Vec<f32>>,
+    /// Packed rotated V indices and norms (symmetric mode).
+    pub vq: Vec<Vec<u8>>,
+    pub vn: Vec<Vec<f32>>,
 }
 
 impl AttnCache {
     pub fn new(cfg: &Qwen35) -> AttnCache {
         let n_kv_elems = cfg.n_head_kv * cfg.n_embd_head;
+        let (pq, pqv) = crate::kvquant::from_env(cfg.n_embd_head);
         AttnCache {
             n_kv_elems,
             n_kv: cfg.n_head_kv,
             hd: cfg.n_embd_head,
             k: vec![Vec::new(); cfg.n_layer],
             v: vec![Vec::new(); cfg.n_layer],
-            pq: crate::kvquant::from_env(cfg.n_embd_head),
+            pq,
+            pqv,
             kq: vec![Vec::new(); cfg.n_layer],
             kn: vec![Vec::new(); cfg.n_layer],
+            vq: vec![Vec::new(); cfg.n_layer],
+            vn: vec![Vec::new(); cfg.n_layer],
         }
     }
 
@@ -95,6 +104,20 @@ impl AttnCache {
         debug_assert_eq!(vrow.len(), self.n_kv_elems);
         self.v[il].extend_from_slice(vrow);
     }
+
+    /// Quantized V append (symmetric mode).
+    pub fn append_v_quantized(&mut self, il: usize, vrow: &[f32]) {
+        let (n_kv, hd) = (self.n_kv, self.hd);
+        let pqv = self.pqv.as_ref().expect("quantized V append without quantizer");
+        let plen = pqv.packed_len();
+        let mut packed = vec![0u8; plen];
+        for kv in 0..n_kv {
+            let mut norm = 0.0f32;
+            pqv.quantize(&vrow[kv * hd..(kv + 1) * hd], &mut packed, &mut norm);
+            self.vq[il].extend_from_slice(&packed);
+            self.vn[il].push(norm);
+        }
+    }
 }
 
 /// Scratch buffers reused across attention calls (avoids per-head allocs).
@@ -110,6 +133,9 @@ pub struct AttnScratch {
     pub head_out: Vec<f32>,
     /// Rotated query scratch (quantized-K path), sized to an even pair count.
     pub qrot: Vec<f32>,
+    /// V dequant scratch (quantized-V path).
+    pub vrot: Vec<f32>,
+    pub vidx: Vec<u8>,
 }
 
 impl AttnScratch {
@@ -125,8 +151,10 @@ impl AttnScratch {
             scores: Vec::new(),
             probs: Vec::new(),
             out: vec![0.0; nh * hd],
-            head_out: vec![0.0; hd],
+            head_out: vec![0.0; hd.div_ceil(2) * 2],
             qrot: vec![0.0; hd.div_ceil(2) * 2],
+            vrot: vec![0.0; hd.div_ceil(2) * 2],
+            vidx: vec![0u8; hd.div_ceil(2) * 2],
         }
     }
 }
@@ -217,7 +245,11 @@ pub fn full_attention_layer(
     // ---- store in KV cache (token index == pos) ----------------------------
     if cache.pq.is_some() {
         cache.append_k_quantized(il, &k);
-        cache.append_v(il, &s.vrow);
+        if cache.pqv.is_some() {
+            cache.append_v_quantized(il, &s.vrow);
+        } else {
+            cache.append_v(il, &s.vrow);
+        }
     } else {
         cache.append(il, &k, &s.vrow);
     }
@@ -260,17 +292,39 @@ pub fn full_attention_layer(
         s.probs.copy_from_slice(&probs);
 
         s.head_out.fill(0.0);
-        for j in 0..n_pos {
-            let pj = s.probs[j];
-            if pj == 0.0 {
-                continue;
+        if let Some(pqv) = cache.pqv.as_ref() {
+            // V is cached rotated; accumulate the weighted sum in rotated
+            // space (folding each position's norm) and inverse-rotate once.
+            let plen = pqv.packed_len();
+            let vq = &cache.vq[il];
+            let vn = &cache.vn[il];
+            for j in 0..n_pos {
+                let pj = s.probs[j];
+                if pj == 0.0 {
+                    continue;
+                }
+                let r0 = (j * cache.n_kv + kv) * plen;
+                let norm = vn[j * cache.n_kv + kv];
+                pqv.unpack_centroids_into(&vq[r0..r0 + plen], &mut s.vidx, &mut s.vrot);
+                let w = pj * norm;
+                for d in 0..hd {
+                    s.head_out[d] += w * s.vrot[d];
+                }
             }
-            let vj = &v_cache[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
-            for d in 0..hd {
-                s.head_out[d] += pj * vj[d];
+            pqv.rotate_inv_inplace(&mut s.head_out[..pqv.hd_padded]);
+        } else {
+            for j in 0..n_pos {
+                let pj = s.probs[j];
+                if pj == 0.0 {
+                    continue;
+                }
+                let vj = &v_cache[j * n_kv_elems + kv_off..j * n_kv_elems + kv_off + hd];
+                for d in 0..hd {
+                    s.head_out[d] += pj * vj[d];
+                }
             }
         }
-        s.out[hq * hd..(hq + 1) * hd].copy_from_slice(&s.head_out);
+        s.out[hq * hd..(hq + 1) * hd].copy_from_slice(&s.head_out[..hd]);
     }
 
     // ---- gate + output projection ------------------------------------------

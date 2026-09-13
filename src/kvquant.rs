@@ -294,6 +294,28 @@ impl PlanarQuant {
         }
     }
 
+    /// Unpack packed indices into centroid values, using caller scratch.
+    pub fn unpack_centroids_into(&self, packed: &[u8], idx: &mut [u8], out: &mut [f32]) {
+        let c = self.centroids();
+        unpack_bits(packed, self.bits, self.hd_padded, idx);
+        for i in 0..self.hd_padded {
+            out[i] = c[idx[i] as usize];
+        }
+    }
+
+    /// In-place inverse rotation. Safe because each output pair depends only on
+    /// the same input pair.
+    pub fn rotate_inv_inplace(&self, x: &mut [f32]) {
+        let t = givens_table(self.hd);
+        for i in 0..self.n_groups {
+            let (c, s) = t[i];
+            let a = x[2 * i];
+            let b = x[2 * i + 1];
+            x[2 * i] = c * a + s * b;
+            x[2 * i + 1] = -s * a + c * b;
+        }
+    }
+
     /// `dot(q_rotated, dequantized)_` where the cache holds rotated K.
     /// `q_rot` must already be forward-rotated with the same table; the result
     /// equals `q . k_original` up to quantization error.
@@ -309,23 +331,42 @@ impl PlanarQuant {
     }
 }
 
-/// KV quantization selected by `BONSAI_KV`:
-///   unset / `f32`  -> None (full-precision cache, the anchor)
-///   `planar4`/`iso4` -> 4-bit planar
-///   `planar3`/`iso3` -> 3-bit planar
-pub fn from_env(hd: usize) -> Option<PlanarQuant> {
-    let v = std::env::var("BONSAI_KV").ok()?;
-    let bits = match v.as_str() {
-        "f32" | "" => return None,
+/// KV quantization selected by `BONSAI_KV`, returning `(k_quant, v_quant)`:
+///   unset / `f32`     -> (None, None)   full-precision cache (the anchor)
+///   `planar3`/`iso3`  -> both K and V (symmetric)
+///   `planar4`/`iso4`  -> both K and V
+///   `planarNk`        -> K only, V stays f32 (asymmetric, lower risk)
+pub fn from_env(hd: usize) -> (Option<PlanarQuant>, Option<PlanarQuant>) {
+    let Ok(v) = std::env::var("BONSAI_KV") else {
+        return (None, None);
+    };
+    if v.is_empty() || v == "f32" {
+        return (None, None);
+    }
+    let (name, k_only) = match v.strip_suffix('k') {
+        Some(base) => (base, true),
+        None => (v.as_str(), false),
+    };
+    let bits = match name {
         "planar3" | "iso3" => 3,
         "planar4" | "iso4" => 4,
-        other => other
+        other => match other
             .strip_prefix("planar")
             .or_else(|| other.strip_prefix("iso"))
             .and_then(|s| s.parse::<u32>().ok())
-            .filter(|b| (1..=8).contains(b))?,
+            .filter(|b| (1..=8).contains(b))
+        {
+            Some(b) => b,
+            None => return (None, None),
+        },
     };
-    Some(PlanarQuant::new(hd, bits))
+    let k = PlanarQuant::new(hd, bits);
+    let vq = if k_only {
+        None
+    } else {
+        Some(PlanarQuant::new(hd, bits))
+    };
+    (Some(k), vq)
 }
 
 // ---------------------------------------------------------------------------

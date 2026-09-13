@@ -1,5 +1,43 @@
 # Plan: RotorQuant-style KV cache quantization
 
+> ## Status (2026-09-13): R0, R1, R2 done on CPU. R3 (GPU) NOT started.
+>
+> `src/kvquant.rs` implements the quantizer; `AttnCache`/`full_attention_layer`
+> use it. Selected with `BONSAI_KV=f32|planarN|planarNk` (N = 1..8; `planarNk`
+> = K only, V f32). Default is `f32`, so nothing changes unless asked.
+>
+> **Measured (qa prompt, 20 tokens; f32 baseline logit rel diff is 4.03e-3,
+> greedy 8160):**
+>
+> | config | logit rel diff | greedy |
+> | --- | --- | --- |
+> | f32 (baseline) | 4.03e-3 | MATCH |
+> | planar2k | 4.07e-2 | MATCH |
+> | planar3k | 3.13e-2 | MATCH |
+> | planar4k | 2.07e-2 | MATCH |
+> | planar6k | 1.63e-2 | MATCH |
+> | planar8k | 1.07e-2 | MATCH |
+> | planar4 (symmetric) | 4.14e-2 | MATCH |
+> | planar8 (symmetric) | 2.43e-2 | MATCH |
+>
+> Greedy matches at every bit width on both prompts. The quantizer is
+> textbook-exact: measured per-coordinate RMSE is 18.58% of sigma at 3-bit and
+> 9.25% at 4-bit against the theoretical 18.58% / 9.75%, halving per bit.
+>
+> **Conclusion that changes the plan:** 3-4 bit KV quantization perturbs this
+> model's logits by 2-4% (5-10x the f32 baseline error), and the error is
+> monotone in bits, so it is inherent, not a bug. On a 20-token prompt greedy
+> survives, but this is a real quality cost and the 10.3x headline should not
+> be treated as free. The defensible operating points are:
+>   - **f16 KV**: 2x saving, error ~1e-3 (not implemented; trivial).
+>   - **8-bit planar K-only**: ~4x on K, logit error 1.07e-2.
+>   - 3-4 bit: only if long-context memory forces it, and then measure PPL.
+>
+> R3 (GPU shaders) is worth doing only for a chosen operating point; at 3-4 bit
+> the quality tradeoff is significant enough that it should be a deliberate
+> decision first.
+
+
 Goal: replace the f32 KV cache with a rotated + Lloyd-Max scalar-quantized
 cache (PlanarQuant / IsoQuant family, from the RotorQuant work), so long
 context fits the 8 GB RX 7600 and KV bandwidth stops growing at 4 bytes per
