@@ -91,8 +91,21 @@ struct ThinkSplitter {
 }
 
 impl ThinkSplitter {
-    fn new(keep: bool) -> ThinkSplitter {
-        ThinkSplitter { buf: String::new(), phase: if keep { 2 } else { 0 }, keep }
+    /// `in_think` must be true when the prompt already opened the block (the
+    /// `--think` scaffold ends with `<think>\n`), so the reply starts as
+    /// reasoning with no tag of its own.
+    fn new(keep: bool, in_think: bool) -> ThinkSplitter {
+        ThinkSplitter {
+            buf: String::new(),
+            phase: if keep {
+                2
+            } else if in_think {
+                1
+            } else {
+                0
+            },
+            keep,
+        }
     }
 
     fn feed(&mut self, text: &str) -> (String, String) {
@@ -776,7 +789,7 @@ fn run_completion(
         let mut buf: Vec<u8> = Vec::new();
         let mut pending_bytes: Vec<u8> = Vec::new();
         let split = e.split_reasoning;
-        let mut filt = ThinkSplitter::new(!split);
+        let mut filt = ThinkSplitter::new(!split, e.think);
         let mut tfilt = ToolFilter::new();
         // Buffer pieces so multi-byte UTF-8 is not split across SSE frames.
         let res = e.generate(prompt, opts.max_tokens, &cfg, &mut |piece| {
@@ -905,7 +918,7 @@ fn run_completion(
         Ok((pt, ct, finish0)) => {
             let raw = String::from_utf8_lossy(&text).to_string();
             let (reasoning, body_text) = {
-                let mut sp = ThinkSplitter::new(!e.split_reasoning);
+                let mut sp = ThinkSplitter::new(!e.split_reasoning, e.think);
                 let (mut r, mut c) = sp.feed(&raw);
                 let (r2, c2) = sp.flush();
                 r.push_str(&r2);
@@ -1021,7 +1034,7 @@ mod tests {
 
     #[test]
     fn splitter_separates_reasoning_from_content() {
-        let mut f = ThinkSplitter::new(false);
+        let mut f = ThinkSplitter::new(false, false);
         let (mut reason, mut content) = f.feed("<think>\nreasoning...");
         assert!(content.is_empty());
         let (r2, c2) = f.feed("\n</think>\n\nParis");
@@ -1033,7 +1046,7 @@ mod tests {
 
     #[test]
     fn splitter_passes_plain_text_as_content() {
-        let mut f = ThinkSplitter::new(false);
+        let mut f = ThinkSplitter::new(false, false);
         let (r, c) = f.feed("hello world");
         assert!(r.is_empty());
         assert_eq!(c, "hello world");
@@ -1041,7 +1054,7 @@ mod tests {
 
     #[test]
     fn splitter_keeps_an_unterminated_block_as_reasoning() {
-        let mut f = ThinkSplitter::new(false);
+        let mut f = ThinkSplitter::new(false, false);
         let (mut reason, content) = f.feed("<think>still thinking");
         assert!(content.is_empty());
         let (r2, c2) = f.flush();
@@ -1051,8 +1064,21 @@ mod tests {
     }
 
     #[test]
+    fn splitter_started_in_think_treats_the_reply_as_reasoning() {
+        // --think: the prompt ends with <think>, so the reply has no opening tag
+        let mut f = ThinkSplitter::new(false, true);
+        let (mut r, mut c) = f.feed("reasoning so far");
+        assert!(c.is_empty());
+        let (r2, c2) = f.feed("\n</think>\n\nParis");
+        r.push_str(&r2);
+        c.push_str(&c2);
+        assert_eq!(r, "reasoning so far\n");
+        assert_eq!(c, "Paris");
+    }
+
+    #[test]
     fn splitter_disabled_inlines_everything() {
-        let mut f = ThinkSplitter::new(true);
+        let mut f = ThinkSplitter::new(true, false);
         let (r, c) = f.feed("<think>x</think>y");
         assert!(r.is_empty());
         assert_eq!(c, "<think>x</think>y");
