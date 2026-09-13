@@ -332,4 +332,17 @@ Total draft footprint after this work:
 | draft-only peak RSS (smoke) | - | 575 MiB |
 | draft block (warm) | 7.2 s (Q4_1, first cut) | ~0.5-0.8 s |
 
-Remaining footprint idea, not done: f16 draft/target KV caches.
+Draft KV cache is now f16 as well (widen the attended prefix into a reusable f32
+scratch once per layer): 100 -> 50 MiB at ctx 4096 plus a 16.8 MiB scratch, with
+unchanged logits/confidence.
+
+Remaining footprint idea, not done: an f16 target KV cache (`BONSAI_KV=f16`
+already exists for the target's full-attention layers, so this is mostly
+accounting).
+
+Bandwidth-vs-compute: the only lever that cuts the draft's *traffic* rather than
+its size is reading each weight once per block instead of once per block
+position (the head is 379 MiB x 4, the layer matrices ~470 MiB x 4). That needs
+the per-layer matvecs batched like `matvec_multi`/`pq2_matmul_n`; measured a
+wash on this CPU (compute-bound), so it is deliberately not wired - it is the
+first thing to enable on bandwidth-bound hardware.
